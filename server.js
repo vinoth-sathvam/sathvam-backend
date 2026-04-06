@@ -30,9 +30,9 @@ const rateLimitOpts = { validate: { xForwardedForHeader: false } };
 // General rate limit — 300 req/15min per IP
 app.use(rateLimit({ windowMs: 15*60*1000, max: 300, standardHeaders: true, legacyHeaders: false, ...rateLimitOpts }));
 
-// Strict limiter for auth endpoints — 10 req/15min per IP
+// Strict limiter for auth endpoints — 50 req/15min per IP
 const authLimiter = rateLimit({
-  windowMs: 15*60*1000, max: 10,
+  windowMs: 15*60*1000, max: 50,
   standardHeaders: true, legacyHeaders: false,
   message: { error: 'Too many attempts, please try again later' },
   ...rateLimitOpts,
