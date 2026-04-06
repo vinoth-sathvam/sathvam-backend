@@ -1,0 +1,194 @@
+const express = require('express');
+const supabase = require('../config/supabase');
+const router = express.Router();
+
+// GET /api/public/products — no auth, returns website-enabled products + tamil names
+router.get('/products', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const [{ data: products, error }, { data: settings }] = await Promise.all([
+      supabase.from('products').select('id,name,sku,cat,unit,pack_size,pack_unit,gst,price,website_price,retail_price,featured,active').eq('active', true).order('name'),
+      supabase.from('settings').select('value').eq('key', 'website_enabled_products').single(),
+    ]);
+    if (error) return res.status(500).json({ error: error.message });
+
+    const enabledSet = new Set(Array.isArray(settings?.value) ? settings.value : []);
+    const websiteProducts = (products || []).filter(p => enabledSet.has(p.id) && p.cat !== 'raw');
+
+    // Fetch tamil names — unwrap {value:{...}} if stored that way
+    const { data: tamilSettings } = await supabase.from('settings').select('value').eq('key', 'product_tamil_names').single();
+    const rawTamil = tamilSettings?.value;
+    const tamilNames = (rawTamil && typeof rawTamil === 'object' && rawTamil.value && typeof rawTamil.value === 'object')
+      ? rawTamil.value : (rawTamil || {});
+
+    res.json({ products: websiteProducts, tamilNames });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/public/stock — no auth, returns aggregated stock per product_id
+// Oil products: estimated from batch output (bulk L available → estimated bottles)
+// Other products: stock_ledger in - out
+router.get('/stock', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const [
+      { data: ledger },
+      { data: batches },
+      { data: products },
+      { data: procurements },
+    ] = await Promise.all([
+      supabase.from('stock_ledger').select('product_id,type,qty,channel'),
+      supabase.from('batches').select('oil_type,oil_output'),
+      supabase.from('products').select('id,oil_type_key,pack_size,pack_unit').eq('active', true),
+      supabase.from('procurements').select('commodity_name,cleaned_qty,received_qty,ordered_qty,notes,status'),
+    ]);
+
+    // Step 1: aggregate ledger by product (in - out)
+    const stock = {};
+    for (const row of (ledger || [])) {
+      if (!row.product_id) continue;
+      const id = row.product_id;
+      if (!stock[id]) stock[id] = 0;
+      stock[id] += row.type === 'in' ? (+row.qty || 0) : -(+row.qty || 0);
+    }
+
+    // Oil density (kg/L) — same as frontend constants
+    const OIL_DENSITY = { groundnut: 0.910, sesame: 0.920, coconut: 0.924 };
+
+    // Step 2: total bulk oil liters from batches per oil type (oil_output stored in kg)
+    const bulkOilL = {};
+    for (const b of (batches || [])) {
+      if (!b.oil_type) continue;
+      const key = b.oil_type.toLowerCase();
+      const density = OIL_DENSITY[key] || 0.915;
+      bulkOilL[key] = (bulkOilL[key] || 0) + (parseFloat(b.oil_output) || 0) / density;
+    }
+
+    // Step 2b: also count procurement-based opening stock for bulk oil
+    // e.g., "Groundnut Oil" stocked procurement with [unit:L] in notes
+    const OIL_KEYWORDS = { groundnut: ['groundnut oil','groundnut'], sesame: ['sesame oil','sesame'], coconut: ['coconut oil','coconut'] };
+    for (const proc of (procurements || [])) {
+      if (proc.status !== 'stocked') continue;
+      const qty = parseFloat(proc.cleaned_qty || proc.received_qty || proc.ordered_qty) || 0;
+      if (qty <= 0) continue;
+      const name = (proc.commodity_name || '').toLowerCase();
+      const notes = (proc.notes || '').toLowerCase();
+      // Detect unit from notes [unit:L] or [unit:l]
+      const unitMatch = (proc.notes || '').match(/\[unit:([^\]]+)\]/i);
+      const unit = unitMatch ? unitMatch[1].toLowerCase() : 'kg';
+      for (const [oilKey, keywords] of Object.entries(OIL_KEYWORDS)) {
+        if (keywords.some(kw => name.includes(kw))) {
+          // Convert to liters
+          let liters = qty;
+          if (unit === 'kg') liters = qty / (OIL_DENSITY[oilKey] || 0.915);
+          else if (unit === 'ml') liters = qty / 1000;
+          // Only count if it looks like bulk oil (has "oil" in name)
+          if (name.includes('oil')) {
+            bulkOilL[oilKey] = (bulkOilL[oilKey] || 0) + liters;
+          }
+          break;
+        }
+      }
+    }
+
+    // Step 3: liters already packed per oil type (production channel entries in ledger)
+    const packedL = {};
+    for (const row of (ledger || [])) {
+      if (row.channel !== 'production' || row.type !== 'in' || !row.product_id) continue;
+      const prod = (products || []).find(p => p.id === row.product_id);
+      if (!prod?.oil_type_key) continue;
+      const key = prod.oil_type_key.toLowerCase();
+      const packUnit = (prod.pack_unit || 'ML').toUpperCase();
+      const packL = (parseFloat(prod.pack_size) || 0) / (packUnit === 'L' ? 1 : 1000);
+      packedL[key] = (packedL[key] || 0) + packL * (+row.qty || 0);
+    }
+
+    // Step 4: available bulk liters per oil type
+    const availBulkL = {};
+    for (const key of Object.keys(bulkOilL)) {
+      availBulkL[key] = Math.max(0, bulkOilL[key] - (packedL[key] || 0));
+    }
+
+    // Step 5: for oil products with no packed stock recorded, estimate from bulk
+    for (const prod of (products || [])) {
+      if (!prod.oil_type_key) continue;
+      const key = prod.oil_type_key.toLowerCase();
+      const available = availBulkL[key] || 0;
+      if (available > 0 && !(stock[prod.id] > 0)) {
+        const packUnit = (prod.pack_unit || 'ML').toUpperCase();
+        const packL = (parseFloat(prod.pack_size) || 0) / (packUnit === 'L' ? 1 : 1000);
+        stock[prod.id] = packL > 0 ? Math.floor(available / packL) : (available > 0 ? 999 : 0);
+      }
+    }
+
+    // Clamp negatives to 0
+    for (const id of Object.keys(stock)) {
+      if (stock[id] < 0) stock[id] = 0;
+    }
+
+    res.json({ stock });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/public/orders — no auth required; places a webstore order + creates a factory sale
+router.post('/orders', async (req, res) => {
+  try {
+    const o = req.body;
+    if (!o.id || !o.orderNo || !o.total) return res.status(400).json({ error: 'Missing required fields' });
+
+    // Insert webstore order
+    const { error: wsErr } = await supabase.from('webstore_orders').insert({
+      id:       o.id,
+      order_no: o.orderNo,
+      date:     o.date || new Date().toISOString().slice(0, 10),
+      customer: o.customer || {},
+      items:    o.items || [],
+      subtotal: parseFloat(o.subtotal) || 0,
+      gst:      parseFloat(o.gst) || 0,
+      shipping: parseFloat(o.shipping) || 0,
+      total:    parseFloat(o.total) || 0,
+      status:   'confirmed',
+      channel:  'website',
+    });
+    if (wsErr) return res.status(400).json({ error: wsErr.message });
+
+    // Also create a factory sale record
+    const customer = o.customer || {};
+    const { data: sale, error: saleErr } = await supabase.from('sales').insert({
+      order_no:       o.orderNo,
+      date:           o.date || new Date().toISOString().slice(0, 10),
+      channel:        'website',
+      status:         'pending',
+      customer_name:  customer.name || '',
+      customer_phone: customer.phone || '',
+      total_amount:   parseFloat(o.subtotal) || 0,
+      discount:       0,
+      final_amount:   parseFloat(o.total) || 0,
+      amount_paid:    customer.payment === 'cod' ? 0 : parseFloat(o.total),
+      payment_method: customer.payment || 'cod',
+      notes:          `${customer.address || ''}, ${customer.city || ''}, ${customer.state || ''} - ${customer.pincode || ''}`,
+    }).select().single();
+
+    if (!saleErr && sale && Array.isArray(o.items) && o.items.length > 0) {
+      await supabase.from('sale_items').insert(o.items.map(i => ({
+        sale_id:      sale.id,
+        product_id:   i.id || null,
+        product_name: i.name || '',
+        qty:          i.qty || 1,
+        rate:         i.price || 0,
+        total:        (i.qty || 1) * (i.price || 0),
+        unit:         'pcs',
+      })));
+    }
+
+    res.status(201).json({ success: true, orderId: o.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = router;

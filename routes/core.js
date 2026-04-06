@@ -43,6 +43,34 @@ products.delete('/:id', auth, requireRole('admin'), async (req, res) => {
   await supabase.from('products').update({ active: false }).eq('id', req.params.id);
   res.json({ message: 'Deactivated' });
 });
+// Batch price/field update — updates multiple products at once
+products.put('/batch', auth, requireRole('admin', 'manager'), async (req, res) => {
+  const prods = Array.isArray(req.body) ? req.body : [];
+  if (prods.length === 0) return res.json({ updated: 0 });
+  const updates = prods.filter(p => p.id).map(p => ({
+    id: p.id,
+    name: p.name, sku: p.sku, cat: p.cat, unit: p.unit,
+    pack_size: p.packSize, pack_unit: p.packUnit,
+    oil_type_key: p.oilTypeKey, raw_mat_key: p.rawMatKey,
+    reorder: p.reorder || 0, gst: p.gst || 0,
+    price: p.price || 0,
+    retail_price: p.retailPrice ?? null,
+    website_price: p.websitePrice ?? null,
+    intl_price: p.intlPrice ?? null,
+    retail_profit_pct: p.retailProfitPct ?? null,
+    web_profit_pct: p.webProfitPct ?? null,
+    web_courier_charge: p.webCourierCharge ?? null,
+    intl_profit_pct: p.intlProfitPct ?? null,
+    intl_carton_key: p.intlCartonKey ?? null,
+    label_cost: p.labelCost || 0,
+    pkg_type_key: p.pkgTypeKey ?? null,
+    featured: p.featured || false,
+    active: p.active !== false,
+  }));
+  const { error } = await supabase.from('products').upsert(updates, { onConflict: 'id' });
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ updated: updates.length });
+});
 products.get('/stock', auth, async (req, res) => {
   const { data, error } = await supabase.from('stock_ledger').select('*').order('date', { ascending: false }).limit(1000);
   if (error) return res.status(500).json({ error: error.message });
@@ -58,6 +86,24 @@ products.post('/stock', auth, async (req, res) => {
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.status(201).json(data);
+});
+
+// Bulk sync — replaces entire stock_ledger with the array from localStorage
+products.post('/stock/bulk', auth, async (req, res) => {
+  const entries = Array.isArray(req.body) ? req.body : [];
+  // Delete all existing entries then reinsert
+  const { error: delErr } = await supabase.from('stock_ledger').delete().neq('id', 0);
+  if (delErr) return res.status(500).json({ error: delErr.message });
+  if (entries.length === 0) return res.json({ synced: 0 });
+  const rows = entries.map(s => ({
+    date: s.date, product_id: s.productId || null, product_name: s.productName || null,
+    type: s.type, qty: s.qty, unit: s.unit || 'pcs',
+    rate: s.rate || 0, total_value: s.totalValue || 0,
+    channel: s.channel || null, reference: s.reference || null, notes: s.notes || null
+  }));
+  const { error } = await supabase.from('stock_ledger').insert(rows);
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ synced: rows.length });
 });
 
 const procurement = express.Router();
@@ -96,6 +142,26 @@ procurement.put('/:id', auth, requireRole('admin','manager'), async (req, res) =
 procurement.delete('/:id', auth, requireRole('admin'), async (req, res) => {
   await supabase.from('procurements').delete().eq('id', req.params.id);
   res.json({ message: 'Deleted' });
+});
+
+procurement.post('/bulk', auth, requireRole('admin','manager'), async (req, res) => {
+  const { items, date, supplier, notes } = req.body;
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items array required' });
+  const rows = items.map(it => ({
+    date: date || new Date().toISOString().slice(0,10),
+    commodity_name: it.commodityName,
+    supplier: supplier || 'Opening Balance',
+    ordered_qty: parseFloat(it.qty) || 0,
+    ordered_price_per_kg: 0,
+    received_qty: parseFloat(it.qty) || 0,
+    cleaned_qty: parseFloat(it.qty) || 0,
+    gst: 0,
+    status: 'stocked',
+    notes: (notes || 'Opening stock entry') + (it.unit && it.unit !== 'kg' ? ` [unit:${it.unit}]` : ''),
+  }));
+  const { data, error } = await supabase.from('procurements').insert(rows).select();
+  if (error) return res.status(400).json({ error: error.message });
+  res.status(201).json({ inserted: data.length });
 });
 
 const vendors = express.Router();
@@ -165,6 +231,11 @@ sales.put('/:id', auth, async (req, res) => {
   }).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
+});
+sales.delete('/:id', auth, requireRole('admin'), async (req, res) => {
+  await supabase.from('sale_items').delete().eq('sale_id', req.params.id);
+  await supabase.from('sales').delete().eq('id', req.params.id);
+  res.json({ message: 'Deleted' });
 });
 
 const settings = express.Router();
