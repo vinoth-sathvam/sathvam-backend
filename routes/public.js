@@ -7,7 +7,7 @@ router.get('/products', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
   try {
     const [{ data: products, error }, { data: settings }] = await Promise.all([
-      supabase.from('products').select('id,name,sku,cat,unit,pack_size,pack_unit,gst,price,website_price,retail_price,featured,active,hsn_code').eq('active', true).order('name'),
+      supabase.from('products').select('id,name,sku,cat,unit,pack_size,pack_unit,gst,price,website_price,retail_price,featured,active,hsn_code,description').eq('active', true).order('name'),
       supabase.from('settings').select('value').eq('key', 'website_enabled_products').single(),
     ]);
     if (error) return res.status(500).json({ error: error.message });
