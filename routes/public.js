@@ -7,13 +7,18 @@ router.get('/products', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
   try {
     const [{ data: products, error }, { data: settings }] = await Promise.all([
-      supabase.from('products').select('id,name,sku,cat,unit,pack_size,pack_unit,gst,price,website_price,retail_price,featured,active').eq('active', true).order('name'),
+      supabase.from('products').select('id,name,sku,cat,unit,pack_size,pack_unit,gst,price,website_price,retail_price,featured,active,hsn_code').eq('active', true).order('name'),
       supabase.from('settings').select('value').eq('key', 'website_enabled_products').single(),
     ]);
     if (error) return res.status(500).json({ error: error.message });
 
-    const enabledSet = new Set(Array.isArray(settings?.value) ? settings.value : []);
-    const websiteProducts = (products || []).filter(p => enabledSet.has(p.id) && p.cat !== 'raw');
+    const rawEnabled = settings?.value;
+    const enabledArr = Array.isArray(rawEnabled) ? rawEnabled : (Array.isArray(rawEnabled?.value) ? rawEnabled.value : []);
+    const enabledSet = new Set(enabledArr);
+    // If nothing is explicitly enabled, show all active non-raw products with a price
+    const websiteProducts = enabledSet.size > 0
+      ? (products || []).filter(p => enabledSet.has(p.id) && p.cat !== 'raw')
+      : (products || []).filter(p => p.cat !== 'raw' && (p.website_price || p.price) > 0);
 
     // Fetch tamil names — unwrap {value:{...}} if stored that way
     const { data: tamilSettings } = await supabase.from('settings').select('value').eq('key', 'product_tamil_names').single();

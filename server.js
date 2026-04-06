@@ -63,6 +63,8 @@ app.use('/api/users',         users);
 app.use('/api/purchases',     purchases);
 app.use('/api/flour-batches', flourBatches);
 app.use('/api/webstore-orders', webstoreOrders);
+app.use('/api/customer',       require('./routes/customer'));
+app.use('/api/payments',      require('./routes/payments'));
 app.use('/api/b2b/auth',      authLimiter, b2bAuth);
 app.use('/api/b2b/customers', b2bCustomers);
 app.use('/api/b2b/orders',    b2bOrders);

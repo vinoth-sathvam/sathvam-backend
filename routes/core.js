@@ -152,7 +152,7 @@ procurement.post('/bulk', auth, requireRole('admin','manager'), async (req, res)
     commodity_name: it.commodityName,
     supplier: supplier || 'Opening Balance',
     ordered_qty: parseFloat(it.qty) || 0,
-    ordered_price_per_kg: 0,
+    ordered_price_per_kg: parseFloat(it.orderedPricePerKg||it.pricePerKg) || 0,
     received_qty: parseFloat(it.qty) || 0,
     cleaned_qty: parseFloat(it.qty) || 0,
     gst: 0,
