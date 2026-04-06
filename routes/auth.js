@@ -18,7 +18,7 @@ router.post('/login', async (req, res) => {
       process.env.JWT_SECRET, { expiresIn: '7d' }
     );
     res.json({ token, user: { id: user.id, name: user.name, username: user.username, role: user.role } });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch { res.status(500).json({ error: 'Server error' }); }
 });
 
 router.post('/setup', async (req, res) => {
@@ -31,9 +31,9 @@ router.post('/setup', async (req, res) => {
       name: process.env.ADMIN_NAME || 'Admin User',
       password: hash, role: 'admin', active: true
     }).select().single();
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) return res.status(500).json({ error: 'Setup failed' });
     res.json({ message: 'Admin created!', username: data.username });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch { res.status(500).json({ error: 'Server error' }); }
 });
 
 router.get('/me', auth, async (req, res) => {
@@ -42,19 +42,24 @@ router.get('/me', auth, async (req, res) => {
   res.json(data);
 });
 
+const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 router.post('/b2b-login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    const { data: cust, error } = await supabase.from('b2b_customers').select('*').eq('email', email).eq('active', true).single();
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+    if (!emailRegex.test(email)) return res.status(400).json({ error: 'Invalid email address' });
+    const { data: cust, error } = await supabase.from('b2b_customers').select('*').eq('email', email.toLowerCase()).eq('active', true).single();
     if (error || !cust) return res.status(401).json({ error: 'Invalid credentials' });
+    if (!cust.password) return res.status(401).json({ error: 'Password not set. Please sign up again to receive a setup link.' });
     const valid = await bcrypt.compare(password, cust.password);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
     const token = jwt.sign(
-      { id: cust.id, email: cust.email, name: cust.contact_name, company: cust.company_name, type: 'b2b' },
+      { id: cust.id, email: cust.email, companyName: cust.company_name, contactName: cust.contact_name, type: 'b2b_customer' },
       process.env.JWT_SECRET, { expiresIn: '7d' }
     );
-    res.json({ token, customer: { id: cust.id, companyName: cust.company_name, contactName: cust.contact_name, email: cust.email } });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+    res.json({ token, customer: { id: cust.id, companyName: cust.company_name, contactName: cust.contact_name, email: cust.email, country: cust.country, currency: cust.currency, address: cust.address, phone: cust.phone } });
+  } catch { res.status(500).json({ error: 'Server error' }); }
 });
 
 module.exports = router;

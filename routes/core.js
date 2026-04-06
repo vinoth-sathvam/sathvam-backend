@@ -62,8 +62,8 @@ products.post('/stock', auth, async (req, res) => {
 
 const procurement = express.Router();
 procurement.get('/', auth, async (req, res) => {
-  const { data, error } = await supabase.from('procurements').select('*').order('date', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
+  const { data, error } = await supabase.from('procurements').select('*').order('date', { ascending: false }).limit(1000);
+  if (error) return res.status(500).json({ error: 'Failed to load procurements' });
   res.json(data);
 });
 procurement.post('/', auth, requireRole('admin','manager'), async (req, res) => {
@@ -100,8 +100,8 @@ procurement.delete('/:id', auth, requireRole('admin'), async (req, res) => {
 
 const vendors = express.Router();
 vendors.get('/', auth, async (req, res) => {
-  const { data, error } = await supabase.from('vendors').select('*').eq('active', true).order('display_name');
-  if (error) return res.status(500).json({ error: error.message });
+  const { data, error } = await supabase.from('vendors').select('*').eq('active', true).order('display_name').limit(500);
+  if (error) return res.status(500).json({ error: 'Failed to load vendors' });
   res.json(data);
 });
 vendors.post('/', auth, requireRole('admin','manager'), async (req, res) => {
@@ -136,8 +136,8 @@ vendors.delete('/:id', auth, requireRole('admin'), async (req, res) => {
 
 const sales = express.Router();
 sales.get('/', auth, async (req, res) => {
-  const { data, error } = await supabase.from('sales').select('*, sale_items(*)').order('date', { ascending: false });
-  if (error) return res.status(500).json({ error: error.message });
+  const { data, error } = await supabase.from('sales').select('*, sale_items(*)').order('date', { ascending: false }).limit(1000);
+  if (error) return res.status(500).json({ error: 'Failed to load sales' });
   res.json(data);
 });
 sales.post('/', auth, async (req, res) => {
@@ -187,7 +187,7 @@ users.get('/', auth, requireRole('admin'), async (req, res) => {
 });
 users.post('/', auth, requireRole('admin'), async (req, res) => {
   const u = req.body;
-  if (!u.password || u.password.length < 6) return res.status(400).json({ error: 'Password too short' });
+  if (!u.password || u.password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   const hash = await bcrypt.hash(u.password, 12);
   const { data, error } = await supabase.from('users').insert({
     username:u.username, name:u.name, email:u.email,
