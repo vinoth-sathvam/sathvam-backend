@@ -10,6 +10,13 @@ const MAGIC_SECRET = process.env.MAGIC_LINK_SECRET;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'https://www.sathvam.in';
 const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+const B2B_COOKIE_OPTS = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'strict',
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+};
+
 // ── Email transporter ─────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -160,14 +167,14 @@ router.get('/verify', async (req, res) => {
       return res.json({ needsPassword: true, token: setPwToken, customer: customerData });
     }
 
-    // Password already set — issue session token
+    // Password already set — set session cookie
     const sessionToken = jwt.sign(
       { id: cust.id, email: cust.email, companyName: cust.company_name, contactName: cust.contact_name, type: 'b2b_customer' },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
-
-    res.json({ token: sessionToken, customer: customerData });
+    res.cookie('sathvam_b2b', sessionToken, B2B_COOKIE_OPTS);
+    res.json({ customer: customerData });
   } catch (err) {
     console.error('Verify error:', err.message);
     res.status(500).json({ error: 'Server error' });
@@ -207,8 +214,8 @@ router.post('/set-password', async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
-
-    res.json({ token: sessionToken, customer: {
+    res.cookie('sathvam_b2b', sessionToken, B2B_COOKIE_OPTS);
+    res.json({ customer: {
       id: cust.id,
       companyName: cust.company_name,
       contactName: cust.contact_name,

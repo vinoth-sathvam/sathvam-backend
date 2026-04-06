@@ -5,6 +5,15 @@ const supabase = require('../config/supabase');
 const { auth } = require('../middleware/auth');
 const router = express.Router();
 
+const COOKIE_OPTS = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'strict',
+  maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+};
+
+const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -17,8 +26,15 @@ router.post('/login', async (req, res) => {
       { id: user.id, username: user.username, name: user.name, role: user.role },
       process.env.JWT_SECRET, { expiresIn: '7d' }
     );
-    res.json({ token, user: { id: user.id, name: user.name, username: user.username, role: user.role } });
+    res.cookie('sathvam_admin', token, COOKIE_OPTS);
+    res.json({ user: { id: user.id, name: user.name, username: user.username, role: user.role } });
   } catch { res.status(500).json({ error: 'Server error' }); }
+});
+
+router.post('/logout', (req, res) => {
+  res.clearCookie('sathvam_admin', { httpOnly: true, secure: COOKIE_OPTS.secure, sameSite: 'strict' });
+  res.clearCookie('sathvam_b2b',   { httpOnly: true, secure: COOKIE_OPTS.secure, sameSite: 'strict' });
+  res.json({ message: 'Logged out' });
 });
 
 router.post('/setup', async (req, res) => {
@@ -42,8 +58,6 @@ router.get('/me', auth, async (req, res) => {
   res.json(data);
 });
 
-const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
 router.post('/b2b-login', async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -58,7 +72,8 @@ router.post('/b2b-login', async (req, res) => {
       { id: cust.id, email: cust.email, companyName: cust.company_name, contactName: cust.contact_name, type: 'b2b_customer' },
       process.env.JWT_SECRET, { expiresIn: '7d' }
     );
-    res.json({ token, customer: { id: cust.id, companyName: cust.company_name, contactName: cust.contact_name, email: cust.email, country: cust.country, currency: cust.currency, address: cust.address, phone: cust.phone } });
+    res.cookie('sathvam_b2b', token, COOKIE_OPTS);
+    res.json({ customer: { id: cust.id, companyName: cust.company_name, contactName: cust.contact_name, email: cust.email, country: cust.country, currency: cust.currency, address: cust.address, phone: cust.phone } });
   } catch { res.status(500).json({ error: 'Server error' }); }
 });
 

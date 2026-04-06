@@ -10,6 +10,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const rateLimit = require('express-rate-limit');
+const cookieParser = require('cookie-parser');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -37,6 +38,7 @@ const authLimiter = rateLimit({
   ...rateLimitOpts,
 });
 
+app.use(cookieParser());
 app.use(express.json({ limit: '2mb' }));
 app.use(morgan('combined'));
 
