@@ -74,15 +74,12 @@ async function createInvoice(order) {
     rate:     parseFloat(i.price) || 0,
   }));
 
-  if (parseFloat(shipping) > 0) {
-    lineItems.push({ name: 'Shipping & Handling', quantity: 1, rate: parseFloat(shipping) });
-  }
-
   const payload = {
     invoice_number:   orderNo,
     reference_number: orderNo,
     date:             date || new Date().toISOString().slice(0, 10),
     line_items:       lineItems,
+    shipping_charge:  parseFloat(shipping) > 0 ? parseFloat(shipping) : 0,
     notes:            `Order ${orderNo} via sathvam.in`,
     ...(contactId
       ? { customer_id: contactId }
