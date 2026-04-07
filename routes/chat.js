@@ -48,9 +48,9 @@ async function getLiveContext() {
 }
 
 // ── Save lead to DB ───────────────────────────────────────────────────────────
-async function saveLead(name, phone) {
+async function saveLead(name, phone, email) {
   try {
-    await supabase.from('chat_leads').insert({ name, phone, created_at: new Date().toISOString() });
+    await supabase.from('chat_leads').insert({ name, phone, email: email || null, created_at: new Date().toISOString() });
   } catch (e) {
     // Table may not exist yet — log and continue
     console.warn('chat_leads save skipped:', e.message);
@@ -69,7 +69,7 @@ router.post('/', async (req, res) => {
 
   // Save lead on first message
   if (lead?.name && lead?.phone) {
-    await saveLead(lead.name, lead.phone);
+    await saveLead(lead.name, lead.phone, lead.email);
   }
 
   // Build system prompt with live data
