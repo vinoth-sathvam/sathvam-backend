@@ -3,6 +3,7 @@ const router     = express.Router();
 const nodemailer = require('nodemailer');
 const { auth }   = require('../middleware/auth');
 const supabase   = require('../config/supabase');
+const { checkDailyTasks, sendReminders } = require('../config/scheduler');
 
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -357,6 +358,75 @@ const TOOLS = [
         etd:          { type: 'string', description: 'Estimated departure date YYYY-MM-DD' },
         eta:          { type: 'string', description: 'Estimated arrival date YYYY-MM-DD' },
         notes:        { type: 'string', description: 'Notes' },
+      },
+    },
+  },
+  {
+    name: 'get_expense_summary',
+    description: 'Get company expense summary for any date range. Shows total spent, category breakdown, payment mode split, daily trend, top vendors, and opening/closing balance.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        start_date: { type: 'string', description: 'Start date YYYY-MM-DD (default: first of current month)' },
+        end_date:   { type: 'string', description: 'End date YYYY-MM-DD (default: today)' },
+        category:   { type: 'string', description: 'Filter by specific category name (optional)' },
+      },
+    },
+  },
+  {
+    name: 'get_expense_details',
+    description: 'Get individual expense entries for a date or range. Use to answer questions like "what did we spend on transport today?" or "show all cash expenses this week".',
+    input_schema: {
+      type: 'object',
+      properties: {
+        start_date:   { type: 'string', description: 'Start date YYYY-MM-DD' },
+        end_date:     { type: 'string', description: 'End date YYYY-MM-DD' },
+        category:     { type: 'string', description: 'Filter by category (optional)' },
+        payment_mode: { type: 'string', enum: ['cash','upi','bank_transfer','cheque','credit_card'], description: 'Filter by payment mode (optional)' },
+      },
+    },
+  },
+  {
+    name: 'get_expense_vs_revenue',
+    description: 'Compare company expenses vs sales revenue for a period. Shows profit/loss after expenses, expense ratio, and net position.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        start_date: { type: 'string', description: 'Start date YYYY-MM-DD (default: first of current month)' },
+        end_date:   { type: 'string', description: 'End date YYYY-MM-DD (default: today)' },
+      },
+    },
+  },
+  {
+    name: 'get_opening_balance',
+    description: 'Get the opening balance (petty cash / daily budget) for a specific date, or set a new one.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        date:            { type: 'string', description: 'Date YYYY-MM-DD (default: today)' },
+        action:          { type: 'string', enum: ['get','set'], description: 'Get or set opening balance (default: get)' },
+        opening_balance: { type: 'number', description: 'New opening balance amount (required for set)' },
+      },
+    },
+  },
+  {
+    name: 'check_daily_tasks',
+    description: 'Check what daily tasks are completed or pending today: expenses logged, batch logged, attendance marked. Use this to monitor manager compliance and decide if a reminder is needed.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'send_manager_reminder',
+    description: 'Send an immediate reminder to all active managers and admins via email and WhatsApp. Use when daily tasks are overdue or manager has not updated required data.',
+    input_schema: {
+      type: 'object',
+      required: ['pending_tasks'],
+      properties: {
+        pending_tasks: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'List of pending task descriptions to include in the reminder message',
+        },
+        label: { type: 'string', description: 'Label for the reminder e.g. "Afternoon Check" (default: "AI Reminder")' },
       },
     },
   },
@@ -860,6 +930,147 @@ async function executeTool(name, input) {
         return { success:true, order_no: order.order_no, updated: updates };
       }
 
+      case 'get_expense_summary': {
+        const today      = new Date().toISOString().slice(0,10);
+        const monthStart = today.slice(0,7) + '-01';
+        const start = input.start_date || monthStart;
+        const end   = input.end_date   || today;
+
+        let q = supabase.from('company_expenses').select('*').gte('date', start).lte('date', end).is('deleted_at', null);
+        if (input.category) q = q.eq('category', input.category);
+        const { data: rows } = await q;
+        const expenses = rows || [];
+        const total = expenses.reduce((s,r) => s + parseFloat(r.amount||0), 0);
+
+        const byCat = {}, byDate = {}, byPM = {}, byVendor = {};
+        for (const r of expenses) {
+          byCat[r.category] = (byCat[r.category]||0) + parseFloat(r.amount||0);
+          byDate[r.date]    = (byDate[r.date]||0)    + parseFloat(r.amount||0);
+          const pm = r.payment_mode||'cash';
+          byPM[pm]          = (byPM[pm]||0)          + parseFloat(r.amount||0);
+          if (r.vendor_name?.trim()) byVendor[r.vendor_name] = (byVendor[r.vendor_name]||0) + parseFloat(r.amount||0);
+        }
+
+        const daysWithData = Object.keys(byDate).length;
+        const totalDays    = Math.round((new Date(end) - new Date(start)) / (1000*60*60*24)) + 1;
+        const highestDay   = Object.entries(byDate).sort((a,b) => b[1]-a[1])[0];
+
+        // Opening balance for today (if range includes today)
+        let openingBalance = null;
+        if (end === today) {
+          const { data: ob } = await supabase.from('expense_opening_balance').select('*').eq('date', today).maybeSingle();
+          openingBalance = ob ? parseFloat(ob.opening_balance||0) : 0;
+        }
+
+        return {
+          period: `${start} to ${end}`,
+          total_spent:    Math.round(total*100)/100,
+          entry_count:    expenses.length,
+          days_with_data: daysWithData,
+          total_days:     totalDays,
+          avg_per_day:    daysWithData > 0 ? Math.round((total/daysWithData)*100)/100 : 0,
+          highest_day:    highestDay ? { date:highestDay[0], amount:Math.round(highestDay[1]*100)/100 } : null,
+          opening_balance: openingBalance,
+          closing_balance: openingBalance !== null ? Math.round((openingBalance - total)*100)/100 : null,
+          by_category:    Object.entries(byCat).map(([k,v])=>({ category:k, amount:Math.round(v*100)/100, pct: total>0?Math.round((v/total)*1000)/10:0 })).sort((a,b)=>b.amount-a.amount),
+          by_payment_mode:Object.entries(byPM).map(([k,v])=>({ mode:k, amount:Math.round(v*100)/100 })).sort((a,b)=>b.amount-a.amount),
+          top_vendors:    Object.entries(byVendor).map(([k,v])=>({ vendor:k, amount:Math.round(v*100)/100 })).sort((a,b)=>b.amount-a.amount).slice(0,5),
+          daily_trend:    Object.entries(byDate).map(([d,v])=>({ date:d, amount:Math.round(v*100)/100 })).sort((a,b)=>a.date.localeCompare(b.date)),
+        };
+      }
+
+      case 'get_expense_details': {
+        const today = new Date().toISOString().slice(0,10);
+        const start = input.start_date || today;
+        const end   = input.end_date   || today;
+        let q = supabase.from('company_expenses').select('date,category,description,amount,payment_mode,vendor_name,reference_no,notes,created_by')
+          .gte('date', start).lte('date', end).is('deleted_at', null).order('date').order('created_at');
+        if (input.category)     q = q.eq('category', input.category);
+        if (input.payment_mode) q = q.eq('payment_mode', input.payment_mode);
+        const { data: rows } = await q;
+        const expenses = rows || [];
+        const total = expenses.reduce((s,r) => s + parseFloat(r.amount||0), 0);
+        return { period:`${start} to ${end}`, total:Math.round(total*100)/100, count:expenses.length, expenses };
+      }
+
+      case 'get_expense_vs_revenue': {
+        const today      = new Date().toISOString().slice(0,10);
+        const monthStart = today.slice(0,7) + '-01';
+        const start = input.start_date || monthStart;
+        const end   = input.end_date   || today;
+
+        const [{ data: sales }, { data: expRows }] = await Promise.all([
+          supabase.from('sales').select('final_amount,status').gte('date', start).lte('date', end),
+          supabase.from('company_expenses').select('amount').gte('date', start).lte('date', end).is('deleted_at', null),
+        ]);
+
+        const revenue  = (sales||[]).filter(s=>s.status!=='cancelled').reduce((s,r) => s + parseFloat(r.final_amount||0), 0);
+        const expenses = (expRows||[]).reduce((s,r) => s + parseFloat(r.amount||0), 0);
+        const profit   = revenue - expenses;
+        const expenseRatio = revenue > 0 ? Math.round((expenses/revenue)*1000)/10 : 0;
+
+        return {
+          period:         `${start} to ${end}`,
+          total_revenue:  Math.round(revenue*100)/100,
+          total_expenses: Math.round(expenses*100)/100,
+          net_profit:     Math.round(profit*100)/100,
+          expense_ratio:  `${expenseRatio}%`,
+          status:         profit >= 0 ? 'profitable' : 'loss',
+        };
+      }
+
+      case 'get_opening_balance': {
+        const date = input.date || new Date().toISOString().slice(0,10);
+        if (input.action === 'set') {
+          const { data, error } = await supabase.from('expense_opening_balance').upsert({
+            date, opening_balance: parseFloat(input.opening_balance)||0,
+            updated_at: new Date().toISOString(),
+          }, { onConflict:'date' }).select().single();
+          if (error) return { error: error.message };
+          return { success:true, date, opening_balance: data.opening_balance };
+        }
+        const { data } = await supabase.from('expense_opening_balance').select('*').eq('date', date).maybeSingle();
+        const { data: dayExp } = await supabase.from('company_expenses').select('amount').eq('date', date).is('deleted_at', null);
+        const totalSpent = (dayExp||[]).reduce((s,r) => s + parseFloat(r.amount||0), 0);
+        const ob = parseFloat(data?.opening_balance||0);
+        return { date, opening_balance:ob, total_spent:Math.round(totalSpent*100)/100, closing_balance:Math.round((ob-totalSpent)*100)/100 };
+      }
+
+      case 'check_daily_tasks': {
+        const tasks = await checkDailyTasks();
+        const pending = [];
+        if (!tasks.expenses_logged)   pending.push('Daily expenses not logged');
+        if (!tasks.batch_logged)      pending.push('Production batch not logged');
+        if (!tasks.attendance_marked) pending.push('Attendance not marked');
+        return {
+          date:              tasks.date,
+          expenses_logged:   tasks.expenses_logged,
+          batch_logged:      tasks.batch_logged,
+          attendance_marked: tasks.attendance_marked,
+          all_complete:      pending.length === 0,
+          pending_tasks:     pending,
+          summary:           pending.length === 0
+            ? 'All daily tasks are up to date.'
+            : `${pending.length} task(s) pending: ${pending.join(', ')}`,
+        };
+      }
+
+      case 'send_manager_reminder': {
+        const pending = input.pending_tasks || [];
+        if (pending.length === 0) return { error: 'pending_tasks array is required and must not be empty' };
+        await sendReminders(pending, input.label || 'AI Reminder');
+        // Count how many contacts notified
+        const { data: contacts } = await supabase.from('users').select('name,email,phone,role').in('role',['admin','manager']).eq('active',true);
+        const notified = (contacts||[]).filter(u => u.email || u.phone).map(u => u.name || u.email);
+        return {
+          success:       true,
+          notified:      notified,
+          message_count: notified.length,
+          tasks_sent:    pending,
+          note:          `Reminder sent to ${notified.length} manager(s) via email and WhatsApp`,
+        };
+      }
+
       default:
         return { error: `Unknown tool: ${name}` };
     }
@@ -893,7 +1104,14 @@ Be concise and business-like. Use ₹ for amounts. Format large numbers with com
 When listing items keep it short and readable — use line breaks, avoid markdown tables.
 For action confirmations, clearly state what was done.
 For morning briefing / overview, use get_business_summary.
-For anomaly/trend questions, use get_anomaly_report or compare_periods.`;
+For anomaly/trend questions, use get_anomaly_report or compare_periods.
+
+PROACTIVE MONITORING RULES:
+- When asked about daily status or "what's pending", always call check_daily_tasks first.
+- If check_daily_tasks shows pending tasks and the user asks you to remind the manager, use send_manager_reminder immediately.
+- When user asks "remind manager" or "send reminder" or "notify manager", call check_daily_tasks then send_manager_reminder with the pending items.
+- For expense monitoring: if expenses not logged by afternoon, proactively flag it.
+- Always mention the task status (done/pending) clearly when it's relevant.`;
 
   let apiMessages = messages.slice(-14).map(m => ({
     role: m.role === 'assistant' ? 'assistant' : 'user',
@@ -937,8 +1155,11 @@ For anomaly/trend questions, use get_anomaly_report or compare_periods.`;
 
 // ── GET /api/admin-chat/briefing — auto morning summary ──────────────────────
 router.get('/briefing', auth, async (req, res) => {
-  const summary = await executeTool('get_business_summary', {});
-  res.json(summary);
+  const [summary, expenses] = await Promise.all([
+    executeTool('get_business_summary', {}),
+    executeTool('get_expense_summary', {}),
+  ]);
+  res.json({ ...summary, expenses });
 });
 
 module.exports = router;

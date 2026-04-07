@@ -77,6 +77,10 @@ app.use('/api/chat',     require('./routes/chat'));
 app.use('/api/social',      require('./routes/social'));
 app.use('/api/admin-chat', require('./routes/adminChat'));
 app.use('/api/payroll',    require('./routes/payroll'));
+app.use('/api/expenses',   require('./routes/expenses'));
+app.use('/api/tts',              require('./routes/tts'));
+app.use('/api/packing-inventory', require('./routes/packingInventory'));
+app.use('/api/raw-stock',         require('./routes/rawStock'));
 
 // ── Weekly report manual trigger ──────────────────────────────────────────────
 const { startScheduler, buildWeeklyReport } = require('./config/scheduler');
