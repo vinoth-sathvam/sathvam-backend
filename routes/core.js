@@ -113,6 +113,21 @@ products.post('/stock/bulk', auth, async (req, res) => {
   res.json({ synced: rows.length });
 });
 
+// POST /api/products/seed-images — bulk-set image_url by product name (admin only)
+products.post('/seed-images', auth, requireRole('admin'), async (req, res) => {
+  const map = req.body; // { "Product Name": "https://..." }
+  if (!map || typeof map !== 'object') return res.status(400).json({ error: 'Provide {name:url} map' });
+  const { data: prods } = await supabase.from('products').select('id,name,image_url');
+  let updated = 0, skipped = 0;
+  for (const prod of (prods || [])) {
+    const url = map[prod.name];
+    if (!url) { skipped++; continue; }
+    await supabase.from('products').update({ image_url: url }).eq('id', prod.id);
+    updated++;
+  }
+  res.json({ ok: true, updated, skipped });
+});
+
 const procurement = express.Router();
 procurement.get('/', auth, async (req, res) => {
   const { data, error } = await supabase.from('procurements').select('*').order('date', { ascending: false }).limit(1000);

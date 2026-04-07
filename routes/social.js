@@ -2,18 +2,18 @@ const express  = require('express');
 const router   = express.Router();
 const supabase = require('../config/supabase');
 
-// ── Auth middleware (reuse JWT from core) ─────────────────────────────────────
+// ── Auth middleware (admin cookie) ────────────────────────────────────────────
 const jwt = require('jsonwebtoken');
 const JWT_SECRET = process.env.JWT_SECRET;
 const auth = (req, res, next) => {
-  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  const token = req.cookies?.sathvam_admin;
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
   try { req.user = jwt.verify(token, JWT_SECRET); next(); }
   catch { res.status(401).json({ error: 'Session expired' }); }
 };
 
 // ── AI Caption generator ──────────────────────────────────────────────────────
-async function generateCaption(product) {
+async function generateCaption(product, customNotes) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return null;
   const prompt = `Create an engaging social media post caption for this product from Sathvam Natural Products.
@@ -24,14 +24,24 @@ Category: ${product.cat}
 Pack size: ${product.pack_size || ''}${product.pack_unit || product.unit || ''}
 GST: ${product.gst || 0}%
 
-Write a captivating caption (3-5 lines) that:
-- Highlights the natural/chemical-free benefits
-- Mentions the factory-direct price advantage
-- Includes 5-8 relevant hashtags at the end
-- Mix of English and Tamil (1 Tamil line is fine)
-- Has a call to action (order on www.sathvam.in)
-- Warm and authentic tone, not corporate
-- No asterisks or markdown, plain text only`;
+Write the caption in TWO sections — first in Tamil, then in English. Format exactly like this:
+
+[Tamil section — 3-4 lines in Tamil]
+
+[English section — 3-4 lines in English]
+
+[5-8 hashtags shared at the end]
+
+Rules for both sections:
+- Mention "Sathvam" — in Tamil always spell it as "சத்துவம்" (never சத்வம்) — use it at least twice across both sections
+- Strongly emphasize purity — 100% natural, zero chemicals, no preservatives, traditional cold-press/stone-ground methods (மரபு முறை / இயற்கை in Tamil)
+- Highlight factory-direct from Karur, Tamil Nadu
+- Include a call to action: order on www.sathvam.in
+- Warm, authentic tone — like a trusted family brand, not corporate
+- No asterisks, no bold, no markdown — plain text only
+
+IMPORTANT: You MUST end the post with 8-10 relevant hashtags on their own line. Always include: #Sathvam #சத்துவம் #SathvamNaturals #NaturalProducts #PureAndNatural #KarurProducts
+${customNotes ? `\nAdditional instructions from the brand:\n${customNotes}` : ''}`;
 
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
@@ -54,17 +64,14 @@ router.get('/posts', auth, async (req, res) => {
 
 // ── POST /api/social/posts/generate ──────────────────────────────────────────
 router.post('/posts/generate', auth, async (req, res) => {
-  const { product_id } = req.body;
+  const { product_id, custom_notes } = req.body;
   if (!product_id) return res.status(400).json({ error: 'product_id required' });
   const { data: product } = await supabase.from('products').select('*').eq('id', product_id).single();
   if (!product) return res.status(404).json({ error: 'Product not found' });
-  const caption = await generateCaption(product);
+  const caption = await generateCaption(product, custom_notes);
   if (!caption) return res.status(503).json({ error: 'Caption generation failed' });
 
-  // Get product image if available
-  const { data: imgs } = await supabase.from('product_images')
-    .select('url').eq('product_id', product_id).order('position').limit(1);
-  const image_url = imgs?.[0]?.url || null;
+  const image_url = product.image_url || null;
 
   const { data: post, error } = await supabase.from('social_posts').insert({
     product_id,
@@ -167,12 +174,28 @@ router.post('/posts/:id/regenerate', auth, async (req, res) => {
   if (!post) return res.status(404).json({ error: 'Post not found' });
   const { data: product } = await supabase.from('products').select('*').eq('id', post.product_id).single();
   if (!product) return res.status(404).json({ error: 'Product not found' });
-  const caption = await generateCaption(product);
+  const caption = await generateCaption(product, req.body.custom_notes);
   if (!caption) return res.status(503).json({ error: 'Caption generation failed' });
   const { data, error } = await supabase.from('social_posts')
     .update({ caption, status: 'draft' }).eq('id', req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
+});
+
+// GET /api/social/image-proxy?url=... — proxies image to fix canvas CORS
+router.get('/image-proxy', async (req, res) => {
+  const { url } = req.query;
+  if (!url) return res.status(400).json({ error: 'url required' });
+  try {
+    const r = await fetch(url);
+    if (!r.ok) return res.status(502).send('Image fetch failed');
+    const ct = r.headers.get('content-type') || 'image/jpeg';
+    const buf = await r.arrayBuffer();
+    res.setHeader('Content-Type', ct);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.send(Buffer.from(buf));
+  } catch (e) { res.status(502).send('Proxy error: ' + e.message); }
 });
 
 module.exports = router;

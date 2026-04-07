@@ -5,6 +5,48 @@ const router = express.Router();
 
 const TODAY = () => new Date().toISOString().slice(0, 10);
 
+// Helper — atomic upsert of a JSON blob in store_analytics
+async function updateAnalytics(key, updater, def = {}) {
+  const { data } = await supabase.from('store_analytics').select('id,data').eq('key', key).single();
+  const current = data?.data ?? def;
+  const updated = updater(current);
+  if (data?.id) {
+    await supabase.from('store_analytics').update({ data: updated }).eq('key', key);
+  } else {
+    await supabase.from('store_analytics').insert({ key, data: updated });
+  }
+}
+
+// POST /api/analytics/track  (public — called from website, no auth)
+router.post('/track', async (req, res) => {
+  try {
+    const { type, path, title, product_id, product_name } = req.body;
+    const today = TODAY();
+
+    if (type === 'visit') {
+      await updateAnalytics('visits', d => ({ ...d, [today]: (d[today] || 0) + 1 }));
+    }
+
+    if (type === 'page_view' && path) {
+      await updateAnalytics('page_views', d => {
+        const entry = d[path] || { title: title || path, count: 0 };
+        return { ...d, [path]: { ...entry, title: title || entry.title, count: entry.count + 1 } };
+      });
+    }
+
+    if (type === 'product_view' && product_id) {
+      await updateAnalytics('product_views', d => {
+        const entry = d[product_id] || { name: product_name || product_id, count: 0 };
+        return { ...d, [product_id]: { ...entry, name: product_name || entry.name, count: entry.count + 1 } };
+      });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 async function getAKey(key, def = {}) {
   const { data } = await supabase.from('store_analytics').select('data').eq('key', key).single();
   return data?.data ?? def;

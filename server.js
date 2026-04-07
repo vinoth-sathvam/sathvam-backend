@@ -71,9 +71,11 @@ app.use('/api/b2b/orders',    b2bOrders);
 app.use('/api/projects',      projects);
 app.use('/api/b2b/item-progress', b2bItemProgress);
 app.use('/api/analytics', require('./routes/analytics'));
+app.use('/api/zoho-customers', require('./routes/zohoCustomers'));
 app.use('/api/upload',   require('./routes/upload'));
 app.use('/api/chat',     require('./routes/chat'));
-app.use('/api/social',   require('./routes/social'));
+app.use('/api/social',      require('./routes/social'));
+app.use('/api/admin-chat', require('./routes/adminChat'));
 
 app.use((req, res) => res.status(404).json({ error: `Route ${req.method} ${req.path} not found` }));
 app.use((err, req, res, next) => {

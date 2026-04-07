@@ -1,8 +1,84 @@
-const express  = require('express');
-const Razorpay = require('razorpay');
-const crypto   = require('crypto');
-const supabase = require('../config/supabase');
+const express      = require('express');
+const Razorpay     = require('razorpay');
+const crypto       = require('crypto');
+const nodemailer   = require('nodemailer');
+const supabase     = require('../config/supabase');
 const { createInvoice, recordPayment } = require('../config/zoho');
+
+// ── Email transporter ─────────────────────────────────────────────────────────
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || 'smtp.gmail.com',
+  port: parseInt(process.env.SMTP_PORT || '587'),
+  secure: false,
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+});
+
+// ── Order email alert ─────────────────────────────────────────────────────────
+async function sendOrderEmail(order, paymentId) {
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) return; // skip if not configured
+  const cust  = order.customer || {};
+  const items = (order.items || []).map(i => `<tr><td style="padding:4px 8px">${i.name}</td><td style="padding:4px 8px;text-align:center">${i.qty}</td><td style="padding:4px 8px;text-align:right">₹${((i.qty||1)*(i.price||0)).toLocaleString('en-IN')}</td></tr>`).join('');
+  const html = `
+<div style="font-family:sans-serif;max-width:560px;margin:0 auto">
+  <div style="background:#1a5c2a;color:#fff;padding:16px 24px;border-radius:8px 8px 0 0">
+    <h2 style="margin:0">🛒 New Order — ${order.orderNo}</h2>
+  </div>
+  <div style="border:1px solid #ddd;border-top:none;padding:20px 24px;border-radius:0 0 8px 8px">
+    <p><strong>Customer:</strong> ${cust.name || 'Guest'}<br>
+    <strong>Phone:</strong> ${cust.phone || '—'}<br>
+    <strong>Address:</strong> ${[cust.address, cust.city, cust.state, cust.pincode].filter(Boolean).join(', ')}</p>
+    <table style="width:100%;border-collapse:collapse;margin:12px 0">
+      <thead><tr style="background:#f5f5f5"><th style="padding:4px 8px;text-align:left">Item</th><th style="padding:4px 8px">Qty</th><th style="padding:4px 8px;text-align:right">Amount</th></tr></thead>
+      <tbody>${items}</tbody>
+    </table>
+    <p style="text-align:right"><strong>Subtotal:</strong> ₹${parseFloat(order.subtotal||0).toLocaleString('en-IN')}<br>
+    <strong>GST:</strong> ₹${parseFloat(order.gst||0).toLocaleString('en-IN')}<br>
+    <strong>Shipping:</strong> ₹${parseFloat(order.shipping||0).toLocaleString('en-IN')}<br>
+    <strong style="font-size:1.1em">Total: ₹${parseFloat(order.total||0).toLocaleString('en-IN')}</strong></p>
+    <p style="color:#888;font-size:0.85em">Razorpay ID: ${paymentId}</p>
+  </div>
+</div>`;
+
+  try {
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || 'Sathvam Exports <noreply@sathvam.in>',
+      to:   'vinoth@sathvam.in',
+      subject: `New Order ${order.orderNo} — ₹${parseFloat(order.total||0).toLocaleString('en-IN')}`,
+      html,
+    });
+  } catch (e) { console.error('Order email failed:', e.message); }
+}
+
+// ── WhatsApp order alert ──────────────────────────────────────────────────────
+async function sendWhatsAppAlert(order) {
+  const phoneId  = process.env.WA_PHONE_NUMBER_ID;
+  const token    = process.env.WA_ACCESS_TOKEN;
+  const notifyTo = process.env.WA_NOTIFY_TO; // e.g. "917092177092"
+  if (!phoneId || !token || !notifyTo) return; // skip if not configured
+
+  const cust  = order.customer || {};
+  const items = (order.items || []).map(i => `• ${i.name} × ${i.qty}`).join('\n');
+  const text  =
+    `🛒 *New Order — ${order.orderNo}*\n\n` +
+    `👤 ${cust.name || 'Guest'}  📞 ${cust.phone || '—'}\n` +
+    `📍 ${[cust.city, cust.state, cust.pincode].filter(Boolean).join(', ')}\n\n` +
+    `${items}\n\n` +
+    `💰 Total: ₹${order.total}  |  Shipping: ₹${order.shipping || 0}\n` +
+    `🔑 Razorpay: ${order.paymentId || ''}`;
+
+  try {
+    await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to: notifyTo,
+        type: 'text',
+        text: { body: text },
+      }),
+    });
+  } catch (e) { console.error('WhatsApp alert failed:', e.message); }
+}
 
 const router = express.Router();
 
@@ -94,8 +170,13 @@ router.post('/verify', async (req, res) => {
       })));
     }
 
-    // Create Zoho Books invoice + record payment (non-blocking)
+    // Non-blocking: WhatsApp alert + Zoho invoice
     setImmediate(async () => {
+      // WhatsApp + email notifications to owner
+      await sendWhatsAppAlert({ ...o, paymentId: razorpay_payment_id });
+      await sendOrderEmail(o, razorpay_payment_id);
+
+      // Zoho Books invoice
       try {
         const invoice = await createInvoice(o);
         if (invoice?.invoice_id) {
