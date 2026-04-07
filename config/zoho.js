@@ -109,4 +109,4 @@ async function recordPayment(invoice, amount, paymentMethod, referenceNo) {
   return result.payment;
 }
 
-module.exports = { createInvoice, recordPayment, findOrCreateContact };
+module.exports = { createInvoice, recordPayment, findOrCreateContact, zoho };

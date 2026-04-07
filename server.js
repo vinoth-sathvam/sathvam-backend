@@ -84,6 +84,7 @@ app.use('/api/raw-stock',         require('./routes/rawStock'));
 app.use('/api/finished-goods',    require('./routes/finishedGoods'));
 app.use('/api/maintenance',       require('./routes/maintenance'));
 app.use('/api/production-plan',   require('./routes/productionPlan'));
+app.use('/api/finance',           require('./routes/finance'));
 
 // ── Weekly report manual trigger ──────────────────────────────────────────────
 const { startScheduler, buildWeeklyReport } = require('./config/scheduler');
