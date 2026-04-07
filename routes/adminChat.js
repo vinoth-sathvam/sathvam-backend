@@ -430,6 +430,17 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: 'get_customer_issues',
+    description: 'Get customer chat sessions where visitors reported ordering problems, payment failures, or checkout issues. Use when asked about customer complaints, chat issues, ordering problems, or to check if anyone needs help.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', enum: ['open','resolved','all'], description: 'Filter by status (default: open)' },
+        limit:  { type: 'number', description: 'Max results (default 10)' },
+      },
+    },
+  },
 ];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1071,6 +1082,26 @@ async function executeTool(name, input) {
         };
       }
 
+      case 'get_customer_issues': {
+        const status = input.status || 'open';
+        const limit  = input.limit  || 10;
+        let q = supabase.from('chat_sessions').select('id,lead_name,lead_phone,has_issue,issue_type,status,created_at,updated_at').order('updated_at', { ascending: false }).limit(limit);
+        if (status !== 'all') q = q.eq('status', status);
+        const { data, error } = await q;
+        if (error) return { error: error.message };
+        const issues  = (data || []).filter(s => s.has_issue);
+        const regular = (data || []).filter(s => !s.has_issue);
+        return {
+          total_sessions: (data||[]).length,
+          flagged_issues: issues.length,
+          issues: issues.map(s => ({ name: s.lead_name||'Anonymous', phone: s.lead_phone||'—', issue: s.issue_type||'unknown', status: s.status, time: s.updated_at?.slice(0,16) })),
+          other_chats: regular.length,
+          summary: issues.length > 0
+            ? `${issues.length} customer(s) reported issues: ${issues.map(s=>`${s.lead_name||'Anonymous'} (${s.issue_type||'problem'})`).join(', ')}`
+            : 'No flagged issues. All chats look normal.',
+        };
+      }
+
       default:
         return { error: `Unknown tool: ${name}` };
     }
@@ -1111,7 +1142,13 @@ PROACTIVE MONITORING RULES:
 - If check_daily_tasks shows pending tasks and the user asks you to remind the manager, use send_manager_reminder immediately.
 - When user asks "remind manager" or "send reminder" or "notify manager", call check_daily_tasks then send_manager_reminder with the pending items.
 - For expense monitoring: if expenses not logged by afternoon, proactively flag it.
-- Always mention the task status (done/pending) clearly when it's relevant.`;
+- Always mention the task status (done/pending) clearly when it's relevant.
+
+CUSTOMER ISSUE ALERTS:
+- When asked "any customer issues?", "any complaints?", "website chat problems?", "ordering issues?" — call get_customer_issues immediately.
+- On morning briefing (get_business_summary), also call get_customer_issues to include in summary.
+- If get_customer_issues returns flagged issues, highlight them clearly: customer name, phone, issue type.
+- Always suggest the admin check Webstore → Customer Chats to view the full conversation.`;
 
   let apiMessages = messages.slice(-14).map(m => ({
     role: m.role === 'assistant' ? 'assistant' : 'user',
@@ -1155,11 +1192,12 @@ PROACTIVE MONITORING RULES:
 
 // ── GET /api/admin-chat/briefing — auto morning summary ──────────────────────
 router.get('/briefing', auth, async (req, res) => {
-  const [summary, expenses] = await Promise.all([
+  const [summary, expenses, customerIssues] = await Promise.all([
     executeTool('get_business_summary', {}),
     executeTool('get_expense_summary', {}),
+    executeTool('get_customer_issues', { status: 'open', limit: 10 }),
   ]);
-  res.json({ ...summary, expenses });
+  res.json({ ...summary, expenses, customerIssues });
 });
 
 module.exports = router;
