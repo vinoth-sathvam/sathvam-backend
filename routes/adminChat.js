@@ -1,31 +1,39 @@
-const express = require('express');
-const router  = express.Router();
-const { auth } = require('../middleware/auth');
-const supabase  = require('../config/supabase');
+const express    = require('express');
+const router     = express.Router();
+const nodemailer = require('nodemailer');
+const { auth }   = require('../middleware/auth');
+const supabase   = require('../config/supabase');
+
+const mailer = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || 'smtp.gmail.com',
+  port: parseInt(process.env.SMTP_PORT || '587'),
+  secure: false,
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+});
 
 // ── Tool definitions ──────────────────────────────────────────────────────────
 const TOOLS = [
   {
     name: 'get_sales_summary',
-    description: 'Get sales totals, revenue, and order counts. Use for questions about revenue, how much we sold, sales performance.',
+    description: 'Get sales totals, revenue, order counts, and outstanding payments. Use for revenue, sales performance, how much we sold, outstanding amounts.',
     input_schema: {
       type: 'object',
       properties: {
-        start_date: { type: 'string', description: 'Start date YYYY-MM-DD (optional)' },
-        end_date:   { type: 'string', description: 'End date YYYY-MM-DD (optional)' },
+        start_date: { type: 'string', description: 'Start date YYYY-MM-DD' },
+        end_date:   { type: 'string', description: 'End date YYYY-MM-DD' },
         channel:    { type: 'string', enum: ['website','b2b','retail','wholesale','all'], description: 'Sales channel' },
       },
     },
   },
   {
     name: 'get_orders',
-    description: 'List orders with details. Use for questions about specific orders, order status, recent orders, pending orders.',
+    description: 'List domestic/retail/webstore orders. Use for order status, recent orders, pending orders, customer orders.',
     input_schema: {
       type: 'object',
       properties: {
         limit:      { type: 'number', description: 'Number of orders (default 10, max 50)' },
         status:     { type: 'string', description: 'Filter: pending, confirmed, processing, shipped, delivered, cancelled' },
-        channel:    { type: 'string', description: 'Filter: website, b2b, retail, wholesale' },
+        channel:    { type: 'string', description: 'Filter: website, retail, wholesale' },
         start_date: { type: 'string', description: 'Start date YYYY-MM-DD' },
         end_date:   { type: 'string', description: 'End date YYYY-MM-DD' },
         search:     { type: 'string', description: 'Search by customer name or order number' },
@@ -33,20 +41,33 @@ const TOOLS = [
     },
   },
   {
+    name: 'get_b2b_data',
+    description: 'Get B2B export orders and customers.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        type:       { type: 'string', enum: ['orders','customers','both'], description: 'What to fetch (default: both)' },
+        stage:      { type: 'string', description: 'Filter orders by stage: order_placed, production, quality_check, shipped, delivered' },
+        search:     { type: 'string', description: 'Search by buyer name or country' },
+        limit:      { type: 'number', description: 'Number of records (default 10)' },
+      },
+    },
+  },
+  {
     name: 'get_stock_levels',
-    description: 'Get current stock levels for products. Use for inventory, stock, availability questions.',
+    description: 'Get current stock levels. Use for inventory, stock, availability, low-stock questions.',
     input_schema: {
       type: 'object',
       properties: {
         product_name:   { type: 'string', description: 'Filter by product name (partial match)' },
-        low_stock_only: { type: 'boolean', description: 'Only show products with stock below 10 units' },
-        category:       { type: 'string', description: 'Filter by category: oil, spice, flour, millet, etc.' },
+        low_stock_only: { type: 'boolean', description: 'Only products with stock below 10' },
+        category:       { type: 'string', description: 'Filter by category' },
       },
     },
   },
   {
     name: 'get_top_products',
-    description: 'Get best-selling products ranked by revenue or quantity.',
+    description: 'Get best-selling products by revenue or quantity.',
     input_schema: {
       type: 'object',
       properties: {
@@ -58,34 +79,57 @@ const TOOLS = [
     },
   },
   {
-    name: 'update_order_status',
-    description: 'Update the status of an order. Use when asked to mark an order as shipped, delivered, cancelled, etc.',
+    name: 'get_revenue_trend',
+    description: 'Get daily or monthly revenue trend. Use for charts, growth, period comparisons.',
     input_schema: {
       type: 'object',
-      required: ['order_no', 'status'],
       properties: {
-        order_no: { type: 'string', description: 'Order number e.g. SW-1234' },
-        status:   { type: 'string', enum: ['pending','confirmed','processing','shipped','delivered','cancelled'], description: 'New status' },
-        notes:    { type: 'string', description: 'Optional note to append' },
+        start_date: { type: 'string', description: 'Start date YYYY-MM-DD' },
+        end_date:   { type: 'string', description: 'End date YYYY-MM-DD' },
+        group_by:   { type: 'string', enum: ['day','month'], description: 'Group by day or month' },
       },
     },
   },
   {
-    name: 'add_stock',
-    description: 'Add stock inventory for a product. Use when asked to add stock, receive goods, update inventory.',
+    name: 'compare_periods',
+    description: 'Compare revenue and orders between two time periods (e.g. this month vs last month).',
     input_schema: {
       type: 'object',
-      required: ['product_name', 'qty'],
+      required: ['period1_start','period1_end','period2_start','period2_end'],
       properties: {
-        product_name: { type: 'string', description: 'Product name (partial match ok)' },
-        qty:          { type: 'number', description: 'Quantity to add' },
-        notes:        { type: 'string', description: 'Optional notes e.g. batch number, supplier' },
+        period1_start: { type: 'string', description: 'Period 1 start YYYY-MM-DD' },
+        period1_end:   { type: 'string', description: 'Period 1 end YYYY-MM-DD' },
+        period2_start: { type: 'string', description: 'Period 2 start YYYY-MM-DD' },
+        period2_end:   { type: 'string', description: 'Period 2 end YYYY-MM-DD' },
+      },
+    },
+  },
+  {
+    name: 'get_procurement',
+    description: 'Get raw material procurement records. Use for purchase history, supplier costs, material availability.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        material:   { type: 'string', description: 'Filter by material name (partial match)' },
+        start_date: { type: 'string', description: 'Start date YYYY-MM-DD' },
+        end_date:   { type: 'string', description: 'End date YYYY-MM-DD' },
+        limit:      { type: 'number', description: 'Number of records (default 20)' },
+      },
+    },
+  },
+  {
+    name: 'get_vendors',
+    description: 'Get supplier/vendor list.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        search: { type: 'string', description: 'Search by vendor name' },
       },
     },
   },
   {
     name: 'get_customers',
-    description: 'Search or list customers.',
+    description: 'Search or list retail/webstore customers.',
     input_schema: {
       type: 'object',
       properties: {
@@ -95,18 +139,242 @@ const TOOLS = [
     },
   },
   {
-    name: 'get_revenue_trend',
-    description: 'Get daily/monthly revenue trend for a period. Use for charts, trends, growth analysis.',
+    name: 'get_products',
+    description: 'Get product list with prices. Use for price lookup, product details.',
     input_schema: {
       type: 'object',
       properties: {
-        start_date:  { type: 'string', description: 'Start date YYYY-MM-DD' },
-        end_date:    { type: 'string', description: 'End date YYYY-MM-DD' },
-        group_by:    { type: 'string', enum: ['day','month'], description: 'Group by day or month' },
+        search:   { type: 'string', description: 'Search by product name' },
+        category: { type: 'string', description: 'Filter by category' },
+        active_only: { type: 'boolean', description: 'Only active products (default true)' },
+      },
+    },
+  },
+  {
+    name: 'update_order_status',
+    description: 'Update the status of a domestic/retail order.',
+    input_schema: {
+      type: 'object',
+      required: ['order_no','status'],
+      properties: {
+        order_no: { type: 'string', description: 'Order number e.g. SW-1234' },
+        status:   { type: 'string', enum: ['pending','confirmed','processing','shipped','delivered','cancelled'] },
+        notes:    { type: 'string', description: 'Optional note to append' },
+      },
+    },
+  },
+  {
+    name: 'add_stock',
+    description: 'Add stock inventory for a product.',
+    input_schema: {
+      type: 'object',
+      required: ['product_name','qty'],
+      properties: {
+        product_name: { type: 'string', description: 'Product name (partial match ok)' },
+        qty:          { type: 'number', description: 'Quantity to add' },
+        notes:        { type: 'string', description: 'Optional notes e.g. batch number' },
+      },
+    },
+  },
+  {
+    name: 'update_product_price',
+    description: 'Update the price of a product (website price and/or factory price).',
+    input_schema: {
+      type: 'object',
+      required: ['product_name'],
+      properties: {
+        product_name:  { type: 'string', description: 'Product name (partial match)' },
+        website_price: { type: 'number', description: 'New website/retail price' },
+        factory_price: { type: 'number', description: 'New factory/B2B price' },
+      },
+    },
+  },
+  {
+    name: 'toggle_website_product',
+    description: 'Enable or disable a product on the website store.',
+    input_schema: {
+      type: 'object',
+      required: ['product_name','enabled'],
+      properties: {
+        product_name: { type: 'string', description: 'Product name (partial match)' },
+        enabled:      { type: 'boolean', description: 'true = show on website, false = hide' },
+      },
+    },
+  },
+  {
+    name: 'create_sale',
+    description: 'Create a new sales order (retail/walk-in). Use when asked to record a sale.',
+    input_schema: {
+      type: 'object',
+      required: ['customer_name','items','payment_method'],
+      properties: {
+        customer_name:  { type: 'string', description: 'Customer name' },
+        customer_phone: { type: 'string', description: 'Customer phone (optional)' },
+        channel:        { type: 'string', enum: ['retail','wholesale','website'], description: 'Channel (default: retail)' },
+        payment_method: { type: 'string', enum: ['cash','upi','card','credit','online'], description: 'Payment method' },
+        items: {
+          type: 'array',
+          description: 'List of items sold',
+          items: {
+            type: 'object',
+            required: ['product_name','qty','rate'],
+            properties: {
+              product_name: { type: 'string' },
+              qty:          { type: 'number' },
+              rate:         { type: 'number', description: 'Price per unit' },
+            },
+          },
+        },
+        notes: { type: 'string', description: 'Optional notes' },
+      },
+    },
+  },
+  {
+    name: 'send_whatsapp',
+    description: 'Send a WhatsApp message to a customer or phone number.',
+    input_schema: {
+      type: 'object',
+      required: ['phone','message'],
+      properties: {
+        phone:   { type: 'string', description: 'Phone number with country code e.g. 919876543210' },
+        message: { type: 'string', description: 'Message text to send' },
+      },
+    },
+  },
+  {
+    name: 'get_business_summary',
+    description: 'Get a complete business summary: pending orders, low stock, today\'s revenue, recent activity. Use this for morning briefing or overview requests.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_margin_analysis',
+    description: 'Get profit margin analysis for products — cost vs selling price, margin %. Use for profitability questions.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        product_name: { type: 'string', description: 'Filter by product name (partial match)' },
+        category:     { type: 'string', description: 'Filter by category' },
+        sort_by:      { type: 'string', enum: ['margin_pct','price','name'], description: 'Sort order' },
+      },
+    },
+  },
+  {
+    name: 'get_customer_history',
+    description: 'Get full order history for a specific customer — all their past orders and items.',
+    input_schema: {
+      type: 'object',
+      required: ['customer'],
+      properties: {
+        customer: { type: 'string', description: 'Customer name or phone number' },
+      },
+    },
+  },
+  {
+    name: 'get_reorder_suggestions',
+    description: 'Get products that need restocking — based on low current stock and recent sales velocity.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_production_batches',
+    description: 'Get oil production batch records — input kg, oil output, cake output, efficiency.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        oil_type:   { type: 'string', description: 'Filter by oil type: Groundnut, Sesame, Coconut' },
+        start_date: { type: 'string', description: 'Start date YYYY-MM-DD' },
+        end_date:   { type: 'string', description: 'End date YYYY-MM-DD' },
+        limit:      { type: 'number', description: 'Number of records (default 20)' },
+      },
+    },
+  },
+  {
+    name: 'get_anomaly_report',
+    description: 'Detect unusual patterns — revenue drops/spikes, order count changes vs prior week.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_set_sales_target',
+    description: 'Get or set the monthly sales revenue target.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['get','set'], description: 'Get current target or set a new one' },
+        target: { type: 'number', description: 'New target amount in ₹ (required for set)' },
+        month:  { type: 'string', description: 'Month YYYY-MM (default: current month)' },
+      },
+    },
+  },
+  {
+    name: 'send_email',
+    description: 'Send an email to any address. Use for reports, summaries, or customer communication.',
+    input_schema: {
+      type: 'object',
+      required: ['to','subject','body'],
+      properties: {
+        to:      { type: 'string', description: 'Recipient email address' },
+        subject: { type: 'string', description: 'Email subject' },
+        body:    { type: 'string', description: 'Email body (plain text or simple HTML)' },
+      },
+    },
+  },
+  {
+    name: 'bulk_update_prices',
+    description: 'Update prices for multiple products at once — by category or name pattern, by percentage or fixed amount.',
+    input_schema: {
+      type: 'object',
+      required: ['change_pct'],
+      properties: {
+        category:     { type: 'string', description: 'Apply to all products in this category' },
+        name_pattern: { type: 'string', description: 'Apply to products matching this name pattern' },
+        change_pct:   { type: 'number', description: 'Percentage change e.g. 5 for +5%, -10 for -10%' },
+        price_field:  { type: 'string', enum: ['website_price','price','both'], description: 'Which price to update (default: website_price)' },
+      },
+    },
+  },
+  {
+    name: 'bulk_toggle_website',
+    description: 'Enable or disable multiple products on the website at once — by category.',
+    input_schema: {
+      type: 'object',
+      required: ['enabled'],
+      properties: {
+        category: { type: 'string', description: 'Category to enable/disable (e.g. oil, spice, millet)' },
+        enabled:  { type: 'boolean', description: 'true = show on website, false = hide' },
+      },
+    },
+  },
+  {
+    name: 'update_b2b_order',
+    description: 'Update a B2B export order — stage, BL number, container number, ETD, ETA, notes.',
+    input_schema: {
+      type: 'object',
+      required: ['order_no'],
+      properties: {
+        order_no:     { type: 'string', description: 'B2B order number' },
+        stage:        { type: 'string', enum: ['order_placed','production','quality_check','shipped','delivered','cancelled'], description: 'New stage' },
+        bl_no:        { type: 'string', description: 'Bill of lading number' },
+        container_no: { type: 'string', description: 'Container number' },
+        etd:          { type: 'string', description: 'Estimated departure date YYYY-MM-DD' },
+        eta:          { type: 'string', description: 'Estimated arrival date YYYY-MM-DD' },
+        notes:        { type: 'string', description: 'Notes' },
       },
     },
   },
 ];
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+async function getStockMap() {
+  const { data } = await supabase.from('stock_ledger').select('product_id,type,qty');
+  const stock = {};
+  for (const row of data || []) {
+    if (!stock[row.product_id]) stock[row.product_id] = 0;
+    stock[row.product_id] += row.type === 'in' ? (+row.qty||0) : -(+row.qty||0);
+  }
+  for (const id of Object.keys(stock)) if (stock[id] < 0) stock[id] = 0;
+  return stock;
+}
+
+function uid() { return 'sale_' + Date.now() + '_' + Math.random().toString(36).slice(2,7); }
 
 // ── Tool implementations ──────────────────────────────────────────────────────
 async function executeTool(name, input) {
@@ -120,25 +388,21 @@ async function executeTool(name, input) {
         if (input.channel && input.channel !== 'all') q = q.eq('channel', input.channel);
         const { data, error } = await q;
         if (error) return { error: error.message };
-
-        const totalRevenue  = data.reduce((s, r) => s + (r.final_amount || 0), 0);
-        const totalPaid     = data.reduce((s, r) => s + (r.amount_paid  || 0), 0);
-        const outstanding   = totalRevenue - totalPaid;
-        const byChannel = {};
-        const byStatus  = {};
+        const totalRevenue = data.reduce((s,r) => s+(r.final_amount||0), 0);
+        const totalPaid    = data.reduce((s,r) => s+(r.amount_paid||0), 0);
+        const byChannel = {}, byStatus = {};
         for (const r of data) {
-          byChannel[r.channel] = (byChannel[r.channel] || 0) + (r.final_amount || 0);
-          byStatus[r.status]   = (byStatus[r.status]   || 0) + 1;
+          byChannel[r.channel] = (byChannel[r.channel]||0) + (r.final_amount||0);
+          byStatus[r.status]   = (byStatus[r.status]||0) + 1;
         }
-        return { total_orders: data.length, total_revenue: Math.round(totalRevenue), total_paid: Math.round(totalPaid), outstanding: Math.round(outstanding), by_channel: byChannel, by_status: byStatus };
+        return { total_orders: data.length, total_revenue: Math.round(totalRevenue), total_paid: Math.round(totalPaid), outstanding: Math.round(totalRevenue-totalPaid), by_channel: byChannel, by_status: byStatus };
       }
 
       case 'get_orders': {
-        const limit = Math.min(input.limit || 10, 50);
+        const limit = Math.min(input.limit||10, 50);
         let q = supabase.from('sales')
-          .select('order_no,date,channel,status,customer_name,customer_phone,final_amount,payment_method')
-          .order('date', { ascending: false })
-          .limit(limit);
+          .select('order_no,date,channel,status,customer_name,customer_phone,final_amount,amount_paid,payment_method')
+          .order('date', { ascending: false }).limit(limit);
         if (input.status)     q = q.eq('status', input.status);
         if (input.channel)    q = q.eq('channel', input.channel);
         if (input.start_date) q = q.gte('date', input.start_date);
@@ -149,120 +413,451 @@ async function executeTool(name, input) {
         return { orders: data, count: data.length };
       }
 
+      case 'get_b2b_data': {
+        const type = input.type || 'both';
+        const result = {};
+        if (type === 'customers' || type === 'both') {
+          let q = supabase.from('b2b_customers').select('company_name,contact_name,email,country,currency,phone,active').eq('active', true).limit(input.limit||50);
+          if (input.search) q = q.or(`company_name.ilike.%${input.search}%,contact_name.ilike.%${input.search}%,country.ilike.%${input.search}%`);
+          const { data } = await q;
+          result.customers = data || [];
+        }
+        if (type === 'orders' || type === 'both') {
+          let q = supabase.from('b2b_orders').select('order_no,date,buyer_name,stage,total_value,notes').order('date', { ascending: false }).limit(input.limit||10);
+          if (input.stage) q = q.eq('stage', input.stage);
+          if (input.search) q = q.or(`buyer_name.ilike.%${input.search}%`);
+          const { data } = await q;
+          result.orders = data || [];
+        }
+        return result;
+      }
+
       case 'get_stock_levels': {
         let pq = supabase.from('products').select('id,name,cat,unit').eq('active', true);
         if (input.category) pq = pq.ilike('cat', `%${input.category}%`);
         const { data: products } = await pq;
-        const { data: ledger }   = await supabase.from('stock_ledger').select('product_id,type,qty');
-
-        const stock = {};
-        for (const row of ledger || []) {
-          if (!stock[row.product_id]) stock[row.product_id] = 0;
-          stock[row.product_id] += row.type === 'in' ? (+row.qty || 0) : -(+row.qty || 0);
-        }
-
-        let result = (products || []).map(p => ({
-          name: p.name, category: p.cat, unit: p.unit,
-          stock: Math.max(0, stock[p.id] || 0),
-        }));
-        if (input.product_name) {
-          const term = input.product_name.toLowerCase();
-          result = result.filter(p => p.name.toLowerCase().includes(term));
-        }
+        const stock = await getStockMap();
+        let result = (products||[]).map(p => ({ name:p.name, category:p.cat, unit:p.unit, stock: stock[p.id]||0 }));
+        if (input.product_name) { const t = input.product_name.toLowerCase(); result = result.filter(p => p.name.toLowerCase().includes(t)); }
         if (input.low_stock_only) result = result.filter(p => p.stock < 10);
-        result.sort((a, b) => a.stock - b.stock);
+        result.sort((a,b) => a.stock - b.stock);
         return { products: result, count: result.length };
       }
 
       case 'get_top_products': {
-        const limit  = input.limit  || 10;
-        const sortBy = input.sort_by || 'revenue';
+        const limit  = input.limit||10;
+        const sortBy = input.sort_by||'revenue';
         let q = supabase.from('sale_items').select('product_name,qty,total');
         if (input.start_date || input.end_date) {
           let sq = supabase.from('sales').select('id');
           if (input.start_date) sq = sq.gte('date', input.start_date);
           if (input.end_date)   sq = sq.lte('date', input.end_date);
           const { data: sales } = await sq;
-          const ids = (sales || []).map(s => s.id);
-          if (ids.length > 0) q = q.in('sale_id', ids);
-          else return { top_products: [] };
+          const ids = (sales||[]).map(s => s.id);
+          if (ids.length === 0) return { top_products: [] };
+          q = q.in('sale_id', ids);
         }
         const { data, error } = await q;
         if (error) return { error: error.message };
-
         const agg = {};
-        for (const row of data || []) {
-          if (!agg[row.product_name]) agg[row.product_name] = { qty: 0, revenue: 0 };
-          agg[row.product_name].qty     += row.qty   || 0;
-          agg[row.product_name].revenue += row.total || 0;
+        for (const row of data||[]) {
+          if (!agg[row.product_name]) agg[row.product_name] = { qty:0, revenue:0 };
+          agg[row.product_name].qty     += row.qty||0;
+          agg[row.product_name].revenue += row.total||0;
         }
-        const sorted = Object.entries(agg)
-          .map(([name, d]) => ({ name, qty: Math.round(d.qty), revenue: Math.round(d.revenue) }))
-          .sort((a, b) => b[sortBy] - a[sortBy])
-          .slice(0, limit);
+        const sorted = Object.entries(agg).map(([name,d]) => ({ name, qty:Math.round(d.qty), revenue:Math.round(d.revenue) })).sort((a,b) => b[sortBy]-a[sortBy]).slice(0,limit);
         return { top_products: sorted };
       }
 
-      case 'update_order_status': {
-        const update = { status: input.status };
-        if (input.notes) update.notes = input.notes;
-        const { error: e1 } = await supabase.from('sales').update(update).eq('order_no', input.order_no);
-        await supabase.from('webstore_orders').update({ status: input.status }).eq('order_no', input.order_no);
-        if (e1) return { error: e1.message };
-        return { success: true, order_no: input.order_no, new_status: input.status };
+      case 'get_revenue_trend': {
+        let q = supabase.from('sales').select('date,final_amount');
+        if (input.start_date) q = q.gte('date', input.start_date);
+        if (input.end_date)   q = q.lte('date', input.end_date);
+        const { data, error } = await q;
+        if (error) return { error: error.message };
+        const groupBy = input.group_by || 'day';
+        const trend = {};
+        for (const r of data||[]) {
+          const key = groupBy === 'month' ? r.date.slice(0,7) : r.date;
+          if (!trend[key]) trend[key] = { revenue:0, orders:0 };
+          trend[key].revenue += r.final_amount||0;
+          trend[key].orders  += 1;
+        }
+        const series = Object.entries(trend).sort(([a],[b]) => a.localeCompare(b)).map(([date,d]) => ({ date, revenue:Math.round(d.revenue), orders:d.orders }));
+        return { trend: series };
       }
 
-      case 'add_stock': {
-        const { data: products } = await supabase.from('products')
-          .select('id,name').ilike('name', `%${input.product_name}%`).eq('active', true);
-        if (!products || products.length === 0)
-          return { error: `No product found matching "${input.product_name}"` };
-        if (products.length > 1)
-          return { matches: products.map(p => p.name), error: `Multiple matches — be more specific: ${products.map(p=>p.name).join(', ')}` };
+      case 'compare_periods': {
+        async function periodSummary(start, end) {
+          const { data } = await supabase.from('sales').select('final_amount,channel').gte('date', start).lte('date', end);
+          const revenue = (data||[]).reduce((s,r) => s+(r.final_amount||0), 0);
+          return { orders: (data||[]).length, revenue: Math.round(revenue) };
+        }
+        const [p1, p2] = await Promise.all([
+          periodSummary(input.period1_start, input.period1_end),
+          periodSummary(input.period2_start, input.period2_end),
+        ]);
+        const revGrowth = p1.revenue > 0 ? Math.round(((p2.revenue-p1.revenue)/p1.revenue)*100) : null;
+        const ordGrowth = p1.orders  > 0 ? Math.round(((p2.orders -p1.orders )/p1.orders )*100) : null;
+        return {
+          period1: { dates: `${input.period1_start} to ${input.period1_end}`, ...p1 },
+          period2: { dates: `${input.period2_start} to ${input.period2_end}`, ...p2 },
+          revenue_change_pct: revGrowth,
+          orders_change_pct:  ordGrowth,
+        };
+      }
 
-        const product = products[0];
-        const { error } = await supabase.from('stock_ledger').insert({
-          product_id: product.id,
-          type:       'in',
-          qty:        input.qty,
-          date:       new Date().toISOString().slice(0, 10),
-          notes:      input.notes || 'Added via AI assistant',
-        });
+      case 'get_procurement': {
+        const limit = Math.min(input.limit||20, 100);
+        let q = supabase.from('procurements').select('date,material_type,vendor,ordered_qty,received_qty,price_per_kg,gst,total_cost,notes').order('date', { ascending: false }).limit(limit);
+        if (input.material)   q = q.ilike('material_type', `%${input.material}%`);
+        if (input.start_date) q = q.gte('date', input.start_date);
+        if (input.end_date)   q = q.lte('date', input.end_date);
+        const { data, error } = await q;
         if (error) return { error: error.message };
-        return { success: true, product: product.name, qty_added: input.qty };
+        return { procurements: data, count: data.length };
+      }
+
+      case 'get_vendors': {
+        let q = supabase.from('vendors').select('display_name,company_name,mobile,email,city,state,gstin').eq('active', true).order('display_name');
+        if (input.search) q = q.or(`display_name.ilike.%${input.search}%,company_name.ilike.%${input.search}%`);
+        const { data, error } = await q;
+        if (error) return { error: error.message };
+        return { vendors: data, count: data.length };
       }
 
       case 'get_customers': {
-        const limit = Math.min(input.limit || 20, 100);
-        let q = supabase.from('customers')
-          .select('name,email,phone,city,state,created_at')
-          .order('created_at', { ascending: false })
-          .limit(limit);
+        const limit = Math.min(input.limit||20, 100);
+        let q = supabase.from('customers').select('name,email,phone,city,state,created_at').order('created_at', { ascending: false }).limit(limit);
         if (input.search) q = q.or(`name.ilike.%${input.search}%,phone.ilike.%${input.search}%,email.ilike.%${input.search}%`);
         const { data, error } = await q;
         if (error) return { error: error.message };
         return { customers: data, count: data.length };
       }
 
-      case 'get_revenue_trend': {
-        const { start_date, end_date, group_by = 'day' } = input;
-        let q = supabase.from('sales').select('date,final_amount,channel');
-        if (start_date) q = q.gte('date', start_date);
-        if (end_date)   q = q.lte('date', end_date);
+      case 'get_products': {
+        let q = supabase.from('products').select('name,cat,unit,price,website_price,retail_price,active,featured');
+        if (input.active_only !== false) q = q.eq('active', true);
+        if (input.category) q = q.ilike('cat', `%${input.category}%`);
+        if (input.search)   q = q.ilike('name', `%${input.search}%`);
+        q = q.order('name');
         const { data, error } = await q;
         if (error) return { error: error.message };
+        return { products: data, count: data.length };
+      }
 
-        const trend = {};
-        for (const r of data || []) {
-          const key = group_by === 'month' ? r.date.slice(0, 7) : r.date;
-          if (!trend[key]) trend[key] = { revenue: 0, orders: 0 };
-          trend[key].revenue += r.final_amount || 0;
-          trend[key].orders  += 1;
+      case 'update_order_status': {
+        const update = { status: input.status };
+        if (input.notes) update.notes = input.notes;
+        const { error } = await supabase.from('sales').update(update).eq('order_no', input.order_no);
+        await supabase.from('webstore_orders').update({ status: input.status }).eq('order_no', input.order_no);
+        if (error) return { error: error.message };
+        return { success: true, order_no: input.order_no, new_status: input.status };
+      }
+
+      case 'add_stock': {
+        const { data: products } = await supabase.from('products').select('id,name').ilike('name', `%${input.product_name}%`).eq('active', true);
+        if (!products || products.length === 0) return { error: `No product found matching "${input.product_name}"` };
+        if (products.length > 1) return { error: `Multiple matches, be more specific: ${products.map(p=>p.name).join(', ')}` };
+        const { error } = await supabase.from('stock_ledger').insert({ product_id: products[0].id, type:'in', qty: input.qty, date: new Date().toISOString().slice(0,10), notes: input.notes||'Added via AI assistant' });
+        if (error) return { error: error.message };
+        return { success: true, product: products[0].name, qty_added: input.qty };
+      }
+
+      case 'update_product_price': {
+        const { data: products } = await supabase.from('products').select('id,name,price,website_price').ilike('name', `%${input.product_name}%`).eq('active', true);
+        if (!products || products.length === 0) return { error: `No product found matching "${input.product_name}"` };
+        if (products.length > 1) return { error: `Multiple matches: ${products.map(p=>p.name).join(', ')}` };
+        const updates = {};
+        if (input.website_price != null) updates.website_price = input.website_price;
+        if (input.factory_price != null) updates.price = input.factory_price;
+        const { error } = await supabase.from('products').update(updates).eq('id', products[0].id);
+        if (error) return { error: error.message };
+        return { success: true, product: products[0].name, updated: updates };
+      }
+
+      case 'toggle_website_product': {
+        const { data: products } = await supabase.from('products').select('id,name').ilike('name', `%${input.product_name}%`).eq('active', true);
+        if (!products || products.length === 0) return { error: `No product found matching "${input.product_name}"` };
+        if (products.length > 1) return { error: `Multiple matches: ${products.map(p=>p.name).join(', ')}` };
+        const productId = products[0].id;
+        // Update website_enabled_products in settings
+        const { data: setting } = await supabase.from('settings').select('value').eq('key','website_enabled_products').single();
+        let enabled = Array.isArray(setting?.value) ? [...setting.value] : [];
+        if (input.enabled) {
+          if (!enabled.includes(productId)) enabled.push(productId);
+        } else {
+          enabled = enabled.filter(id => id !== productId);
         }
-        const series = Object.entries(trend)
-          .sort(([a], [b]) => a.localeCompare(b))
-          .map(([date, d]) => ({ date, revenue: Math.round(d.revenue), orders: d.orders }));
-        return { trend: series, total_points: series.length };
+        await supabase.from('settings').upsert({ key:'website_enabled_products', value: enabled, updated_at: new Date() });
+        return { success: true, product: products[0].name, enabled: input.enabled };
+      }
+
+      case 'create_sale': {
+        const orderNo = 'SALE-' + Date.now();
+        const total = input.items.reduce((s,i) => s + (i.qty * i.rate), 0);
+        const { data: sale, error: sErr } = await supabase.from('sales').insert({
+          order_no:       orderNo,
+          date:           new Date().toISOString().slice(0,10),
+          channel:        input.channel || 'retail',
+          status:         'confirmed',
+          customer_name:  input.customer_name,
+          customer_phone: input.customer_phone || '',
+          total_amount:   total,
+          discount:       0,
+          final_amount:   total,
+          amount_paid:    total,
+          payment_method: input.payment_method,
+          notes:          input.notes || 'Created via AI assistant',
+        }).select().single();
+        if (sErr) return { error: sErr.message };
+        // Insert items
+        const itemRows = input.items.map(i => ({
+          sale_id:      sale.id,
+          product_name: i.product_name,
+          qty:          i.qty,
+          rate:         i.rate,
+          total:        i.qty * i.rate,
+          unit:         'pcs',
+        }));
+        await supabase.from('sale_items').insert(itemRows);
+        return { success: true, order_no: orderNo, total, items_count: input.items.length };
+      }
+
+      case 'send_whatsapp': {
+        const phoneId  = process.env.WA_PHONE_NUMBER_ID;
+        const token    = process.env.WA_ACCESS_TOKEN;
+        if (!phoneId || !token) return { error: 'WhatsApp not configured (WA_PHONE_NUMBER_ID / WA_ACCESS_TOKEN missing)' };
+        const res = await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ messaging_product:'whatsapp', to: input.phone, type:'text', text:{ body: input.message } }),
+        });
+        if (!res.ok) { const e = await res.text(); return { error: 'WhatsApp API error: ' + e }; }
+        return { success: true, sent_to: input.phone };
+      }
+
+      case 'get_business_summary': {
+        const today = new Date().toISOString().slice(0,10);
+        const monthStart = today.slice(0,7) + '-01';
+        const [ordersRes, stockRes, monthRes, pendingRes] = await Promise.all([
+          supabase.from('sales').select('order_no,customer_name,final_amount,status,channel').eq('date', today),
+          supabase.from('stock_ledger').select('product_id,type,qty'),
+          supabase.from('sales').select('final_amount').gte('date', monthStart).lte('date', today),
+          supabase.from('sales').select('order_no,customer_name,final_amount').eq('status','pending').order('date', { ascending: false }).limit(5),
+        ]);
+        const todayOrders   = ordersRes.data || [];
+        const todayRevenue  = todayOrders.reduce((s,r) => s+(r.final_amount||0), 0);
+        const monthRevenue  = (monthRes.data||[]).reduce((s,r) => s+(r.final_amount||0), 0);
+        // Compute stock
+        const { data: products } = await supabase.from('products').select('id,name').eq('active',true);
+        const stock = {};
+        for (const row of stockRes.data||[]) {
+          if (!stock[row.product_id]) stock[row.product_id] = 0;
+          stock[row.product_id] += row.type==='in' ? (+row.qty||0) : -(+row.qty||0);
+        }
+        const lowStock = (products||[]).filter(p => (stock[p.id]||0) < 5).map(p => p.name);
+        return {
+          today: { date: today, orders: todayOrders.length, revenue: Math.round(todayRevenue) },
+          month_revenue: Math.round(monthRevenue),
+          pending_orders: pendingRes.data || [],
+          low_stock_products: lowStock,
+          low_stock_count: lowStock.length,
+        };
+      }
+
+      case 'get_margin_analysis': {
+        let q = supabase.from('products').select('name,cat,unit,price,website_price,retail_price,label_cost,web_profit_pct,retail_profit_pct,pack_size,pack_unit').eq('active',true);
+        if (input.category)     q = q.ilike('cat', `%${input.category}%`);
+        if (input.product_name) q = q.ilike('name', `%${input.product_name}%`);
+        const { data, error } = await q.order('name');
+        if (error) return { error: error.message };
+        const result = (data||[]).map(p => {
+          const sellPrice  = p.website_price || p.price || 0;
+          const labelCost  = p.label_cost || 0;
+          const profitPct  = p.web_profit_pct || p.retail_profit_pct || 0;
+          // Estimated cost = sellPrice / (1 + profitPct/100) if profit pct known
+          const estCost    = profitPct > 0 ? Math.round(sellPrice / (1 + profitPct/100)) : null;
+          const margin     = estCost ? Math.round(sellPrice - estCost) : null;
+          const marginPct  = profitPct || null;
+          return { name:p.name, category:p.cat, website_price:sellPrice, estimated_cost:estCost, margin, margin_pct:marginPct, label_cost:labelCost };
+        }).filter(p => p.website_price > 0);
+        const sortBy = input.sort_by || 'margin_pct';
+        result.sort((a,b) => sortBy==='name' ? a.name.localeCompare(b.name) : (b[sortBy]||0)-(a[sortBy]||0));
+        return { products: result, count: result.length };
+      }
+
+      case 'get_customer_history': {
+        const term = input.customer;
+        const { data: sales, error } = await supabase.from('sales')
+          .select('id,order_no,date,channel,status,final_amount,payment_method,notes')
+          .or(`customer_name.ilike.%${term}%,customer_phone.ilike.%${term}%`)
+          .order('date', { ascending: false });
+        if (error) return { error: error.message };
+        if (!sales || sales.length === 0) return { message: `No orders found for "${term}"` };
+        const saleIds = sales.map(s => s.id);
+        const { data: items } = await supabase.from('sale_items').select('sale_id,product_name,qty,rate,total').in('sale_id', saleIds);
+        const itemsBySale = {};
+        for (const item of items||[]) {
+          if (!itemsBySale[item.sale_id]) itemsBySale[item.sale_id] = [];
+          itemsBySale[item.sale_id].push(item);
+        }
+        const totalSpent = sales.reduce((s,r) => s+(r.final_amount||0), 0);
+        return {
+          customer: term,
+          order_count: sales.length,
+          total_spent: Math.round(totalSpent),
+          orders: sales.map(s => ({ ...s, items: itemsBySale[s.id] || [] })),
+        };
+      }
+
+      case 'get_reorder_suggestions': {
+        const { data: products } = await supabase.from('products').select('id,name,cat,unit').eq('active',true);
+        const stock = await getStockMap();
+        // Get sales in last 30 days for velocity
+        const thirtyDaysAgo = new Date(Date.now()-30*24*60*60*1000).toISOString().slice(0,10);
+        const { data: recentSales } = await supabase.from('sales').select('id').gte('date', thirtyDaysAgo);
+        const recentIds = (recentSales||[]).map(s=>s.id);
+        let velocity = {};
+        if (recentIds.length > 0) {
+          const { data: items } = await supabase.from('sale_items').select('product_name,qty').in('sale_id', recentIds);
+          for (const i of items||[]) { velocity[i.product_name] = (velocity[i.product_name]||0) + (i.qty||0); }
+        }
+        const suggestions = (products||[])
+          .map(p => ({ name:p.name, cat:p.cat, unit:p.unit, stock: stock[p.id]||0, sold_last_30d: velocity[p.name]||0 }))
+          .filter(p => p.stock < 20 && p.sold_last_30d > 0)
+          .sort((a,b) => (b.sold_last_30d/Math.max(1,b.stock)) - (a.sold_last_30d/Math.max(1,a.stock)));
+        return { suggestions, count: suggestions.length };
+      }
+
+      case 'get_production_batches': {
+        const limit = Math.min(input.limit||20, 100);
+        let q = supabase.from('batches').select('date,oil_type,input_kg,oil_output,cake_output,raw_price_per_kg,notes,logged_by').order('date', { ascending: false }).limit(limit);
+        if (input.oil_type)   q = q.ilike('oil_type', `%${input.oil_type}%`);
+        if (input.start_date) q = q.gte('date', input.start_date);
+        if (input.end_date)   q = q.lte('date', input.end_date);
+        const { data, error } = await q;
+        if (error) return { error: error.message };
+        const result = (data||[]).map(b => ({
+          ...b,
+          yield_pct: b.input_kg > 0 ? Math.round((b.oil_output/b.input_kg)*100*10)/10 : null,
+        }));
+        const totalInput  = result.reduce((s,b) => s+(b.input_kg||0), 0);
+        const totalOutput = result.reduce((s,b) => s+(b.oil_output||0), 0);
+        return { batches: result, count: result.length, total_input_kg: Math.round(totalInput), total_oil_output: Math.round(totalOutput) };
+      }
+
+      case 'get_anomaly_report': {
+        const today = new Date().toISOString().slice(0,10);
+        const d7 = new Date(Date.now()-7*24*60*60*1000).toISOString().slice(0,10);
+        const d14 = new Date(Date.now()-14*24*60*60*1000).toISOString().slice(0,10);
+        const [thisWeek, lastWeek] = await Promise.all([
+          supabase.from('sales').select('final_amount,channel').gte('date',d7).lte('date',today),
+          supabase.from('sales').select('final_amount,channel').gte('date',d14).lt('date',d7),
+        ]);
+        const tw = thisWeek.data||[], lw = lastWeek.data||[];
+        const twRev = tw.reduce((s,r) => s+(r.final_amount||0), 0);
+        const lwRev = lw.reduce((s,r) => s+(r.final_amount||0), 0);
+        const revChange = lwRev > 0 ? Math.round(((twRev-lwRev)/lwRev)*100) : null;
+        const ordChange = lw.length > 0 ? Math.round(((tw.length-lw.length)/lw.length)*100) : null;
+        const alerts = [];
+        if (revChange !== null && Math.abs(revChange) >= 20) alerts.push(`Revenue ${revChange>0?'up':'down'} ${Math.abs(revChange)}% vs last week`);
+        if (ordChange !== null && Math.abs(ordChange) >= 20) alerts.push(`Orders ${ordChange>0?'up':'down'} ${Math.abs(ordChange)}% vs last week`);
+        if (alerts.length === 0) alerts.push('No significant anomalies detected');
+        return { this_week: { orders:tw.length, revenue:Math.round(twRev) }, last_week: { orders:lw.length, revenue:Math.round(lwRev) }, revenue_change_pct:revChange, orders_change_pct:ordChange, alerts };
+      }
+
+      case 'get_set_sales_target': {
+        const month = input.month || new Date().toISOString().slice(0,7);
+        const key   = `sales_target_${month}`;
+        if (input.action === 'set') {
+          await supabase.from('settings').upsert({ key, value: input.target, updated_at: new Date() });
+          return { success:true, month, target: input.target };
+        }
+        // get target + actual
+        const { data: setting } = await supabase.from('settings').select('value').eq('key', key).single();
+        const target = setting?.value || null;
+        const monthStart = month + '-01';
+        const monthEnd   = month + '-31';
+        const { data: sales } = await supabase.from('sales').select('final_amount').gte('date', monthStart).lte('date', monthEnd);
+        const actual = (sales||[]).reduce((s,r) => s+(r.final_amount||0), 0);
+        const progress = target ? Math.round((actual/target)*100) : null;
+        return { month, target, actual: Math.round(actual), progress_pct: progress };
+      }
+
+      case 'send_email': {
+        if (!process.env.SMTP_USER || !process.env.SMTP_PASS) return { error: 'Email not configured (SMTP_USER / SMTP_PASS missing in .env)' };
+        try {
+          await mailer.sendMail({
+            from: process.env.SMTP_FROM || 'Sathvam <noreply@sathvam.in>',
+            to:   input.to,
+            subject: input.subject,
+            html: input.body.includes('<') ? input.body : `<pre style="font-family:sans-serif;white-space:pre-wrap">${input.body}</pre>`,
+          });
+          return { success:true, sent_to: input.to };
+        } catch(e) { return { error: 'Email send failed: ' + e.message }; }
+      }
+
+      case 'bulk_update_prices': {
+        let q = supabase.from('products').select('id,name,cat,price,website_price').eq('active',true);
+        if (input.category)     q = q.ilike('cat', `%${input.category}%`);
+        if (input.name_pattern) q = q.ilike('name', `%${input.name_pattern}%`);
+        const { data: products, error } = await q;
+        if (error) return { error: error.message };
+        if (!products || products.length === 0) return { error: 'No products found matching criteria' };
+        const pct    = input.change_pct / 100;
+        const field  = input.price_field || 'website_price';
+        let updated  = 0;
+        for (const p of products) {
+          const updates = {};
+          if (field === 'website_price' || field === 'both') {
+            const cur = p.website_price || p.price;
+            if (cur) updates.website_price = Math.round(cur * (1 + pct));
+          }
+          if (field === 'price' || field === 'both') {
+            if (p.price) updates.price = Math.round(p.price * (1 + pct));
+          }
+          if (Object.keys(updates).length > 0) {
+            await supabase.from('products').update(updates).eq('id', p.id);
+            updated++;
+          }
+        }
+        return { success:true, updated, change_pct: input.change_pct, category: input.category || input.name_pattern };
+      }
+
+      case 'bulk_toggle_website': {
+        const { data: products } = await supabase.from('products').select('id,name,cat').eq('active',true).ilike('cat', `%${input.category}%`);
+        if (!products || products.length === 0) return { error: `No products found in category "${input.category}"` };
+        const { data: setting } = await supabase.from('settings').select('value').eq('key','website_enabled_products').single();
+        let enabled = Array.isArray(setting?.value) ? [...setting.value] : [];
+        const ids = products.map(p => p.id);
+        if (input.enabled) {
+          for (const id of ids) if (!enabled.includes(id)) enabled.push(id);
+        } else {
+          enabled = enabled.filter(id => !ids.includes(id));
+        }
+        await supabase.from('settings').upsert({ key:'website_enabled_products', value:enabled, updated_at:new Date() });
+        return { success:true, category: input.category, enabled: input.enabled, products_affected: products.length, product_names: products.map(p=>p.name) };
+      }
+
+      case 'update_b2b_order': {
+        const { data: orders } = await supabase.from('b2b_orders').select('id,order_no,stage').ilike('order_no', `%${input.order_no}%`);
+        if (!orders || orders.length === 0) return { error: `B2B order "${input.order_no}" not found` };
+        const order = orders[0];
+        const updates = {};
+        if (input.stage)        updates.stage        = input.stage;
+        if (input.bl_no)        updates.bl_no        = input.bl_no;
+        if (input.container_no) updates.container_no = input.container_no;
+        if (input.etd)          updates.etd          = input.etd;
+        if (input.eta)          updates.eta          = input.eta;
+        if (input.notes)        updates.notes        = input.notes;
+        const { error } = await supabase.from('b2b_orders').update(updates).eq('id', order.id);
+        if (error) return { error: error.message };
+        // Log stage change
+        if (input.stage) {
+          await supabase.from('b2b_order_stages').insert({ order_id: order.id, stage: input.stage, date: new Date().toISOString().slice(0,10), note: input.notes || `Stage updated to ${input.stage}`, updated_by: 'AI Assistant' });
+        }
+        return { success:true, order_no: order.order_no, updated: updates };
       }
 
       default:
@@ -288,16 +883,19 @@ router.post('/', auth, async (req, res) => {
 Today's date: ${today}
 
 You help the admin team by:
-- Answering questions about sales, revenue, orders, stock, customers
-- Taking actions: update order status, add stock
-- Providing business insights and summaries
+- Answering questions about sales, revenue, orders, stock, customers, B2B, procurement, vendors, production batches
+- Analysing margins, anomalies, reorder needs, period comparisons, sales targets
+- Taking actions: update order/B2B status, add stock, update prices (single or bulk), toggle website products, create sales, send email, send WhatsApp
+- Providing business insights, summaries, and scheduled reports
 
 Always use tools to get real data before answering. Never guess numbers.
-Be concise and business-like. Use ₹ for amounts, format large numbers with commas (e.g. ₹1,23,456).
-When showing lists keep them short and readable — use line breaks, not markdown tables.
-For action confirmations, be clear about what was done.`;
+Be concise and business-like. Use ₹ for amounts. Format large numbers with commas (₹1,23,456).
+When listing items keep it short and readable — use line breaks, avoid markdown tables.
+For action confirmations, clearly state what was done.
+For morning briefing / overview, use get_business_summary.
+For anomaly/trend questions, use get_anomaly_report or compare_periods.`;
 
-  let apiMessages = messages.slice(-12).map(m => ({
+  let apiMessages = messages.slice(-14).map(m => ({
     role: m.role === 'assistant' ? 'assistant' : 'user',
     content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
   }));
@@ -305,53 +903,42 @@ For action confirmations, be clear about what was done.`;
   const toolSteps = [];
 
   try {
-    for (let i = 0; i < 6; i++) {
+    for (let i = 0; i < 8; i++) {
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
-        headers: {
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          model:      'claude-sonnet-4-6',
-          max_tokens: 1024,
-          system:     systemPrompt,
-          tools:      TOOLS,
-          messages:   apiMessages,
-        }),
+        headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+        body: JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:1024, system:systemPrompt, tools:TOOLS, messages:apiMessages }),
       });
-
-      if (!response.ok) {
-        const err = await response.text();
-        console.error('Admin chat Anthropic error:', err);
-        return res.status(502).json({ error: 'AI service error' });
-      }
-
+      if (!response.ok) { const err = await response.text(); console.error('Admin chat error:', err); return res.status(502).json({ error: 'AI service error' }); }
       const data = await response.json();
 
       if (data.stop_reason === 'tool_use') {
-        apiMessages.push({ role: 'assistant', content: data.content });
+        apiMessages.push({ role:'assistant', content: data.content });
         const toolResults = [];
         for (const block of data.content) {
           if (block.type !== 'tool_use') continue;
           const result = await executeTool(block.name, block.input);
           toolSteps.push({ tool: block.name, input: block.input, result });
-          toolResults.push({ type: 'tool_result', tool_use_id: block.id, content: JSON.stringify(result) });
+          toolResults.push({ type:'tool_result', tool_use_id: block.id, content: JSON.stringify(result) });
         }
-        apiMessages.push({ role: 'user', content: toolResults });
+        apiMessages.push({ role:'user', content: toolResults });
         continue;
       }
 
-      const reply = data.content?.find(b => b.type === 'text')?.text ?? 'Done.';
+      const reply = data.content?.find(b => b.type==='text')?.text ?? 'Done.';
       return res.json({ reply, toolSteps });
     }
-
-    return res.json({ reply: 'Reached maximum reasoning depth. Please try a simpler question.', toolSteps });
+    return res.json({ reply: 'Reached maximum reasoning depth.', toolSteps });
   } catch (err) {
     console.error('Admin chat error:', err);
     res.status(500).json({ error: 'Internal error' });
   }
+});
+
+// ── GET /api/admin-chat/briefing — auto morning summary ──────────────────────
+router.get('/briefing', auth, async (req, res) => {
+  const summary = await executeTool('get_business_summary', {});
+  res.json(summary);
 });
 
 module.exports = router;

@@ -76,6 +76,21 @@ app.use('/api/upload',   require('./routes/upload'));
 app.use('/api/chat',     require('./routes/chat'));
 app.use('/api/social',      require('./routes/social'));
 app.use('/api/admin-chat', require('./routes/adminChat'));
+app.use('/api/payroll',    require('./routes/payroll'));
+
+// ── Weekly report manual trigger ──────────────────────────────────────────────
+const { startScheduler, buildWeeklyReport } = require('./config/scheduler');
+startScheduler();
+app.post('/api/send-weekly-report', require('./middleware/auth').auth, async (req, res) => {
+  try {
+    const nodemailer = require('nodemailer');
+    const mailer = nodemailer.createTransport({ host: process.env.SMTP_HOST||'smtp.gmail.com', port: parseInt(process.env.SMTP_PORT||'587'), secure:false, auth:{ user:process.env.SMTP_USER, pass:process.env.SMTP_PASS } });
+    const html   = await buildWeeklyReport();
+    const to     = req.body?.to || 'vinoth@sathvam.in';
+    await mailer.sendMail({ from: process.env.SMTP_FROM||'Sathvam <noreply@sathvam.in>', to, subject: `Sathvam Weekly Report — ${new Date().toISOString().slice(0,10)}`, html });
+    res.json({ ok: true, sent_to: to });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 app.use((req, res) => res.status(404).json({ error: `Route ${req.method} ${req.path} not found` }));
 app.use((err, req, res, next) => {
