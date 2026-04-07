@@ -1,8 +1,9 @@
-const express = require('express');
-const supabase = require('../config/supabase');
-const bcrypt   = require('bcryptjs');
-const jwt      = require('jsonwebtoken');
-const router   = express.Router();
+const express  = require('express');
+const supabase  = require('../config/supabase');
+const bcrypt    = require('bcryptjs');
+const jwt       = require('jsonwebtoken');
+const { OAuth2Client } = require('google-auth-library');
+const router    = express.Router();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'sathvam-cust-secret-2024';
 
@@ -44,6 +45,56 @@ router.post('/login', async (req, res) => {
     const token = jwt.sign({ id: cust.id, email: cust.email, name: cust.name }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ customer: { id: cust.id, name: cust.name, email: cust.email, phone: cust.phone, address: cust.address, city: cust.city, state: cust.state, pincode: cust.pincode }, token });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Helper — find or create customer by email+name (used by OAuth)
+async function oauthFindOrCreate(email, name, avatarUrl) {
+  const { data: existing } = await supabase.from('customers').select('id,name,email,phone,address,city,state,pincode').eq('email', email).maybeSingle();
+  if (existing) return existing;
+  const { data: created, error } = await supabase.from('customers')
+    .insert({ name, email, avatar_url: avatarUrl || null })
+    .select('id,name,email,phone,address,city,state,pincode').single();
+  if (error) throw new Error(error.message);
+  return created;
+}
+
+// POST /api/customer/oauth/google
+router.post('/oauth/google', async (req, res) => {
+  try {
+    const { credential } = req.body;
+    if (!credential) return res.status(400).json({ error: 'Missing credential' });
+    const clientId = process.env.GOOGLE_CLIENT_ID;
+    if (!clientId) return res.status(503).json({ error: 'Google OAuth not configured' });
+    const client = new OAuth2Client(clientId);
+    const ticket = await client.verifyIdToken({ idToken: credential, audience: clientId });
+    const payload = ticket.getPayload();
+    const cust = await oauthFindOrCreate(payload.email, payload.name, payload.picture);
+    const token = jwt.sign({ id: cust.id, email: cust.email, name: cust.name }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ customer: cust, token });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+// POST /api/customer/oauth/facebook
+router.post('/oauth/facebook', async (req, res) => {
+  try {
+    const { accessToken } = req.body;
+    if (!accessToken) return res.status(400).json({ error: 'Missing accessToken' });
+    const appId = process.env.FACEBOOK_APP_ID;
+    const appSecret = process.env.FACEBOOK_APP_SECRET;
+    if (!appId || !appSecret) return res.status(503).json({ error: 'Facebook OAuth not configured' });
+    // Verify token with Facebook
+    const verifyUrl = `https://graph.facebook.com/debug_token?input_token=${accessToken}&access_token=${appId}|${appSecret}`;
+    const verifyRes = await fetch(verifyUrl);
+    const verifyData = await verifyRes.json();
+    if (!verifyData.data?.is_valid) return res.status(400).json({ error: 'Invalid Facebook token' });
+    // Get user info
+    const userRes = await fetch(`https://graph.facebook.com/me?fields=id,name,email,picture&access_token=${accessToken}`);
+    const fbUser = await userRes.json();
+    if (!fbUser.email) return res.status(400).json({ error: 'Facebook account has no email. Please use email signup instead.' });
+    const cust = await oauthFindOrCreate(fbUser.email, fbUser.name, fbUser.picture?.data?.url);
+    const token = jwt.sign({ id: cust.id, email: cust.email, name: cust.name }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ customer: cust, token });
+  } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
 // GET /api/customer/me
