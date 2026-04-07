@@ -222,6 +222,57 @@ vendors.delete('/:id', auth, requireRole('admin'), async (req, res) => {
   res.json({ message: 'Deactivated' });
 });
 
+// GET /api/vendors/performance — stats per vendor from procurement history
+vendors.get('/performance', auth, async (req, res) => {
+  try {
+    const { data: procs } = await supabase
+      .from('procurements')
+      .select('supplier, vendor_id, commodity_name, ordered_qty, ordered_price_per_kg, gst, date, received_date, status')
+      .not('supplier', 'is', null)
+      .order('date', { ascending: false })
+      .limit(2000);
+
+    const map = {}; // supplier → stats
+    for (const p of (procs || [])) {
+      const key = p.supplier || 'Unknown';
+      if (!map[key]) map[key] = { supplier: key, vendor_id: p.vendor_id, order_count: 0, total_value: 0, on_time: 0, late: 0, avg_delay_days: [], commodities: {}, price_history: [] };
+      const m = map[key];
+      m.order_count++;
+      const val = parseFloat(p.ordered_qty||0) * parseFloat(p.ordered_price_per_kg||0) * (1 + parseFloat(p.gst||0)/100);
+      m.total_value += val;
+
+      // Delivery delay
+      if (p.date && p.received_date) {
+        const delay = Math.round((new Date(p.received_date) - new Date(p.date)) / 86400000);
+        m.avg_delay_days.push(delay);
+        if (delay <= 3) m.on_time++; else m.late++;
+      }
+
+      // Commodity price history
+      const comm = p.commodity_name || 'Unknown';
+      if (!m.commodities[comm]) m.commodities[comm] = { total_qty: 0, total_value: 0, count: 0 };
+      m.commodities[comm].total_qty   += parseFloat(p.ordered_qty||0);
+      m.commodities[comm].total_value += val;
+      m.commodities[comm].count++;
+
+      if (p.ordered_price_per_kg > 0) {
+        m.price_history.push({ date: p.date, commodity: comm, price: parseFloat(p.ordered_price_per_kg), qty: parseFloat(p.ordered_qty||0) });
+      }
+    }
+
+    const result = Object.values(map).map(m => ({
+      ...m,
+      avg_delay_days: m.avg_delay_days.length > 0 ? (m.avg_delay_days.reduce((s,v)=>s+v,0) / m.avg_delay_days.length).toFixed(1) : null,
+      on_time_pct: m.order_count > 0 ? Math.round(m.on_time / m.order_count * 100) : null,
+      price_history: m.price_history.slice(-20), // last 20
+    })).sort((a,b) => b.total_value - a.total_value);
+
+    res.json(result);
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const sales = express.Router();
 sales.get('/', auth, async (req, res) => {
   const { data, error } = await supabase.from('sales').select('*, sale_items(*)').order('date', { ascending: false }).limit(1000);

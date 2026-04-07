@@ -14,12 +14,16 @@ router.get('/', auth, async (req, res) => {
   res.json(data || []);
 });
 
-// Admin: update order status
+// Admin: update order status + dispatch info
 router.put('/:id', auth, async (req, res) => {
-  const { status, notes } = req.body;
+  const { status, notes, courier, awb_number, dispatch_date, delivered_date } = req.body;
   const updates = {};
-  if (status !== undefined) updates.status = status;
-  if (notes !== undefined) updates.notes = notes;
+  if (status         !== undefined) updates.status         = status;
+  if (notes          !== undefined) updates.notes          = notes;
+  if (courier        !== undefined) updates.courier        = courier;
+  if (awb_number     !== undefined) updates.awb_number     = awb_number;
+  if (dispatch_date  !== undefined) updates.dispatch_date  = dispatch_date;
+  if (delivered_date !== undefined) updates.delivered_date = delivered_date;
   const { data, error } = await supabase
     .from('webstore_orders')
     .update(updates)

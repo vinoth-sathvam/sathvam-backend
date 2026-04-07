@@ -128,4 +128,116 @@ router.get('/', auth, async (req, res) => {
   }
 });
 
+// GET /api/analytics/pnl?start=YYYY-MM-DD&end=YYYY-MM-DD
+router.get('/pnl', auth, async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0,10);
+    const start = req.query.start || new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0,10);
+    const end   = req.query.end   || today;
+
+    const [salesRes, wsoRes, b2bRes, procRes, expRes] = await Promise.allSettled([
+      // Revenue: local sales
+      supabase.from('sales').select('final_amount,date').gte('date',start).lte('date',end).eq('status','paid'),
+      // Revenue: webstore orders
+      supabase.from('webstore_orders').select('total,date,created_at').gte('date',start).lte('date',end).in('status',['confirmed','shipped','delivered','paid']),
+      // Revenue: B2B orders
+      supabase.from('b2b_orders').select('total_value,date').gte('date',start).lte('date',end).in('stage',['shipped','delivered','invoice_sent','paid']),
+      // Cost: procurement
+      supabase.from('procurements').select('ordered_qty,ordered_price_per_kg,gst,date').gte('date',start).lte('date',end).in('status',['received','stocked','cleaned']),
+      // Cost: expenses
+      supabase.from('company_expenses').select('amount,category,date').gte('date',start).lte('date',end).is('deleted_at',null),
+    ]);
+
+    const sales   = salesRes.value?.data || [];
+    const wso     = wsoRes.value?.data || [];
+    const b2b     = b2bRes.value?.data || [];
+    const procs   = procRes.value?.data || [];
+    const expenses= expRes.value?.data || [];
+
+    const rev_sales   = sales.reduce((s,r)=>s+parseFloat(r.final_amount||0),0);
+    const rev_webstore= wso.reduce((s,r)=>s+parseFloat(r.total||0),0);
+    const rev_b2b     = b2b.reduce((s,r)=>s+parseFloat(r.total_value||0),0);
+    const total_revenue = rev_sales + rev_webstore + rev_b2b;
+
+    const cost_procurement = procs.reduce((s,r)=>{
+      const qty = parseFloat(r.ordered_qty||0);
+      const rate= parseFloat(r.ordered_price_per_kg||0);
+      const gst = parseFloat(r.gst||0);
+      return s + qty * rate * (1 + gst/100);
+    },0);
+    const cost_expenses = expenses.reduce((s,r)=>s+parseFloat(r.amount||0),0);
+    const total_cost    = cost_procurement + cost_expenses;
+    const gross_profit  = total_revenue - total_cost;
+
+    // Revenue by day for chart
+    const revenueByDay = {};
+    for (const r of sales)  { const d=r.date; revenueByDay[d]=(revenueByDay[d]||0)+parseFloat(r.final_amount||0); }
+    for (const r of wso)    { const d=(r.date||r.created_at||'').slice(0,10); revenueByDay[d]=(revenueByDay[d]||0)+parseFloat(r.total||0); }
+    for (const r of b2b)    { const d=r.date; revenueByDay[d]=(revenueByDay[d]||0)+parseFloat(r.total_value||0); }
+
+    // Expenses by category
+    const expByCategory = {};
+    for (const r of expenses) {
+      const cat = r.category || 'Other';
+      expByCategory[cat] = (expByCategory[cat] || 0) + parseFloat(r.amount||0);
+    }
+
+    res.json({
+      period: { start, end },
+      revenue: { sales: rev_sales, webstore: rev_webstore, b2b: rev_b2b, total: total_revenue },
+      costs:   { procurement: cost_procurement, expenses: cost_expenses, total: total_cost },
+      gross_profit,
+      margin_pct: total_revenue > 0 ? ((gross_profit / total_revenue) * 100).toFixed(1) : 0,
+      revenue_by_day: revenueByDay,
+      expenses_by_category: expByCategory,
+      counts: { sales: sales.length, webstore_orders: wso.length, b2b_orders: b2b.length },
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/analytics/dashboard — quick stats for dashboard header
+router.get('/dashboard', auth, async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0,10);
+    const weekAgo = new Date(); weekAgo.setDate(weekAgo.getDate()-7);
+    const weekStart = weekAgo.toISOString().slice(0,10);
+    const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0,10);
+
+    const [todaySales, pendingWSO, pendingB2B, lowRaw] = await Promise.allSettled([
+      // Today's revenue across all channels
+      Promise.allSettled([
+        supabase.from('sales').select('final_amount').eq('date',today).eq('status','paid'),
+        supabase.from('webstore_orders').select('total').eq('date',today).in('status',['confirmed','shipped','delivered','paid']),
+        supabase.from('b2b_orders').select('total_value').eq('date',today).not('stage','in','("cancelled")'),
+      ]),
+      // Pending webstore orders
+      supabase.from('webstore_orders').select('id',{count:'exact'}).in('status',['confirmed','processing']),
+      // Pending B2B orders
+      supabase.from('b2b_orders').select('id',{count:'exact'}).not('stage','in','("shipped","delivered","cancelled","invoice_sent")'),
+      // Low raw materials
+      supabase.from('raw_materials').select('id',{count:'exact'}).eq('active',true).gt('min_stock',0).lte('current_stock', supabase.raw?.('min_stock') || 0),
+    ]);
+
+    const salesRows = todaySales.value?.[0].value?.data || [];
+    const wsoRows   = todaySales.value?.[1].value?.data || [];
+    const b2bRows   = todaySales.value?.[2].value?.data || [];
+
+    const today_revenue = [
+      ...salesRows.map(r=>parseFloat(r.final_amount||0)),
+      ...wsoRows.map(r=>parseFloat(r.total||0)),
+      ...b2bRows.map(r=>parseFloat(r.total_value||0)),
+    ].reduce((s,v)=>s+v,0);
+
+    res.json({
+      today_revenue,
+      pending_webstore: pendingWSO.value?.count || 0,
+      pending_b2b:      pendingB2B.value?.count || 0,
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

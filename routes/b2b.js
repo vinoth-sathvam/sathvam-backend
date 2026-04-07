@@ -95,7 +95,12 @@ b2bOrders.put('/:id/stage', auth, requireRole('admin','manager','ceo'), async (r
 });
 b2bOrders.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const o = req.body;
-  const { data, error } = await supabase.from('b2b_orders').update({ stage:o.stage, notes:o.notes, bl_no:o.blNo, container_no:o.containerNo, etd:o.etd, eta:o.eta }).eq('id', req.params.id).select().single();
+  const u = { stage:o.stage, notes:o.notes, bl_no:o.blNo, container_no:o.containerNo, etd:o.etd, eta:o.eta };
+  if (o.courier       !== undefined) u.courier        = o.courier;
+  if (o.awbNumber     !== undefined) u.awb_number     = o.awbNumber;
+  if (o.dispatchDate  !== undefined) u.dispatch_date  = o.dispatchDate;
+  if (o.deliveredDate !== undefined) u.delivered_date = o.deliveredDate;
+  const { data, error } = await supabase.from('b2b_orders').update(u).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: 'Update failed' });
   res.json(data);
 });
