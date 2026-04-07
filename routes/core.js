@@ -19,7 +19,8 @@ products.post('/', auth, requireRole('admin'), async (req, res) => {
     intl_price:p.intlPrice, retail_profit_pct:p.retailProfitPct,
     web_profit_pct:p.webProfitPct, web_courier_charge:p.webCourierCharge,
     intl_profit_pct:p.intlProfitPct, intl_carton_key:p.intlCartonKey,
-    label_cost:p.labelCost||0, pkg_type_key:p.pkgTypeKey, featured:p.featured||false
+    label_cost:p.labelCost||0, pkg_type_key:p.pkgTypeKey, featured:p.featured||false,
+    image_url:p.imageUrl||null, description:p.description||null, hsn_code:p.hsnCode||null
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.status(201).json(data);
@@ -34,7 +35,10 @@ products.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
     intl_price:p.intlPrice, retail_profit_pct:p.retailProfitPct,
     web_profit_pct:p.webProfitPct, web_courier_charge:p.webCourierCharge,
     intl_profit_pct:p.intlProfitPct, intl_carton_key:p.intlCartonKey,
-    label_cost:p.labelCost, pkg_type_key:p.pkgTypeKey, featured:p.featured
+    label_cost:p.labelCost, pkg_type_key:p.pkgTypeKey, featured:p.featured,
+    image_url:p.imageUrl!==undefined?p.imageUrl:undefined,
+    description:p.description!==undefined?p.description:undefined,
+    hsn_code:p.hsnCode!==undefined?p.hsnCode:undefined
   }).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
@@ -66,6 +70,9 @@ products.put('/batch', auth, requireRole('admin', 'manager'), async (req, res) =
     pkg_type_key: p.pkgTypeKey ?? null,
     featured: p.featured || false,
     active: p.active !== false,
+    image_url: p.imageUrl ?? undefined,
+    description: p.description ?? undefined,
+    hsn_code: p.hsnCode ?? undefined,
   }));
   const { error } = await supabase.from('products').upsert(updates, { onConflict: 'id' });
   if (error) return res.status(400).json({ error: error.message });

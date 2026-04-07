@@ -7,7 +7,7 @@ router.get('/products', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
   try {
     const [{ data: products, error }, { data: settings }] = await Promise.all([
-      supabase.from('products').select('id,name,sku,cat,unit,pack_size,pack_unit,gst,price,website_price,retail_price,featured,active,hsn_code,description').eq('active', true).order('name'),
+      supabase.from('products').select('id,name,sku,cat,unit,pack_size,pack_unit,gst,price,website_price,retail_price,featured,active,hsn_code,description,image_url').eq('active', true).order('name'),
       supabase.from('settings').select('value').eq('key', 'website_enabled_products').single(),
     ]);
     if (error) return res.status(500).json({ error: error.message });
@@ -194,6 +194,108 @@ router.post('/orders', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
+});
+
+// GET /api/public/content — website CMS content (hero, about, announcement, banners)
+router.get('/content', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'website_content').single();
+    const defaults = {
+      heroTitle: "Nature's Finest, Pure & Simple",
+      heroSubtitle: "Cold-pressed oils, organic millets, traditional dals & spices — delivered from our farm to your family.",
+      heroStats: ["100+ Products", "0 Chemicals", "100% Natural"],
+      benefits: ["🌿 100% Natural","🫙 Cold Pressed","🚫 No Chemicals","🌾 Farm Direct","📦 Safe Packaging"],
+      aboutTitle: "Our Story",
+      aboutText: "Sathvam was born from a simple belief — that what you eat should be as pure as nature intended. We work directly with farmers across Tamil Nadu to bring you cold-pressed oils, organic millets, and traditional foods free from chemicals and preservatives.",
+      announcementBar: "",
+      bannerUrl: "",
+    };
+    res.json({ content: { ...defaults, ...(data?.value || {}) } });
+  } catch {
+    res.json({ content: {} });
+  }
+});
+
+// ── Analytics tracking helpers ─────────────────────────────────────────────
+
+async function getAKey(key, def = {}) {
+  const { data } = await supabase.from('store_analytics').select('data').eq('key', key).single();
+  return data?.data ?? def;
+}
+async function setAKey(key, data) {
+  await supabase.from('store_analytics').upsert({ key, data, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+}
+const TODAY = () => new Date().toISOString().slice(0, 10);
+
+// POST /api/public/track/visit
+router.post('/track/visit', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const today = TODAY();
+    const visits = await getAKey('visits', {});
+    visits[today] = (visits[today] || 0) + 1;
+    await setAKey('visits', visits);
+    res.json({ ok: true });
+  } catch { res.json({ ok: false }); }
+});
+
+// POST /api/public/track/pageview  { path, title? }
+router.post('/track/pageview', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { path, title = '' } = req.body || {};
+    if (!path) return res.status(400).json({ error: 'path required' });
+    const pages = await getAKey('page_views', {});
+    if (!pages[path]) pages[path] = { title, count: 0 };
+    pages[path].count += 1;
+    if (title) pages[path].title = title;
+    await setAKey('page_views', pages);
+    res.json({ ok: true });
+  } catch { res.json({ ok: false }); }
+});
+
+// POST /api/public/track/product-view  { productId, productName? }
+router.post('/track/product-view', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { productId, productName = '' } = req.body || {};
+    if (!productId) return res.status(400).json({ error: 'productId required' });
+    const views = await getAKey('product_views', {});
+    if (!views[productId]) views[productId] = { name: productName, count: 0 };
+    views[productId].count += 1;
+    if (productName) views[productId].name = productName;
+    await setAKey('product_views', views);
+    res.json({ ok: true });
+  } catch { res.json({ ok: false }); }
+});
+
+// POST /api/public/cart  { sessionId, items: [{id,name,price,qty}] }
+router.post('/cart', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { sessionId, items } = req.body || {};
+    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    if (!items || items.length === 0) {
+      await supabase.from('abandoned_carts').delete().eq('session_id', sessionId);
+      return res.json({ ok: true });
+    }
+    await supabase.from('abandoned_carts').upsert({
+      session_id: sessionId, items, updated_at: new Date().toISOString(),
+    }, { onConflict: 'session_id' });
+    res.json({ ok: true });
+  } catch { res.json({ ok: false }); }
+});
+
+// DELETE /api/public/cart/:sessionId — mark cart as recovered when order is placed
+router.delete('/cart/:sessionId', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    await supabase.from('abandoned_carts')
+      .update({ recovered: true, recovered_at: new Date().toISOString() })
+      .eq('session_id', req.params.sessionId);
+    res.json({ ok: true });
+  } catch { res.json({ ok: false }); }
 });
 
 module.exports = router;
