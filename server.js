@@ -85,6 +85,14 @@ app.use('/api/finished-goods',    require('./routes/finishedGoods'));
 app.use('/api/maintenance',       require('./routes/maintenance'));
 app.use('/api/production-plan',   require('./routes/productionPlan'));
 app.use('/api/finance',           require('./routes/finance'));
+app.use('/api/leave',             require('./routes/leave'));
+app.use('/api/returns',           require('./routes/returns'));
+app.use('/api/delivery',          require('./routes/delivery'));
+app.use('/api/coupons',           require('./routes/coupons'));
+app.use('/api/quality',           require('./routes/quality'));
+app.use('/api/tasks',             require('./routes/tasks'));
+app.use('/api/compliance',        require('./routes/compliance'));
+app.use('/api/campaigns',         require('./routes/campaigns'));
 
 // ── Weekly report manual trigger ──────────────────────────────────────────────
 const { startScheduler, buildWeeklyReport } = require('./config/scheduler');

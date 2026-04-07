@@ -185,4 +185,75 @@ router.get('/', auth, async (req, res) => {
   }
 });
 
+// ── Demand Forecasting ────────────────────────────────────────────────────────
+
+// GET /api/production-plan/forecast — compute demand forecast from sales history
+router.get('/forecast', auth, async (req, res) => {
+  try {
+    const { weeks = 4 } = req.query;
+    const nWeeks = parseInt(weeks);
+    // Get last 90 days of webstore + B2B order items
+    const since = new Date();
+    since.setDate(since.getDate() - 90);
+    const [{ data: wsOrders }, { data: b2bOrders }] = await Promise.all([
+      supabase.from('webstore_orders').select('items,created_at,status').gte('created_at', since.toISOString()).neq('status', 'cancelled'),
+      supabase.from('b2b_orders').select('items,created_at,status').gte('created_at', since.toISOString()).neq('status', 'cancelled'),
+    ]);
+
+    const salesMap = {}; // product_id -> [{ week, qty }]
+    const productNames = {};
+
+    const addItems = (items, createdAt) => {
+      const weekNum = Math.floor((Date.now() - new Date(createdAt).getTime()) / (7 * 86400000));
+      for (const item of (items || [])) {
+        const id = item.product_id || item.id || item.name;
+        if (!id) continue;
+        productNames[id] = item.product_name || item.name || id;
+        if (!salesMap[id]) salesMap[id] = [];
+        salesMap[id].push({ week: weekNum, qty: parseFloat(item.quantity || item.qty || 0) });
+      }
+    };
+
+    for (const o of wsOrders || []) {
+      const items = Array.isArray(o.items) ? o.items : (typeof o.items === 'object' ? Object.values(o.items) : []);
+      addItems(items, o.created_at);
+    }
+    for (const o of b2bOrders || []) {
+      const items = Array.isArray(o.items) ? o.items : [];
+      addItems(items, o.created_at);
+    }
+
+    const forecasts = Object.entries(salesMap).map(([productId, sales]) => {
+      const totalQty = sales.reduce((s, r) => s + r.qty, 0);
+      const avgWeekly = totalQty / 13; // 90 days ~ 13 weeks
+      const forecastQty = Math.ceil(avgWeekly * nWeeks);
+      return { product_id: productId, product_name: productNames[productId], avg_weekly: Math.round(avgWeekly * 10) / 10, forecast_qty: forecastQty, forecast_weeks: nWeeks, based_on_90d_qty: totalQty };
+    }).sort((a, b) => b.forecast_qty - a.forecast_qty);
+
+    res.json(forecasts);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/production-plan/forecast/saved — saved forecast records
+router.get('/forecast/saved', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('demand_forecasts')
+      .select('*').order('forecast_date', { ascending: false }).limit(50);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/production-plan/forecast/save — save a forecast snapshot
+router.post('/forecast/save', auth, async (req, res) => {
+  try {
+    const { forecasts, notes, forecast_weeks } = req.body;
+    const { data, error } = await supabase.from('demand_forecasts')
+      .insert({ forecasts: forecasts || [], notes: notes || '', forecast_weeks: forecast_weeks || 4, forecast_date: new Date().toISOString().slice(0, 10) })
+      .select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 module.exports = router;
