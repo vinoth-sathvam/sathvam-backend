@@ -41,7 +41,8 @@ router.post('/setup', async (req, res) => {
   try {
     const { data: existing } = await supabase.from('users').select('id').limit(1);
     if (existing?.length > 0) return res.status(400).json({ error: 'Setup already complete' });
-    const hash = await bcrypt.hash(process.env.ADMIN_PASSWORD || 'admin123', 12);
+    if (!process.env.ADMIN_PASSWORD) return res.status(500).json({ error: 'ADMIN_PASSWORD env var not set' });
+    const hash = await bcrypt.hash(process.env.ADMIN_PASSWORD, 12);
     const { data, error } = await supabase.from('users').insert({
       username: process.env.ADMIN_USERNAME || 'admin',
       name: process.env.ADMIN_NAME || 'Admin User',

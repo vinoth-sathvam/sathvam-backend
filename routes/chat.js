@@ -1,6 +1,17 @@
-const express = require('express');
-const router  = express.Router();
-const supabase = require('../config/supabase');
+const express   = require('express');
+const router    = express.Router();
+const supabase  = require('../config/supabase');
+const rateLimit = require('express-rate-limit');
+
+// Strict rate limit: 20 messages per 10 minutes per IP
+const chatLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many messages. Please wait a few minutes.' },
+  validate: { xForwardedForHeader: false },
+});
 
 // ── Fetch live products + prices + stock from DB ──────────────────────────────
 async function getLiveContext() {
@@ -129,7 +140,7 @@ async function sendIssueAlert(lead, messages, issueType) {
 }
 
 // ── POST /api/chat ────────────────────────────────────────────────────────────
-router.post('/', async (req, res) => {
+router.post('/', chatLimiter, async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Service unavailable' });
 

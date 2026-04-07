@@ -1,7 +1,15 @@
-const express = require('express');
-const supabase = require('../config/supabase');
-const { auth } = require('../middleware/auth');
-const router = express.Router();
+const express   = require('express');
+const supabase  = require('../config/supabase');
+const { auth }  = require('../middleware/auth');
+const rateLimit = require('express-rate-limit');
+const router    = express.Router();
+
+const reviewLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 5,
+  message: { error: 'Too many review submissions. Please try again later.' },
+  validate: { xForwardedForHeader: false },
+});
 
 // Admin: list all webstore orders
 router.get('/', auth, async (req, res) => {
@@ -85,11 +93,14 @@ router.get('/reviews/public/:product_id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/webstore-orders/reviews — submit review (public)
-router.post('/reviews', async (req, res) => {
+// POST /api/webstore-orders/reviews — submit review (public, rate limited)
+router.post('/reviews', reviewLimiter, async (req, res) => {
   try {
     const { product_id, product_name, order_id, reviewer_name, reviewer_email, rating, title, body } = req.body;
     if (!product_id || !rating || !reviewer_name) return res.status(400).json({ error: 'product_id, rating, reviewer_name required' });
+    if (reviewer_name.length > 100) return res.status(400).json({ error: 'Name too long' });
+    if (title && title.length > 200) return res.status(400).json({ error: 'Title too long' });
+    if (body && body.length > 2000) return res.status(400).json({ error: 'Review too long' });
     const { data, error } = await supabase.from('product_reviews')
       .insert({ product_id, product_name: product_name || '', order_id: order_id || null, reviewer_name, reviewer_email: reviewer_email || '', rating: Math.min(5, Math.max(1, parseInt(rating))), title: title || '', body: body || '', status: 'pending' })
       .select().single();

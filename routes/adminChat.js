@@ -1,7 +1,8 @@
 const express    = require('express');
 const router     = express.Router();
 const nodemailer = require('nodemailer');
-const { auth }   = require('../middleware/auth');
+const { auth, requireRole } = require('../middleware/auth');
+const adminOnly = [auth, requireRole('admin','manager')];
 const supabase   = require('../config/supabase');
 const { checkDailyTasks, sendReminders } = require('../config/scheduler');
 
@@ -440,6 +441,139 @@ const TOOLS = [
         limit:  { type: 'number', description: 'Max results (default 10)' },
       },
     },
+  },
+  {
+    name: 'get_operations_status',
+    description: 'Get a full cross-module operations snapshot: overdue staff tasks, pending leave requests, pending returns, quality failures, compliance expiry alerts, active delivery runs, pending product reviews. Use for "what needs attention", "operations overview", morning briefing, or any broad status question.',
+    input_schema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_staff_tasks',
+    description: 'Get staff tasks. Use for task list, overdue tasks, who has what assigned, task progress.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        status:      { type: 'string', enum: ['todo','in_progress','done','all'], description: 'Filter by status (default: all open)' },
+        assigned_to: { type: 'string', description: 'Filter by assignee name (partial match)' },
+        priority:    { type: 'string', enum: ['high','medium','low'], description: 'Filter by priority' },
+      },
+    },
+  },
+  {
+    name: 'create_staff_task',
+    description: 'Create a new staff task. Use when asked to assign a task or reminder to a team member.',
+    input_schema: {
+      type: 'object',
+      required: ['title'],
+      properties: {
+        title:         { type: 'string', description: 'Task title' },
+        description:   { type: 'string', description: 'Task details' },
+        assigned_name: { type: 'string', description: 'Who to assign to' },
+        due_date:      { type: 'string', description: 'Due date YYYY-MM-DD' },
+        priority:      { type: 'string', enum: ['high','medium','low'], description: 'Priority (default: medium)' },
+        category:      { type: 'string', description: 'Category: production, procurement, delivery, quality, admin, general' },
+      },
+    },
+  },
+  {
+    name: 'get_leave_requests',
+    description: 'Get employee leave requests. Use for pending approvals, who is on leave, leave history.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', enum: ['pending','approved','rejected','all'], description: 'Filter by status (default: pending)' },
+        limit:  { type: 'number', description: 'Max results (default 20)' },
+      },
+    },
+  },
+  {
+    name: 'approve_leave',
+    description: 'Approve or reject an employee leave request by ID.',
+    input_schema: {
+      type: 'object',
+      required: ['leave_id','action'],
+      properties: {
+        leave_id: { type: 'number', description: 'Leave request ID' },
+        action:   { type: 'string', enum: ['approved','rejected'], description: 'Approve or reject' },
+        notes:    { type: 'string', description: 'Optional notes' },
+      },
+    },
+  },
+  {
+    name: 'get_returns',
+    description: 'Get return and refund requests. Use for returns overview, pending refunds, refund amounts.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', enum: ['pending','approved','refunded','rejected','all'], description: 'Filter by status (default: all)' },
+        limit:  { type: 'number', description: 'Max results (default 20)' },
+      },
+    },
+  },
+  {
+    name: 'get_quality_status',
+    description: 'Get quality control test results and pass/fail stats by product. Use for quality overview, fail rates, which products have issues.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        product_name: { type: 'string', description: 'Filter by product name (partial match)' },
+        result:       { type: 'string', enum: ['pass','fail','hold'], description: 'Filter by result' },
+        limit:        { type: 'number', description: 'Max test records (default 20)' },
+      },
+    },
+  },
+  {
+    name: 'get_compliance_status',
+    description: 'Get compliance documents status — FSSAI, GST, trade licenses, certifications. Use for expiry alerts, document tracking.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', enum: ['valid','expiring_soon','expired','all'], description: 'Filter by status (default: all non-valid)' },
+      },
+    },
+  },
+  {
+    name: 'get_delivery_status',
+    description: 'Get delivery runs and their status. Use for dispatch overview, pending deliveries, driver assignments.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', enum: ['pending','in_transit','completed','all'], description: 'Filter by status' },
+        limit:  { type: 'number', description: 'Max results (default 10)' },
+      },
+    },
+  },
+  {
+    name: 'get_demand_forecast',
+    description: 'Get demand forecast for the next N weeks based on 90 days of sales history. Use for production planning, what to make next.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        weeks: { type: 'number', description: 'Forecast horizon in weeks (default 4)' },
+        limit: { type: 'number', description: 'Top N products to show (default 10)' },
+      },
+    },
+  },
+  {
+    name: 'get_reviews_summary',
+    description: 'Get product review summary — pending approvals, average ratings, recent reviews.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        status: { type: 'string', enum: ['pending','approved','rejected','all'], description: 'Filter by status (default: all)' },
+        limit:  { type: 'number', description: 'Max results (default 20)' },
+      },
+    },
+  },
+  {
+    name: 'get_crm_summary',
+    description: 'Get webstore customer CRM summary — top customers, total revenue, repeat customer count.',
+    input_schema: { type: 'object', properties: { limit: { type: 'number', description: 'Top N customers (default 10)' } } },
+  },
+  {
+    name: 'get_coupon_performance',
+    description: 'Get coupon usage stats — which coupons are used most, usage counts, active/inactive.',
+    input_schema: { type: 'object', properties: {} },
   },
 ];
 
@@ -1102,6 +1236,207 @@ async function executeTool(name, input) {
         };
       }
 
+      case 'get_operations_status': {
+        const today = new Date().toISOString().slice(0,10);
+        const [
+          { data: tasks },
+          { data: leaves },
+          { data: returns },
+          { data: qTests },
+          { data: compliance },
+          { data: deliveries },
+          { data: reviews },
+        ] = await Promise.all([
+          supabase.from('staff_tasks').select('id,title,status,priority,due_date,assigned_name').neq('status','done'),
+          supabase.from('leave_requests').select('id,employee_name,leave_type,from_date,to_date,days,status').eq('status','pending'),
+          supabase.from('return_requests').select('id,customer_name,refund_amount,status,created_at').eq('status','pending'),
+          supabase.from('quality_tests').select('id,product_name,result,tested_at').in('result',['fail','hold']).gte('tested_at', new Date(Date.now()-7*86400000).toISOString()),
+          supabase.from('compliance_documents').select('id,title,category,expiry_date,status').in('status',['expired','expiring_soon']),
+          supabase.from('delivery_runs').select('id,delivery_date,driver_name,total_orders,status').in('status',['pending','in_transit']),
+          supabase.from('product_reviews').select('id,reviewer_name,product_name,rating,created_at').eq('status','pending'),
+        ]);
+
+        const overdueTasks  = (tasks||[]).filter(t=>t.due_date&&t.due_date<today);
+        const highPriority  = (tasks||[]).filter(t=>t.priority==='high');
+        const alerts = [];
+        if (overdueTasks.length)       alerts.push(`${overdueTasks.length} overdue task(s)`);
+        if (highPriority.length)       alerts.push(`${highPriority.length} high-priority task(s) open`);
+        if ((leaves||[]).length)       alerts.push(`${leaves.length} leave request(s) pending approval`);
+        if ((returns||[]).length)      alerts.push(`${returns.length} return/refund request(s) pending`);
+        if ((qTests||[]).length)       alerts.push(`${qTests.length} quality fail/hold in the last 7 days`);
+        if ((compliance||[]).filter(c=>c.status==='expired').length) alerts.push(`${(compliance||[]).filter(c=>c.status==='expired').length} compliance document(s) EXPIRED`);
+        if ((compliance||[]).filter(c=>c.status==='expiring_soon').length) alerts.push(`${(compliance||[]).filter(c=>c.status==='expiring_soon').length} compliance document(s) expiring soon`);
+        if ((deliveries||[]).length)   alerts.push(`${deliveries.length} delivery run(s) in progress`);
+        if ((reviews||[]).length)      alerts.push(`${reviews.length} product review(s) awaiting approval`);
+
+        return {
+          alerts,
+          alert_count:       alerts.length,
+          overdue_tasks:     overdueTasks.map(t=>({ id:t.id, title:t.title, due:t.due_date, assigned:t.assigned_name, priority:t.priority })),
+          open_tasks:        (tasks||[]).length,
+          pending_leaves:    leaves||[],
+          pending_returns:   (returns||[]).map(r=>({ id:r.id, customer:r.customer_name, amount:r.refund_amount, created:r.created_at?.slice(0,10) })),
+          quality_issues:    (qTests||[]).map(q=>({ product:q.product_name, result:q.result, date:q.tested_at?.slice(0,10) })),
+          compliance_alerts: compliance||[],
+          active_deliveries: deliveries||[],
+          pending_reviews:   (reviews||[]).length,
+          summary: alerts.length===0 ? 'All operations are clear. No pending alerts.' : `${alerts.length} item(s) need attention: ${alerts.join(', ')}.`,
+        };
+      }
+
+      case 'get_staff_tasks': {
+        const status = input.status || 'open';
+        let q = supabase.from('staff_tasks').select('id,title,description,assigned_name,due_date,priority,category,status,created_at').order('due_date',{ascending:true}).limit(50);
+        if (status === 'open') { q = q.neq('status','done'); }
+        else if (status !== 'all') { q = q.eq('status', status); }
+        if (input.assigned_to) q = q.ilike('assigned_name', `%${input.assigned_to}%`);
+        if (input.priority)    q = q.eq('priority', input.priority);
+        const { data, error } = await q;
+        if (error) return { error: error.message };
+        const today = new Date().toISOString().slice(0,10);
+        const tasks = (data||[]).map(t=>({ ...t, overdue: t.status!=='done'&&t.due_date&&t.due_date<today }));
+        return { tasks, count:tasks.length, overdue_count: tasks.filter(t=>t.overdue).length };
+      }
+
+      case 'create_staff_task': {
+        const { data, error } = await supabase.from('staff_tasks').insert({
+          title:         input.title,
+          description:   input.description || '',
+          assigned_name: input.assigned_name || '',
+          due_date:      input.due_date || null,
+          priority:      input.priority || 'medium',
+          category:      input.category || 'general',
+          status:        'todo',
+        }).select().single();
+        if (error) return { error: error.message };
+        return { success:true, task: data, message: `Task "${input.title}" created${input.assigned_name?` and assigned to ${input.assigned_name}`:''}${input.due_date?`, due ${input.due_date}`:''}` };
+      }
+
+      case 'get_leave_requests': {
+        const status = input.status || 'pending';
+        let q = supabase.from('leave_requests').select('*').order('created_at',{ascending:false}).limit(input.limit||20);
+        if (status !== 'all') q = q.eq('status', status);
+        const { data, error } = await q;
+        if (error) return { error: error.message };
+        return { requests: data||[], count:(data||[]).length, pending_count:(data||[]).filter(r=>r.status==='pending').length };
+      }
+
+      case 'approve_leave': {
+        const { data, error } = await supabase.from('leave_requests').update({ status:input.action, notes:input.notes||'', updated_at:new Date().toISOString() }).eq('id', input.leave_id).select().single();
+        if (error) return { error: error.message };
+        return { success:true, action:input.action, employee:data.employee_name, days:data.days, leave_type:data.leave_type, message:`Leave ${input.action} for ${data.employee_name} (${data.days} day${data.days!==1?'s':''} ${data.leave_type})` };
+      }
+
+      case 'get_returns': {
+        const status = input.status || 'all';
+        let q = supabase.from('return_requests').select('*').order('created_at',{ascending:false}).limit(input.limit||20);
+        if (status !== 'all') q = q.eq('status', status);
+        const { data, error } = await q;
+        if (error) return { error: error.message };
+        const totalPending  = (data||[]).filter(r=>r.status==='pending').length;
+        const totalRefunded = (data||[]).filter(r=>r.status==='refunded').reduce((s,r)=>s+(r.refund_amount||0),0);
+        return { returns:data||[], count:(data||[]).length, pending_count:totalPending, total_refunded:Math.round(totalRefunded), summary:`${totalPending} pending, ₹${Math.round(totalRefunded).toLocaleString('en-IN')} refunded so far` };
+      }
+
+      case 'get_quality_status': {
+        let q = supabase.from('quality_tests').select('id,product_name,batch_number,test_type,result,tested_by,notes,tested_at').order('tested_at',{ascending:false}).limit(input.limit||20);
+        if (input.result) q = q.eq('result', input.result);
+        if (input.product_name) q = q.ilike('product_name', `%${input.product_name}%`);
+        const { data, error } = await q;
+        const { data: stats } = await supabase.from('quality_tests').select('product_name,result');
+        const byProduct = {};
+        for (const t of stats||[]) {
+          if (!byProduct[t.product_name]) byProduct[t.product_name] = { pass:0, fail:0, hold:0 };
+          byProduct[t.product_name][t.result] = (byProduct[t.product_name][t.result]||0)+1;
+        }
+        const failProducts = Object.entries(byProduct).filter(([,s])=>s.fail>0).map(([p,s])=>({ product:p, fails:s.fail, passes:s.pass, rate:Math.round(s.pass/(s.pass+s.fail+s.hold)*100)+'%' }));
+        return { recent_tests:(data||[]), fail_summary:failProducts, total_tests:(stats||[]).length, recent_fails:(data||[]).filter(t=>t.result==='fail').length };
+      }
+
+      case 'get_compliance_status': {
+        const status = input.status || 'non_valid';
+        let q = supabase.from('compliance_documents').select('*').order('expiry_date',{ascending:true});
+        if (status === 'non_valid') { q = q.in('status',['expired','expiring_soon']); }
+        else if (status !== 'all') { q = q.eq('status', status); }
+        const { data, error } = await q;
+        if (error) return { error: error.message };
+        const expired  = (data||[]).filter(d=>d.status==='expired');
+        const expiring = (data||[]).filter(d=>d.status==='expiring_soon');
+        const summary = expired.length===0&&expiring.length===0 ? 'All compliance documents are valid.' : `${expired.length} expired, ${expiring.length} expiring soon.`;
+        return { documents:data||[], expired_count:expired.length, expiring_soon_count:expiring.length, summary, urgent: expired.map(d=>({ title:d.title, category:d.category, expired_on:d.expiry_date })) };
+      }
+
+      case 'get_delivery_status': {
+        const status = input.status;
+        let q = supabase.from('delivery_runs').select('id,delivery_date,driver_name,driver_phone,vehicle_number,total_orders,status,created_at').order('delivery_date',{ascending:false}).limit(input.limit||10);
+        if (status && status !== 'all') q = q.eq('status', status);
+        const { data, error } = await q;
+        if (error) return { error: error.message };
+        const active = (data||[]).filter(d=>['pending','in_transit'].includes(d.status));
+        return { runs:data||[], active_count:active.length, active_runs:active, summary: active.length>0 ? `${active.length} delivery run(s) active` : 'No active deliveries' };
+      }
+
+      case 'get_demand_forecast': {
+        const weeks = input.weeks || 4;
+        const limit = input.limit || 10;
+        const since = new Date(); since.setDate(since.getDate()-90);
+        const [{ data: wsOrders }, { data: b2bOrders }] = await Promise.all([
+          supabase.from('webstore_orders').select('items,created_at,status').gte('created_at',since.toISOString()).neq('status','cancelled'),
+          supabase.from('b2b_orders').select('items,created_at,status').gte('created_at',since.toISOString()).neq('status','cancelled'),
+        ]);
+        const salesMap = {}, productNames = {};
+        const addItems = (items, createdAt) => {
+          for (const item of (items||[])) {
+            const id = item.product_id||item.id||item.name; if(!id) continue;
+            productNames[id] = item.product_name||item.name||id;
+            salesMap[id] = (salesMap[id]||0) + parseFloat(item.quantity||item.qty||0);
+          }
+        };
+        for (const o of wsOrders||[]) addItems(Array.isArray(o.items)?o.items:[], o.created_at);
+        for (const o of b2bOrders||[]) addItems(Array.isArray(o.items)?o.items:[], o.created_at);
+        const forecasts = Object.entries(salesMap).map(([id,total])=>({
+          product: productNames[id], avg_weekly: Math.round(total/13*10)/10, forecast_qty: Math.ceil(total/13*weeks), weeks,
+        })).sort((a,b)=>b.forecast_qty-a.forecast_qty).slice(0,limit);
+        return { forecasts, forecast_weeks:weeks, top_product: forecasts[0]?.product||'N/A', summary: `Top ${forecasts.length} products forecast for ${weeks} weeks based on 90-day sales` };
+      }
+
+      case 'get_reviews_summary': {
+        const status = input.status || 'all';
+        let q = supabase.from('product_reviews').select('id,product_name,reviewer_name,rating,title,status,created_at').order('created_at',{ascending:false}).limit(input.limit||20);
+        if (status !== 'all') q = q.eq('status', status);
+        const { data, error } = await q;
+        if (error) return { error: error.message };
+        const pending  = (data||[]).filter(r=>r.status==='pending').length;
+        const approved = (data||[]).filter(r=>r.status==='approved');
+        const avgRating = approved.length ? Math.round(approved.reduce((s,r)=>s+r.rating,0)/approved.length*10)/10 : 0;
+        return { reviews:data||[], total:(data||[]).length, pending_count:pending, approved_count:approved.length, avg_rating:avgRating, summary:`${pending} pending approval, avg rating ${avgRating}★ from ${approved.length} approved reviews` };
+      }
+
+      case 'get_crm_summary': {
+        const { data: orders, error } = await supabase.from('webstore_orders').select('customer_name,customer_phone,customer_email,total_amount,status,created_at').neq('status','cancelled');
+        if (error) return { error: error.message };
+        const map = {};
+        for (const o of orders||[]) {
+          const key = o.customer_phone||o.customer_email||o.customer_name; if(!key) continue;
+          if(!map[key]) map[key]={ name:o.customer_name, phone:o.customer_phone, orders:0, total_spent:0 };
+          map[key].orders++; map[key].total_spent+=(o.total_amount||0);
+        }
+        const customers = Object.values(map).sort((a,b)=>b.total_spent-a.total_spent);
+        const top = customers.slice(0, input.limit||10);
+        const repeat = customers.filter(c=>c.orders>1).length;
+        const totalRevenue = customers.reduce((s,c)=>s+c.total_spent,0);
+        return { top_customers:top, total_customers:customers.length, repeat_customers:repeat, total_revenue:Math.round(totalRevenue), avg_ltv: customers.length?Math.round(totalRevenue/customers.length):0, summary:`${customers.length} customers, ${repeat} repeat, ₹${Math.round(totalRevenue/1000)}K total revenue` };
+      }
+
+      case 'get_coupon_performance': {
+        const { data, error } = await supabase.from('coupons').select('*').order('uses_count',{ascending:false});
+        if (error) return { error: error.message };
+        const active   = (data||[]).filter(c=>c.active);
+        const inactive = (data||[]).filter(c=>!c.active);
+        const totalUses = (data||[]).reduce((s,c)=>s+(c.uses_count||0),0);
+        return { coupons:data||[], active_count:active.length, inactive_count:inactive.length, total_uses:totalUses, top_coupons:(data||[]).slice(0,5).map(c=>({ code:c.code, type:c.type, value:c.value, uses:c.uses_count })), summary:`${active.length} active coupons, ${totalUses} total uses` };
+      }
+
       default:
         return { error: `Unknown tool: ${name}` };
     }
@@ -1111,7 +1446,7 @@ async function executeTool(name, input) {
 }
 
 // ── POST /api/admin-chat ──────────────────────────────────────────────────────
-router.post('/', auth, async (req, res) => {
+router.post('/', ...adminOnly, async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'AI service not configured' });
 
@@ -1124,31 +1459,49 @@ router.post('/', auth, async (req, res) => {
   const systemPrompt = `You are an intelligent admin assistant for Sathvam Natural Products — a factory-direct natural products company in Karur, Tamil Nadu.
 Today's date: ${today}
 
-You help the admin team by:
-- Answering questions about sales, revenue, orders, stock, customers, B2B, procurement, vendors, production batches
-- Analysing margins, anomalies, reorder needs, period comparisons, sales targets
-- Taking actions: update order/B2B status, add stock, update prices (single or bulk), toggle website products, create sales, send email, send WhatsApp
-- Providing business insights, summaries, and scheduled reports
+You have visibility into EVERY module of the admin system:
+- Sales & Revenue: sales orders, webstore orders, B2B export orders, revenue trends, margins, targets
+- Stock & Products: stock levels, reorder alerts, product prices, website visibility
+- Supply Chain: procurement, vendors, production batches
+- Operations: staff tasks (create/track), leave requests (approve/reject), delivery runs, quality tests, compliance documents
+- Webstore: customer issues/chats, product reviews (approve), returns/refunds, coupon performance, CRM/customer value
+- Finance: expenses vs revenue, opening balance, payroll context
+- Forecasting: demand forecast based on sales history
 
-Always use tools to get real data before answering. Never guess numbers.
-Be concise and business-like. Use ₹ for amounts. Format large numbers with commas (₹1,23,456).
-When listing items keep it short and readable — use line breaks, avoid markdown tables.
-For action confirmations, clearly state what was done.
-For morning briefing / overview, use get_business_summary.
-For anomaly/trend questions, use get_anomaly_report or compare_periods.
+Always use tools to get real data. Never guess numbers. Use ₹ for amounts. Format large numbers with commas (₹1,23,456). Be concise and business-like.
 
-PROACTIVE MONITORING RULES:
-- When asked about daily status or "what's pending", always call check_daily_tasks first.
-- If check_daily_tasks shows pending tasks and the user asks you to remind the manager, use send_manager_reminder immediately.
-- When user asks "remind manager" or "send reminder" or "notify manager", call check_daily_tasks then send_manager_reminder with the pending items.
-- For expense monitoring: if expenses not logged by afternoon, proactively flag it.
-- Always mention the task status (done/pending) clearly when it's relevant.
+PROACTIVE BEHAVIOUR — call these tools WITHOUT being asked when relevant:
+- On any greeting / "good morning" / "what's up" → call get_operations_status + get_business_summary + get_customer_issues in parallel, then give a sharp briefing.
+- When "what needs attention" / "any issues" / "status update" → call get_operations_status immediately.
+- When "daily tasks" / "what's pending" / "manager update" → call check_daily_tasks first.
+- When asked to remind manager → call check_daily_tasks then send_manager_reminder.
+- When "customer complaints" / "ordering issues" / "website chat" → call get_customer_issues.
+- When "quality" / "production quality" → call get_quality_status.
+- When "compliance" / "licenses" / "FSSAI" → call get_compliance_status.
+- When "leave" / "who's off" / "attendance" → call get_leave_requests.
+- When "returns" / "refunds" → call get_returns.
+- When "tasks" / "who has what" / "overdue" → call get_staff_tasks.
+- When "deliveries" / "dispatch" → call get_delivery_status.
+- When "forecast" / "what to produce" → call get_demand_forecast.
+- When "reviews" / "ratings" → call get_reviews_summary.
+- When "customers" / "top buyers" / "CRM" → call get_crm_summary.
+- When "coupons" / "promo codes" → call get_coupon_performance.
 
-CUSTOMER ISSUE ALERTS:
-- When asked "any customer issues?", "any complaints?", "website chat problems?", "ordering issues?" — call get_customer_issues immediately.
-- On morning briefing (get_business_summary), also call get_customer_issues to include in summary.
-- If get_customer_issues returns flagged issues, highlight them clearly: customer name, phone, issue type.
-- Always suggest the admin check Webstore → Customer Chats to view the full conversation.`;
+ACTION CAPABILITIES:
+- Create staff tasks: create_staff_task
+- Approve/reject leave: approve_leave
+- Update orders, prices, stock, B2B stage, send reminders, send email/WhatsApp
+
+ALERT PRIORITIES (always surface these first if found):
+1. Expired compliance documents
+2. Overdue staff tasks
+3. Customer ordering issues
+4. Quality failures/holds (last 7 days)
+5. Pending returns
+6. Pending leave approvals
+7. Low stock items
+
+When listing items: use short readable lines, no markdown tables. For action confirmations, clearly state what was done. For morning briefing, use get_business_summary + get_operations_status + get_customer_issues together.`;
 
   let apiMessages = messages.slice(-14).map(m => ({
     role: m.role === 'assistant' ? 'assistant' : 'user',
@@ -1191,13 +1544,14 @@ CUSTOMER ISSUE ALERTS:
 });
 
 // ── GET /api/admin-chat/briefing — auto morning summary ──────────────────────
-router.get('/briefing', auth, async (req, res) => {
-  const [summary, expenses, customerIssues] = await Promise.all([
+router.get('/briefing', ...adminOnly, async (req, res) => {
+  const [summary, expenses, customerIssues, operations] = await Promise.all([
     executeTool('get_business_summary', {}),
     executeTool('get_expense_summary', {}),
     executeTool('get_customer_issues', { status: 'open', limit: 10 }),
+    executeTool('get_operations_status', {}),
   ]);
-  res.json({ ...summary, expenses, customerIssues });
+  res.json({ ...summary, expenses, customerIssues, operations });
 });
 
 module.exports = router;

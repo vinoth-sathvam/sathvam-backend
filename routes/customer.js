@@ -5,7 +5,8 @@ const jwt       = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
 const router    = express.Router();
 
-const JWT_SECRET = process.env.JWT_SECRET || 'sathvam-cust-secret-2024';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) { console.error('FATAL: JWT_SECRET not set'); process.exit(1); }
 
 const custAuth = (req, res, next) => {
   const token = (req.headers.authorization || '').replace('Bearer ', '');

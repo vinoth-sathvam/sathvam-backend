@@ -123,6 +123,20 @@ router.post('/verify', async (req, res) => {
       return res.status(400).json({ error: 'Payment verification failed' });
     }
 
+    // Verify the actual amount paid matches order total via Razorpay API
+    try {
+      const rzpPayment = await razorpay.payments.fetch(razorpay_payment_id);
+      const paidAmount = rzpPayment.amount / 100; // paise → rupees
+      const orderTotal = parseFloat(order?.total || 0);
+      if (Math.abs(paidAmount - orderTotal) > 1) { // allow ₹1 rounding tolerance
+        console.error(`Amount mismatch: paid ₹${paidAmount}, order ₹${orderTotal}`);
+        return res.status(400).json({ error: 'Payment amount mismatch' });
+      }
+    } catch (amtErr) {
+      console.error('Amount verification error:', amtErr.message);
+      // Non-blocking: continue if Razorpay API is unavailable — signature already verified
+    }
+
     // Save webstore order
     const o = order;
     const { error: wsErr } = await supabase.from('webstore_orders').insert({
@@ -215,7 +229,7 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
     res.json({ received: true });
   } catch (err) {
     console.error('Webhook error:', err.message);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: 'Webhook processing error' });
   }
 });
 

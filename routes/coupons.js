@@ -1,7 +1,15 @@
-const express = require('express');
-const router = express.Router();
-const supabase = require('../config/supabase');
-const { auth } = require('../middleware/auth');
+const express   = require('express');
+const router    = express.Router();
+const supabase  = require('../config/supabase');
+const { auth }  = require('../middleware/auth');
+const rateLimit = require('express-rate-limit');
+
+const couponLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: { error: 'Too many coupon attempts. Please try again later.' },
+  validate: { xForwardedForHeader: false },
+});
 
 // GET /api/coupons — list coupons (admin)
 router.get('/', auth, async (req, res) => {
@@ -47,7 +55,7 @@ router.delete('/:id', auth, async (req, res) => {
 });
 
 // POST /api/coupons/validate — public endpoint for webstore checkout
-router.post('/validate', async (req, res) => {
+router.post('/validate', couponLimiter, async (req, res) => {
   try {
     const { code, cart_total } = req.body;
     if (!code) return res.status(400).json({ error: 'Code required' });
@@ -65,16 +73,25 @@ router.post('/validate', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/coupons/:id/redeem — record redemption
-router.post('/:id/redeem', async (req, res) => {
+// POST /api/coupons/:id/redeem — record redemption (requires auth)
+router.post('/:id/redeem', auth, async (req, res) => {
   try {
     const { order_id, order_number, discount_applied } = req.body;
+    if (!order_id) return res.status(400).json({ error: 'order_id required' });
+    // Atomic increment to prevent race condition
+    const { data: c, error: fetchErr } = await supabase.from('coupons').select('id,uses_count,max_uses,active,expires_at').eq('id', parseInt(req.params.id)).single();
+    if (fetchErr || !c) return res.status(404).json({ error: 'Coupon not found' });
+    if (!c.active) return res.status(400).json({ error: 'Coupon is inactive' });
+    if (c.expires_at && new Date(c.expires_at) < new Date()) return res.status(400).json({ error: 'Coupon expired' });
+    if (c.max_uses && c.uses_count >= c.max_uses) return res.status(400).json({ error: 'Coupon usage limit reached' });
+    // Atomic update with condition to prevent race condition
+    const { error: updateErr } = await supabase.from('coupons')
+      .update({ uses_count: c.uses_count + 1 })
+      .eq('id', c.id)
+      .eq('uses_count', c.uses_count); // optimistic lock
+    if (updateErr) return res.status(409).json({ error: 'Concurrent redemption conflict, please retry' });
     await supabase.from('coupon_redemptions')
-      .insert({ coupon_id: parseInt(req.params.id), order_id, order_number: order_number || '', discount_applied: discount_applied || 0 });
-    await supabase.from('coupons').update({ uses_count: supabase.rpc ? undefined : undefined }).eq('id', req.params.id);
-    // Increment uses_count
-    const { data: c } = await supabase.from('coupons').select('uses_count').eq('id', req.params.id).single();
-    await supabase.from('coupons').update({ uses_count: (c?.uses_count || 0) + 1 }).eq('id', req.params.id);
+      .insert({ coupon_id: c.id, order_id, order_number: order_number || '', discount_applied: discount_applied || 0 });
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
