@@ -11,6 +11,7 @@ const MILLET_SIZES  = ['100g','200g','250g','500g','1kg'];
 
 // ── GET all materials ──────────────────────────────────────────────────────────
 router.get('/', auth, async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
   const { data, error } = await supabase
     .from('packing_materials')
     .select('*')
@@ -24,16 +25,21 @@ router.get('/', auth, async (req, res) => {
 
 // ── POST create material ───────────────────────────────────────────────────────
 router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
-  const { name, category, product_name, size, cover_size, unit, current_stock, min_stock, reorder_qty, unit_price, supplier, notes } = req.body;
+  const { name, category, product_name, size, cover_size, spec, unit, current_stock, min_stock, reorder_qty, unit_price, supplier, notes } = req.body;
   if (!name || !category) return res.status(400).json({ error: 'name and category required' });
-  const { data, error } = await supabase.from('packing_materials').insert({
-    name: name.trim(), category, product_name: product_name||'', size: size||'',
-    cover_size: cover_size||'', unit: unit||'pcs',
+  // spec supersedes old size/cover_size fields
+  const resolvedSize = spec || size || '';
+  const insertObj = {
+    name: name.trim(), category, product_name: product_name||'', size: resolvedSize,
+    cover_size: cover_size||resolvedSize, unit: unit||'pcs',
     current_stock: parseInt(current_stock)||0,
     min_stock: parseInt(min_stock)||50, reorder_qty: parseInt(reorder_qty)||100,
     unit_price: parseFloat(unit_price)||0, supplier: supplier||'',
     notes: notes||'', active: true, updated_at: new Date().toISOString(),
-  }).select().single();
+  };
+  // include spec column only if it exists (won't cause error if it doesn't)
+  if (spec !== undefined) insertObj.spec = spec;
+  const { data, error } = await supabase.from('packing_materials').insert(insertObj).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.status(201).json(data);
 });
@@ -41,7 +47,7 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
 // ── PUT update material ────────────────────────────────────────────────────────
 router.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const u = { updated_at: new Date().toISOString() };
-  const fields = ['name','category','product_name','size','cover_size','unit','current_stock','min_stock','reorder_qty','unit_price','supplier','notes','active'];
+  const fields = ['name','category','product_name','size','cover_size','spec','unit','current_stock','min_stock','reorder_qty','unit_price','supplier','notes','active'];
   fields.forEach(f => { if (req.body[f] != null) u[f] = req.body[f]; });
   if (u.current_stock != null) u.current_stock = parseInt(u.current_stock);
   if (u.min_stock     != null) u.min_stock     = parseInt(u.min_stock);
