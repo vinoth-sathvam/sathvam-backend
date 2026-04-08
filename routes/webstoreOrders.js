@@ -106,13 +106,16 @@ function buildInvoiceHtml(o, autoPrint = false) {
   .footer{margin-top:16px;padding-top:10px;border-top:1px dashed #ccc;font-size:10px;color:#aaa;text-align:center;line-height:1.7}
 </style></head><body>
   <div class="hdr">
-    <div>
+    <div style="display:flex;align-items:center;gap:12px">
+      <img src="https://admin.sathvam.in/logo.jpg" alt="Sathvam" style="height:60px;width:auto;object-fit:contain"/>
+      <div>
       <div class="co-name">Sathvam Oils and Spices Pvt Ltd</div>
       <div class="co-sub">
-        No.366B, Amarjothi Garden, Karur - 639004, Tamil Nadu, India<br>
+        Plot No. 6, Anand Jothi Nagar, Near ABS Hospital, Thanthoni, Tamil Nadu 639005<br>
         GSTIN: <strong>33ABFCS9387K1ZN</strong> &nbsp;|&nbsp; PAN: ABFCS9387K<br>
-        Phone: +91 81448 03555 &nbsp;|&nbsp; Email: vinoth@sathvam.in<br>
+        Phone: +91 70921 77092 &nbsp;|&nbsp; Email: sales@sathvam.in<br>
         Website: www.sathvam.in
+      </div>
       </div>
     </div>
     <div class="inv-right">
@@ -192,7 +195,7 @@ function buildInvoiceHtml(o, autoPrint = false) {
 
   <div class="footer">
     This is a computer-generated tax invoice and does not require a physical signature.<br>
-    Thank you for shopping with Sathvam! &nbsp;|&nbsp; Queries: +91 81448 03555 &nbsp;|&nbsp; vinoth@sathvam.in
+    Thank you for shopping with Sathvam! &nbsp;|&nbsp; Queries: +91 70921 77092 &nbsp;|&nbsp; sales@sathvam.in
   </div>
   ${autoPrint ? '<script>window.onload=()=>{setTimeout(()=>window.print(),500);}<\/script>' : ''}
 </body></html>`;
@@ -211,7 +214,7 @@ router.post('/:id/send-invoice', auth, async (req, res) => {
 
     const html = buildInvoiceHtml(o, false);
     await mailer.sendMail({
-      from:    process.env.SMTP_FROM || 'Sathvam Oils <vinoth@sathvam.in>',
+      from:    process.env.SMTP_FROM || 'Sathvam Oils <sales@sathvam.in>',
       to:      email,
       subject: `Your Invoice ${o.order_no} — Sathvam Oils & Spices`,
       html,
@@ -329,16 +332,48 @@ router.get('/reviews/public/:product_id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/webstore-orders/reviews — submit review (public, rate limited)
+// POST /api/webstore-orders/reviews/verify-purchase — check order before allowing review
+router.post('/reviews/verify-purchase', reviewLimiter, async (req, res) => {
+  try {
+    const { order_no } = req.body;
+    if (!order_no || !order_no.trim()) return res.status(400).json({ error: 'Order number required' });
+    const { data, error } = await supabase.from('webstore_orders')
+      .select('order_no, customer, items, status')
+      .eq('order_no', order_no.trim().toUpperCase())
+      .single();
+    if (error || !data) return res.status(404).json({ error: 'Order not found. Please check your order number.' });
+    if (!['confirmed','dispatched','delivered'].includes(data.status)) {
+      return res.status(400).json({ error: 'Only delivered or confirmed orders can be reviewed.' });
+    }
+    res.json({
+      valid: true,
+      customer_name: data.customer?.name || '',
+      items: (data.items || []).map(i => ({ id: i.id, name: i.name })),
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/webstore-orders/reviews — submit review (verified purchase only)
 router.post('/reviews', reviewLimiter, async (req, res) => {
   try {
-    const { product_id, product_name, order_id, reviewer_name, reviewer_email, rating, title, body } = req.body;
-    if (!product_id || !rating || !reviewer_name) return res.status(400).json({ error: 'product_id, rating, reviewer_name required' });
+    const { product_id, product_name, order_no, reviewer_name, reviewer_email, rating, title, body } = req.body;
+    if (!product_id || !rating || !reviewer_name || !order_no) return res.status(400).json({ error: 'product_id, rating, reviewer_name, order_no required' });
     if (reviewer_name.length > 100) return res.status(400).json({ error: 'Name too long' });
     if (title && title.length > 200) return res.status(400).json({ error: 'Title too long' });
     if (body && body.length > 2000) return res.status(400).json({ error: 'Review too long' });
+
+    // Verify the order exists and is from a real customer
+    const { data: order } = await supabase.from('webstore_orders')
+      .select('order_no, status').eq('order_no', order_no.trim().toUpperCase()).single();
+    if (!order) return res.status(400).json({ error: 'Invalid order number.' });
+
+    // Prevent duplicate review for same order + product
+    const { data: existing } = await supabase.from('product_reviews')
+      .select('id').eq('order_id', order_no.trim().toUpperCase()).eq('product_id', product_id).single();
+    if (existing) return res.status(400).json({ error: 'You have already reviewed this product.' });
+
     const { data, error } = await supabase.from('product_reviews')
-      .insert({ product_id, product_name: product_name || '', order_id: order_id || null, reviewer_name, reviewer_email: reviewer_email || '', rating: Math.min(5, Math.max(1, parseInt(rating))), title: title || '', body: body || '', status: 'pending' })
+      .insert({ product_id, product_name: product_name || '', order_id: order_no.trim().toUpperCase(), reviewer_name, reviewer_email: reviewer_email || '', rating: Math.min(5, Math.max(1, parseInt(rating))), title: title || '', body: body || '', status: 'pending' })
       .select().single();
     if (error) return res.status(400).json({ error: error.message });
     res.json(data);

@@ -274,6 +274,22 @@ vendors.get('/performance', auth, async (req, res) => {
 });
 
 const sales = express.Router();
+
+// GET /api/sales/next-invoice-no — returns next sequential invoice number for today
+// Format: SA{MMM}{DD}-{N}  e.g. SAAPR08-3
+sales.get('/next-invoice-no', auth, async (req, res) => {
+  const today = new Date().toISOString().slice(0, 10);
+  const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+  const d = new Date();
+  const prefix = `SA${months[d.getMonth()]}${String(d.getDate()).padStart(2,'0')}`;
+  const [s, w] = await Promise.all([
+    supabase.from('sales').select('id', { count: 'exact', head: true }).eq('date', today),
+    supabase.from('webstore_orders').select('id', { count: 'exact', head: true }).eq('date', today),
+  ]);
+  const seq = (s.count || 0) + (w.count || 0) + 1;
+  res.json({ formatted: `${prefix}-${seq}`, prefix, seq });
+});
+
 sales.get('/', auth, async (req, res) => {
   const { data, error } = await supabase.from('sales').select('*, sale_items(*)').order('date', { ascending: false }).limit(1000);
   if (error) return res.status(500).json({ error: 'Failed to load sales' });
