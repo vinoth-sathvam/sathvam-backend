@@ -132,4 +132,49 @@ router.post('/update', custAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// GET /api/customer/cart — fetch saved cart for logged-in customer
+router.get('/cart', custAuth, async (req, res) => {
+  try {
+    const sessionId = 'cust_' + req.customer.id;
+    const { data } = await supabase.from('abandoned_carts').select('items').eq('session_id', sessionId).maybeSingle();
+    res.json({ items: data?.items || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/customer/cart — save cart for logged-in customer
+router.post('/cart', custAuth, async (req, res) => {
+  try {
+    const { items } = req.body;
+    const sessionId = 'cust_' + req.customer.id;
+    if (!items || items.length === 0) {
+      await supabase.from('abandoned_carts').delete().eq('session_id', sessionId);
+    } else {
+      await supabase.from('abandoned_carts').upsert(
+        { session_id: sessionId, items, updated_at: new Date().toISOString() },
+        { onConflict: 'session_id' }
+      );
+    }
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/customer/wishlist — fetch saved wishlist for logged-in customer
+router.get('/wishlist', custAuth, async (req, res) => {
+  try {
+    const key = 'cust_wishlist_' + req.customer.id;
+    const { data } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
+    res.json({ items: data?.value || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/customer/wishlist — save wishlist for logged-in customer
+router.post('/wishlist', custAuth, async (req, res) => {
+  try {
+    const { items } = req.body;
+    const key = 'cust_wishlist_' + req.customer.id;
+    await supabase.from('settings').upsert({ key, value: items || [] }, { onConflict: 'key' });
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 module.exports = router;

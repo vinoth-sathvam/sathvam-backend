@@ -196,6 +196,38 @@ router.post('/orders', async (req, res) => {
   }
 });
 
+// GET /api/public/product-stats — sold counts (last 10 days) + approved ratings per product
+router.get('/product-stats', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const since = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const [{ data: orders }, { data: reviews }] = await Promise.all([
+      supabase.from('webstore_orders').select('items,status,created_at').gte('created_at', since).in('status', ['confirmed','paid','dispatched','delivered']),
+      supabase.from('product_reviews').select('product_id,rating').eq('status', 'approved'),
+    ]);
+    const soldCounts = {};
+    for (const order of (orders || [])) {
+      for (const item of (order.items || [])) {
+        const pid = item.id || item.productId;
+        if (!pid) continue;
+        soldCounts[pid] = (soldCounts[pid] || 0) + (Number(item.qty) || 1);
+      }
+    }
+    const ratingsAcc = {};
+    for (const r of (reviews || [])) {
+      if (!r.product_id || !r.rating) continue;
+      if (!ratingsAcc[r.product_id]) ratingsAcc[r.product_id] = { sum: 0, count: 0 };
+      ratingsAcc[r.product_id].sum += r.rating;
+      ratingsAcc[r.product_id].count += 1;
+    }
+    const ratings = {};
+    for (const [pid, { sum, count }] of Object.entries(ratingsAcc)) {
+      ratings[pid] = { avg: Math.round((sum / count) * 10) / 10, count };
+    }
+    res.json({ soldCounts, ratings });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // GET /api/public/content — website CMS content (hero, about, announcement, banners)
 router.get('/content', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');

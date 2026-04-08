@@ -14,7 +14,8 @@ products.post('/', auth, requireRole('admin'), async (req, res) => {
   const { data, error } = await supabase.from('products').insert({
     name:p.name, sku:p.sku, cat:p.cat, unit:p.unit||'pcs',
     pack_size:p.packSize, pack_unit:p.packUnit, oil_type_key:p.oilTypeKey,
-    raw_mat_key:p.rawMatKey, reorder:p.reorder||0, gst:p.gst||0,
+    raw_mat_key:p.rawMatKey, cake_type_key:p.cakeTypeKey||null,
+    reorder:p.reorder||0, gst:p.gst||0,
     price:p.price||0, retail_price:p.retailPrice, website_price:p.websitePrice,
     intl_price:p.intlPrice, retail_profit_pct:p.retailProfitPct,
     web_profit_pct:p.webProfitPct, web_courier_charge:p.webCourierCharge,
@@ -25,29 +26,7 @@ products.post('/', auth, requireRole('admin'), async (req, res) => {
   if (error) return res.status(400).json({ error: error.message });
   res.status(201).json(data);
 });
-products.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
-  const p = req.body;
-  const { data, error } = await supabase.from('products').update({
-    name:p.name, sku:p.sku, cat:p.cat, unit:p.unit,
-    pack_size:p.packSize, pack_unit:p.packUnit, oil_type_key:p.oilTypeKey,
-    reorder:p.reorder, gst:p.gst, price:p.price,
-    retail_price:p.retailPrice, website_price:p.websitePrice,
-    intl_price:p.intlPrice, retail_profit_pct:p.retailProfitPct,
-    web_profit_pct:p.webProfitPct, web_courier_charge:p.webCourierCharge,
-    intl_profit_pct:p.intlProfitPct, intl_carton_key:p.intlCartonKey,
-    label_cost:p.labelCost, pkg_type_key:p.pkgTypeKey, featured:p.featured,
-    image_url:p.imageUrl!==undefined?p.imageUrl:undefined,
-    description:p.description!==undefined?p.description:undefined,
-    hsn_code:p.hsnCode!==undefined?p.hsnCode:undefined
-  }).eq('id', req.params.id).select().single();
-  if (error) return res.status(400).json({ error: error.message });
-  res.json(data);
-});
-products.delete('/:id', auth, requireRole('admin'), async (req, res) => {
-  await supabase.from('products').update({ active: false }).eq('id', req.params.id);
-  res.json({ message: 'Deactivated' });
-});
-// Batch price/field update — updates multiple products at once
+// Batch price/field update — must be before /:id so Express doesn't match "batch" as an id
 products.put('/batch', auth, requireRole('admin', 'manager'), async (req, res) => {
   const prods = Array.isArray(req.body) ? req.body : [];
   if (prods.length === 0) return res.json({ updated: 0 });
@@ -55,7 +34,7 @@ products.put('/batch', auth, requireRole('admin', 'manager'), async (req, res) =
     id: p.id,
     name: p.name, sku: p.sku, cat: p.cat, unit: p.unit,
     pack_size: p.packSize, pack_unit: p.packUnit,
-    oil_type_key: p.oilTypeKey, raw_mat_key: p.rawMatKey,
+    oil_type_key: p.oilTypeKey, raw_mat_key: p.rawMatKey, cake_type_key: p.cakeTypeKey ?? null,
     reorder: p.reorder || 0, gst: p.gst || 0,
     price: p.price || 0,
     retail_price: p.retailPrice ?? null,
@@ -77,6 +56,29 @@ products.put('/batch', auth, requireRole('admin', 'manager'), async (req, res) =
   const { error } = await supabase.from('products').upsert(updates, { onConflict: 'id' });
   if (error) return res.status(400).json({ error: error.message });
   res.json({ updated: updates.length });
+});
+products.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
+  const p = req.body;
+  const { data, error } = await supabase.from('products').update({
+    name:p.name, sku:p.sku, cat:p.cat, unit:p.unit,
+    pack_size:p.packSize, pack_unit:p.packUnit, oil_type_key:p.oilTypeKey,
+    cake_type_key:p.cakeTypeKey!==undefined?p.cakeTypeKey:undefined,
+    reorder:p.reorder, gst:p.gst, price:p.price,
+    retail_price:p.retailPrice, website_price:p.websitePrice,
+    intl_price:p.intlPrice, retail_profit_pct:p.retailProfitPct,
+    web_profit_pct:p.webProfitPct, web_courier_charge:p.webCourierCharge,
+    intl_profit_pct:p.intlProfitPct, intl_carton_key:p.intlCartonKey,
+    label_cost:p.labelCost, pkg_type_key:p.pkgTypeKey, featured:p.featured,
+    image_url:p.imageUrl!==undefined?p.imageUrl:undefined,
+    description:p.description!==undefined?p.description:undefined,
+    hsn_code:p.hsnCode!==undefined?p.hsnCode:undefined
+  }).eq('id', req.params.id).select().single();
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(data);
+});
+products.delete('/:id', auth, requireRole('admin'), async (req, res) => {
+  await supabase.from('products').update({ active: false }).eq('id', req.params.id);
+  res.json({ message: 'Deactivated' });
 });
 products.get('/stock', auth, async (req, res) => {
   const { data, error } = await supabase.from('stock_ledger').select('*').order('date', { ascending: false }).limit(1000);
