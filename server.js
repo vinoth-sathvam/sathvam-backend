@@ -93,6 +93,7 @@ app.use('/api/quality',           require('./routes/quality'));
 app.use('/api/tasks',             require('./routes/tasks'));
 app.use('/api/compliance',        require('./routes/compliance'));
 app.use('/api/campaigns',         require('./routes/campaigns'));
+app.use('/api/messages',          require('./routes/messages'));
 
 // ── Weekly report manual trigger ──────────────────────────────────────────────
 const { startScheduler, buildWeeklyReport } = require('./config/scheduler');
