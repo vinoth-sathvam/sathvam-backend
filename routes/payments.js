@@ -139,8 +139,9 @@ router.post('/verify', async (req, res) => {
 
     // Save webstore order
     const o = order;
-    const { error: wsErr } = await supabase.from('webstore_orders').insert({
-      id:       o.id,
+    const dbId = crypto.randomUUID(); // always use a proper UUID for the DB row
+    const { error: wsErr } = await supabase.from('webstore_orders').upsert({
+      id:       dbId,
       order_no: o.orderNo,
       date:     o.date || new Date().toISOString().slice(0, 10),
       customer: o.customer || {},
@@ -152,8 +153,11 @@ router.post('/verify', async (req, res) => {
       status:   'confirmed',
       channel:  'website',
       notes:    `Razorpay: ${razorpay_payment_id}`,
-    });
-    if (wsErr) console.error('Webstore order save error:', wsErr.message);
+    }, { onConflict: 'id' });
+    if (wsErr) {
+      console.error('Webstore order save error:', wsErr.message, 'order_no:', o.orderNo, 'payment:', razorpay_payment_id);
+      return res.status(500).json({ error: 'Order save failed: ' + wsErr.message });
+    }
 
     // Save factory sale
     const customer = o.customer || {};

@@ -64,6 +64,23 @@ router.post('/bulk', auth, async (req, res) => {
   res.json({ synced: (data || []).length });
 });
 
+// Public: look up order status by order_no + phone (customer self-serve)
+router.get('/status', async (req, res) => {
+  const { order_no, phone } = req.query;
+  if (!order_no || !phone) return res.status(400).json({ error: 'order_no and phone required' });
+  const { data, error } = await supabase
+    .from('webstore_orders')
+    .select('id,order_no,status,delivered_date,items,customer')
+    .ilike('order_no', order_no.trim())
+    .single();
+  if (error || !data) return res.status(404).json({ error: 'Order not found' });
+  const orderPhone = (data.customer?.phone || '').replace(/\D/g,'');
+  const inputPhone = phone.trim().replace(/\D/g,'');
+  if (!orderPhone.endsWith(inputPhone.slice(-10)) && !inputPhone.endsWith(orderPhone.slice(-10)))
+    return res.status(403).json({ error: 'Phone number does not match' });
+  res.json({ id: data.id, order_no: data.order_no, status: data.status, delivered_date: data.delivered_date, items: data.items });
+});
+
 // ── Product Reviews ──────────────────────────────────────────────────────────
 
 // GET /api/webstore-orders/reviews — list all reviews (admin)
