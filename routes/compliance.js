@@ -1,79 +1,124 @@
 const express = require('express');
-const router = express.Router();
+const router  = express.Router();
+const { auth, requireRole } = require('../middleware/auth');
 const supabase = require('../config/supabase');
-const { auth } = require('../middleware/auth');
 
-// GET /api/compliance — list documents
+const TABLE   = 'compliance_items';
+const HIST    = 'compliance_history';
+
+function computeNextDue(item, fromDate) {
+  const base = fromDate ? new Date(fromDate) : new Date();
+  const y    = base.getFullYear();
+  const m    = base.getMonth();
+  const day  = item.due_day  || 20;
+  const mon  = (item.due_month || 1) - 1;
+
+  if (item.frequency === 'monthly') {
+    let d = new Date(y, m, day);
+    if (d <= base) d = new Date(y, m + 1, day);
+    return d.toISOString().slice(0, 10);
+  }
+  if (item.frequency === 'quarterly') {
+    const q = Math.ceil((m + 1) / 3);
+    const endMon = q * 3 - 1;
+    let d = new Date(y, endMon, day);
+    if (d <= base) d = new Date(y, endMon + 3, day);
+    return d.toISOString().slice(0, 10);
+  }
+  if (item.frequency === 'annual' || item.frequency === 'one_time') {
+    let d = new Date(y, mon, day);
+    if (d <= base) d = new Date(y + 1, mon, day);
+    return d.toISOString().slice(0, 10);
+  }
+  return item.next_due_date || null;
+}
+
 router.get('/', auth, async (req, res) => {
   try {
-    const { category, status, limit = 200 } = req.query;
-    let q = supabase.from('compliance_documents')
-      .select('*').order('expiry_date', { ascending: true }).limit(parseInt(limit));
-    if (category) q = q.eq('category', category);
-    if (status) q = q.eq('status', status);
-    const { data, error } = await q;
+    const { data: items, error } = await supabase
+      .from(TABLE).select('*').eq('active', true)
+      .order('next_due_date').order('name');
     if (error) return res.status(500).json({ error: error.message });
-    res.json(data || []);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const today = new Date().toISOString().slice(0, 10);
+    const result = (items || []).map(item => {
+      const due   = item.next_due_date || computeNextDue(item, null);
+      const diffMs = due ? new Date(due) - new Date(today) : null;
+      const daysUntil = diffMs != null ? Math.ceil(diffMs / 86400000) : null;
+      return { ...item, next_due_date: due, days_until_due: daysUntil,
+        status: daysUntil == null ? 'unknown' : daysUntil < 0 ? 'overdue' : daysUntil <= (item.alert_days_before||30) ? 'due_soon' : 'ok' };
+    });
+    res.json(result);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/compliance — add document
-router.post('/', auth, async (req, res) => {
+router.get('/alerts', auth, async (req, res) => {
   try {
-    const { title, category, document_number, issued_by, issue_date, expiry_date, file_url, notes } = req.body;
-    if (!title || !category) return res.status(400).json({ error: 'title and category required' });
-    // Auto-compute status
-    let status = 'valid';
-    if (expiry_date) {
-      const daysLeft = Math.ceil((new Date(expiry_date) - new Date()) / 86400000);
-      if (daysLeft < 0) status = 'expired';
-      else if (daysLeft <= 30) status = 'expiring_soon';
-    }
-    const { data, error } = await supabase.from('compliance_documents')
-      .insert({ title, category, document_number: document_number || '', issued_by: issued_by || '', issue_date: issue_date || null, expiry_date: expiry_date || null, file_url: file_url || '', notes: notes || '', status })
-      .select().single();
-    if (error) return res.status(400).json({ error: error.message });
-    res.json(data);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    const { data: items } = await supabase.from(TABLE).select('*').eq('active', true);
+    const today = new Date().toISOString().slice(0, 10);
+    const alerts = (items || []).map(item => {
+      const due = item.next_due_date || computeNextDue(item, null);
+      const diffMs = due ? new Date(due) - new Date(today) : null;
+      const daysUntil = diffMs != null ? Math.ceil(diffMs / 86400000) : null;
+      return { id: item.id, name: item.name, type: item.type, next_due_date: due, days_until_due: daysUntil,
+        status: daysUntil == null ? 'unknown' : daysUntil < 0 ? 'overdue' : daysUntil <= (item.alert_days_before||30) ? 'due_soon' : 'ok' };
+    }).filter(i => i.status === 'overdue' || i.status === 'due_soon')
+      .sort((a, b) => (a.days_until_due ?? 9999) - (b.days_until_due ?? 9999));
+    res.json(alerts);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// PATCH /api/compliance/:id — update document
-router.patch('/:id', auth, async (req, res) => {
-  try {
-    const allowed = ['title','category','document_number','issued_by','issue_date','expiry_date','file_url','notes','status'];
-    const updates = { updated_at: new Date().toISOString() };
-    for (const k of allowed) if (req.body[k] !== undefined) updates[k] = req.body[k];
-    // Recompute status if expiry changed
-    if (updates.expiry_date) {
-      const daysLeft = Math.ceil((new Date(updates.expiry_date) - new Date()) / 86400000);
-      if (!updates.status) updates.status = daysLeft < 0 ? 'expired' : daysLeft <= 30 ? 'expiring_soon' : 'valid';
-    }
-    const { data, error } = await supabase.from('compliance_documents')
-      .update(updates).eq('id', req.params.id).select().single();
-    if (error) return res.status(400).json({ error: error.message });
-    res.json(data);
-  } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// DELETE /api/compliance/:id
-router.delete('/:id', auth, async (req, res) => {
-  const { error } = await supabase.from('compliance_documents').delete().eq('id', req.params.id);
+router.post('/', auth, requireRole('admin', 'manager'), async (req, res) => {
+  const { name, type, frequency, due_day, due_month, next_due_date, cost, vendor, license_no, notes, alert_days_before } = req.body;
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const item = { name: name.trim(), type: type || 'other', frequency: frequency || 'annual',
+    due_day: parseInt(due_day) || 20, due_month: due_month ? parseInt(due_month) : null,
+    cost: parseFloat(cost) || 0, vendor: vendor || '', license_no: license_no || '',
+    notes: notes || '', alert_days_before: parseInt(alert_days_before) || 30,
+    active: true, updated_at: new Date().toISOString() };
+  item.next_due_date = next_due_date || computeNextDue(item, null);
+  const { data, error } = await supabase.from(TABLE).insert(item).select().single();
   if (error) return res.status(400).json({ error: error.message });
+  res.status(201).json(data);
+});
+
+router.put('/:id', auth, requireRole('admin', 'manager'), async (req, res) => {
+  const fields = ['name','type','frequency','due_day','due_month','next_due_date','last_completed_date','cost','vendor','license_no','notes','alert_days_before','active'];
+  const u = { updated_at: new Date().toISOString() };
+  fields.forEach(f => { if (req.body[f] != null) u[f] = req.body[f]; });
+  if (u.cost)              u.cost              = parseFloat(u.cost);
+  if (u.due_day)           u.due_day           = parseInt(u.due_day);
+  if (u.due_month)         u.due_month         = parseInt(u.due_month);
+  if (u.alert_days_before) u.alert_days_before = parseInt(u.alert_days_before);
+  const { data, error } = await supabase.from(TABLE).update(u).eq('id', req.params.id).select().single();
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(data);
+});
+
+router.delete('/:id', auth, requireRole('admin'), async (req, res) => {
+  await supabase.from(TABLE).update({ active: false }).eq('id', req.params.id);
   res.json({ ok: true });
 });
 
-// GET /api/compliance/alerts — soon-to-expire or expired
-router.get('/alerts', auth, async (req, res) => {
-  try {
-    const soon = new Date();
-    soon.setDate(soon.getDate() + 60);
-    const { data, error } = await supabase.from('compliance_documents')
-      .select('id,title,category,expiry_date,status')
-      .or(`status.eq.expired,status.eq.expiring_soon`)
-      .order('expiry_date', { ascending: true });
-    if (error) return res.status(500).json({ error: error.message });
-    res.json(data || []);
-  } catch (e) { res.status(500).json({ error: e.message }); }
+router.post('/:id/done', auth, requireRole('admin', 'manager'), async (req, res) => {
+  const { completed_date, period, notes } = req.body;
+  const today = completed_date || new Date().toISOString().slice(0, 10);
+  const { data: item } = await supabase.from(TABLE).select('*').eq('id', req.params.id).single();
+  if (!item) return res.status(404).json({ error: 'Not found' });
+  await supabase.from(HIST).insert({ compliance_item_id: req.params.id, completed_date: today, period: period || '', notes: notes || '' });
+  const newNextDue = item.frequency === 'one_time' ? null : computeNextDue(item, today);
+  const { data, error } = await supabase.from(TABLE).update({
+    last_completed_date: today, next_due_date: newNextDue, updated_at: new Date().toISOString(),
+  }).eq('id', req.params.id).select().single();
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(data);
+});
+
+router.get('/:id/history', auth, async (req, res) => {
+  const { data, error } = await supabase.from(HIST)
+    .select('*').eq('compliance_item_id', req.params.id)
+    .order('completed_date', { ascending: false }).limit(24);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
 });
 
 module.exports = router;
