@@ -16,12 +16,14 @@ const app = express();
 app.set('trust proxy', 1);
 app.use(helmet());
 
-// CORS — localhost only in non-production
+// CORS — Capacitor Android apps use capacitor://localhost and http://localhost
 const allowedOrigins = [
   'https://admin.sathvam.in',
   'https://sathvam.in',
   'https://www.sathvam.in',
   'https://store.sathvam.in',
+  'capacitor://localhost',   // Capacitor Android/iOS store app
+  'http://localhost',        // Capacitor fallback origin
   ...(process.env.NODE_ENV !== 'production' ? ['http://localhost:5173', 'http://localhost:3000'] : []),
 ];
 app.use(cors({ origin: allowedOrigins, credentials: true }));
