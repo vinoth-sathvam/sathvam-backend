@@ -16,6 +16,8 @@ async function ensureBucket() {
   }
 }
 
+const SAFE_MIME = { 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png', 'image/webp': 'webp', 'image/gif': 'gif' };
+
 // POST /api/upload/product-image
 // Auth required. Accepts multipart: field "image" (file)
 // Returns { url: "https://..." }
@@ -23,21 +25,24 @@ router.post('/product-image', auth, upload.single('image'), async (req, res) => 
   try {
     if (!req.file) return res.status(400).json({ error: 'No image file provided' });
 
+    const ext = SAFE_MIME[req.file.mimetype];
+    if (!ext) return res.status(400).json({ error: 'Invalid file type. Allowed: jpg, png, webp, gif' });
+
     await ensureBucket();
 
-    const ext  = req.file.originalname.split('.').pop().toLowerCase() || 'jpg';
     const name = `${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
 
     const { error } = await supabase.storage
       .from(BUCKET)
       .upload(name, req.file.buffer, { contentType: req.file.mimetype, upsert: false });
 
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) { console.error('Storage upload error:', error); return res.status(500).json({ error: 'Upload failed' }); }
 
     const { data: { publicUrl } } = supabase.storage.from(BUCKET).getPublicUrl(name);
     res.json({ url: publicUrl });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Upload error:', err);
+    res.status(500).json({ error: 'Upload failed' });
   }
 });
 

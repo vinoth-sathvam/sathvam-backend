@@ -10,7 +10,7 @@ router.get('/products', async (req, res) => {
       supabase.from('products').select('id,name,sku,cat,unit,pack_size,pack_unit,gst,price,website_price,retail_price,featured,active,hsn_code,description,image_url').eq('active', true).order('name'),
       supabase.from('settings').select('value').eq('key', 'website_enabled_products').single(),
     ]);
-    if (error) return res.status(500).json({ error: error.message });
+    if (error) return res.status(500).json({ error: "Server error" });
 
     const rawEnabled = settings?.value;
     const enabledArr = Array.isArray(rawEnabled) ? rawEnabled : (Array.isArray(rawEnabled?.value) ? rawEnabled.value : []);
@@ -28,7 +28,7 @@ router.get('/products', async (req, res) => {
 
     res.json({ products: websiteProducts, tamilNames });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Server error" });
   }
 });
 
@@ -135,7 +135,7 @@ router.get('/stock', async (req, res) => {
 
     res.json({ stock });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Server error" });
   }
 });
 
@@ -192,7 +192,7 @@ router.post('/orders', async (req, res) => {
 
     res.status(201).json({ success: true, orderId: o.id });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: "Server error" });
   }
 });
 
@@ -225,7 +225,7 @@ router.get('/product-stats', async (req, res) => {
       ratings[pid] = { avg: Math.round((sum / count) * 10) / 10, count };
     }
     res.json({ soldCounts, ratings });
-  } catch (err) { res.status(500).json({ error: err.message }); }
+  } catch (err) { res.status(500).json({ error: "Server error" }); }
 });
 
 // GET /api/public/content — website CMS content (hero, about, announcement, banners)

@@ -9,6 +9,7 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.87.0",
     "@supabase/supabase-js": "^2.39.0",
     "axios": "^1.14.0",
     "bcryptjs": "^2.4.3",
@@ -17,6 +18,7 @@
     "dotenv": "^16.4.1",
     "express": "^4.18.2",
     "express-rate-limit": "^7.1.5",
+    "firebase-admin": "^13.8.0",
     "google-auth-library": "^10.6.2",
     "helmet": "^7.1.0",
     "jsonwebtoken": "^9.0.2",
@@ -25,6 +27,9 @@
     "node-cron": "^4.2.1",
     "node-gtts": "^2.0.2",
     "nodemailer": "^8.0.4",
-    "razorpay": "^2.9.6"
+    "qrcode": "^1.5.4",
+    "razorpay": "^2.9.6",
+    "speakeasy": "^2.0.0",
+    "web-push": "^3.6.7"
   }
 }

@@ -3,6 +3,7 @@ const supabase  = require('../config/supabase');
 const bcrypt    = require('bcryptjs');
 const jwt       = require('jsonwebtoken');
 const { OAuth2Client } = require('google-auth-library');
+const make2FA   = require('./twoFactor');
 const router    = express.Router();
 
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -43,6 +44,14 @@ router.post('/login', async (req, res) => {
       const valid = await bcrypt.compare(password, cust.password_hash);
       if (!valid) return res.status(400).json({ error: 'Incorrect password' });
     }
+
+    // 2FA — if enabled, return pre-auth token instead of full JWT
+    if (cust.totp_enabled) {
+      const { issuePreAuthToken } = require('./twoFactor');
+      const preAuthToken = issuePreAuthToken({ id: cust.id });
+      return res.json({ requiresTOTP: true, preAuthToken });
+    }
+
     const token = jwt.sign({ id: cust.id, email: cust.email, name: cust.name }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ customer: { id: cust.id, name: cust.name, email: cust.email, phone: cust.phone, address: cust.address, city: cust.city, state: cust.state, pincode: cust.pincode }, token });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -250,5 +259,9 @@ router.post('/referral/validate', async (req, res) => {
     res.json({ valid: true, discount: 50, code: code.toUpperCase() }); // ₹50 discount for using referral
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// 2FA routes — /api/customer/2fa/*
+const { router: twoFARouter } = make2FA(supabase, 'customers', custAuth, null);
+router.use('/2fa', twoFARouter);
 
 module.exports = router;

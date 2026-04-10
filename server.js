@@ -28,14 +28,30 @@ app.use(cors({ origin: allowedOrigins, credentials: true }));
 
 const rateLimitOpts = { validate: { xForwardedForHeader: false } };
 
-// General rate limit — 1000 req/15min per IP
-app.use(rateLimit({ windowMs: 15*60*1000, max: 1000, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests, please try again later' }, ...rateLimitOpts }));
+// General rate limit — 300 req/15min per IP
+app.use(rateLimit({ windowMs: 15*60*1000, max: 300, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests, please try again later' }, ...rateLimitOpts }));
 
-// Auth limiter — 200 req/15min per IP (prevents brute force while allowing normal staff use)
+// Auth limiter — 10 attempts/15min per IP (brute force protection)
 const authLimiter = rateLimit({
-  windowMs: 15*60*1000, max: 200,
+  windowMs: 15*60*1000, max: 10,
   standardHeaders: true, legacyHeaders: false,
-  message: { error: 'Too many attempts, please try again later' },
+  message: { error: 'Too many login attempts, please try again in 15 minutes' },
+  ...rateLimitOpts,
+});
+
+// Public API limiter — 120 req/min per IP (prevents scraping / DoS)
+const publicLimiter = rateLimit({
+  windowMs: 60*1000, max: 120,
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many requests' },
+  ...rateLimitOpts,
+});
+
+// Payments limiter — 20 req/min per IP
+const paymentsLimiter = rateLimit({
+  windowMs: 60*1000, max: 20,
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many payment requests' },
   ...rateLimitOpts,
 });
 
@@ -51,7 +67,7 @@ const flourBatches = require('./routes/flourBatches');
 const webstoreOrders = require('./routes/webstoreOrders');
 
 app.get('/health', (req, res) => res.json({ status: 'ok', version: '1.2.0', time: new Date().toISOString() }));
-app.use('/api/public', require('./routes/public'));
+app.use('/api/public', publicLimiter, require('./routes/public'));
 app.use('/api/auth',          authLimiter, require('./routes/auth'));
 app.use('/api/batches',       require('./routes/batches'));
 app.use('/api/products',      products);
@@ -64,8 +80,8 @@ app.use('/api/purchases',     purchases);
 app.use('/api/flour-batches', flourBatches);
 app.use('/api/webstore-orders', webstoreOrders);
 app.use('/api/customer',       require('./routes/customer'));
-app.use('/api/payments',      require('./routes/payments'));
-app.use('/api/webhooks',      require('./routes/payments')); // alias — Razorpay dashboard may use this URL
+app.use('/api/payments',      paymentsLimiter, require('./routes/payments'));
+app.use('/api/webhooks',      require('./routes/payments')); // alias — Razorpay webhook (no rate limit, verified by signature)
 app.use('/api/b2b/auth',      authLimiter, b2bAuth);
 app.use('/api/b2b/customers', b2bCustomers);
 app.use('/api/b2b/orders',    b2bOrders);
@@ -107,12 +123,12 @@ startScheduler();
 app.post('/api/send-weekly-report', require('./middleware/auth').auth, async (req, res) => {
   try {
     const nodemailer = require('nodemailer');
-    const mailer = nodemailer.createTransport({ host: process.env.SMTP_HOST||'smtp.gmail.com', port: parseInt(process.env.SMTP_PORT||'587'), secure:false, auth:{ user:process.env.SMTP_USER, pass:process.env.SMTP_PASS } });
+    const mailer = nodemailer.createTransport({ host: process.env.SMTP_HOST||'smtp.gmail.com', port: parseInt(process.env.SMTP_PORT||'465'), secure: process.env.SMTP_PORT !== '587', auth:{ user:process.env.SMTP_USER, pass:process.env.SMTP_PASS } });
     const html   = await buildWeeklyReport();
     const to     = req.body?.to || 'vinoth@sathvam.in';
     await mailer.sendMail({ from: process.env.SMTP_FROM||'Sathvam <noreply@sathvam.in>', to, subject: `Sathvam Weekly Report — ${new Date().toISOString().slice(0,10)}`, html });
     res.json({ ok: true, sent_to: to });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+  } catch(e) { console.error('Weekly report error:', e); res.status(500).json({ error: 'Failed to send report' }); }
 });
 
 app.use((req, res) => res.status(404).json({ error: `Route ${req.method} ${req.path} not found` }));

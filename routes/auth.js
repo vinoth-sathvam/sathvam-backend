@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const supabase = require('../config/supabase');
 const { auth } = require('../middleware/auth');
+const make2FA = require('./twoFactor');
 const router = express.Router();
 
 const COOKIE_OPTS = {
@@ -22,6 +23,14 @@ router.post('/login', async (req, res) => {
     if (error || !user) return res.status(401).json({ error: 'Invalid credentials' });
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+
+    // 2FA — if enabled, return a short-lived pre-auth token instead of full session
+    if (user.totp_enabled) {
+      const { issuePreAuthToken } = require('./twoFactor');
+      const preAuthToken = issuePreAuthToken({ id: user.id });
+      return res.json({ requiresTOTP: true, preAuthToken });
+    }
+
     const token = jwt.sign(
       { id: user.id, username: user.username, name: user.name, role: user.role },
       process.env.JWT_SECRET, { expiresIn: '7d' }
@@ -37,21 +46,15 @@ router.post('/logout', (req, res) => {
   res.json({ message: 'Logged out' });
 });
 
-router.post('/setup', async (req, res) => {
-  try {
-    const { data: existing } = await supabase.from('users').select('id').limit(1);
-    if (existing?.length > 0) return res.status(400).json({ error: 'Setup already complete' });
-    if (!process.env.ADMIN_PASSWORD) return res.status(500).json({ error: 'ADMIN_PASSWORD env var not set' });
-    const hash = await bcrypt.hash(process.env.ADMIN_PASSWORD, 12);
-    const { data, error } = await supabase.from('users').insert({
-      username: process.env.ADMIN_USERNAME || 'admin',
-      name: process.env.ADMIN_NAME || 'Admin User',
-      password: hash, role: 'admin', active: true
-    }).select().single();
-    if (error) return res.status(500).json({ error: 'Setup failed' });
-    res.json({ message: 'Admin created!', username: data.username });
-  } catch { res.status(500).json({ error: 'Server error' }); }
+// Setup endpoint permanently disabled — admin account already exists
+router.post('/setup', (req, res) => res.status(410).json({ error: 'Gone' }));
+
+// 2FA routes — /api/auth/2fa/*
+const { router: twoFARouter } = make2FA(supabase, 'users', auth, {
+  name: 'sathvam_admin',
+  opts: COOKIE_OPTS,
 });
+router.use('/2fa', twoFARouter);
 
 router.get('/me', auth, async (req, res) => {
   const { data, error } = await supabase.from('users').select('id,name,username,role,email').eq('id', req.user.id).single();
