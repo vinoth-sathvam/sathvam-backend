@@ -20,7 +20,9 @@ async function updateAnalytics(key, updater, def = {}) {
 // POST /api/analytics/track  (public — called from website, no auth)
 router.post('/track', async (req, res) => {
   try {
-    const { type, path, title, product_id, product_name } = req.body;
+    const { type, path, title, product_id, product_name,
+            session_id, items, customer_name, customer_phone, customer_email,
+            cart_total, order_no } = req.body;
     const today = TODAY();
 
     if (type === 'visit') {
@@ -41,6 +43,50 @@ router.post('/track', async (req, res) => {
       });
     }
 
+    // ── Funnel events ──────────────────────────────────────────────────────────
+
+    if (type === 'add_to_cart') {
+      await updateAnalytics('funnel_add_to_cart', d => ({ ...d, [today]: (d[today] || 0) + 1 }));
+    }
+
+    if (type === 'checkout_start') {
+      await updateAnalytics('funnel_checkout_start', d => ({ ...d, [today]: (d[today] || 0) + 1 }));
+      // Store checkout session for follow-up (using store_analytics as KV store)
+      if (session_id && (customer_name || customer_phone)) {
+        const key = `_cs_${session_id}`;
+        const sessionData = {
+          customer_name: customer_name || null,
+          customer_phone: customer_phone || null,
+          customer_email: customer_email || null,
+          items: (items || []).slice(0, 5).map(i => ({ name: i.name || i.id, qty: i.qty || 1 })),
+          cart_total: cart_total || 0,
+          recovered: false,
+          date: today,
+          updated_at: new Date().toISOString(),
+        };
+        const { data: existing } = await supabase.from('store_analytics').select('id').eq('key', key).single();
+        if (existing?.id) {
+          await supabase.from('store_analytics').update({ data: sessionData }).eq('key', key);
+        } else {
+          await supabase.from('store_analytics').insert({ key, data: sessionData });
+        }
+      }
+    }
+
+    if (type === 'order_placed') {
+      await updateAnalytics('funnel_order_placed', d => ({ ...d, [today]: (d[today] || 0) + 1 }));
+      // Mark checkout session as recovered
+      if (session_id) {
+        const key = `_cs_${session_id}`;
+        const { data: existing } = await supabase.from('store_analytics').select('id,data').eq('key', key).single();
+        if (existing?.id) {
+          await supabase.from('store_analytics').update({
+            data: { ...existing.data, recovered: true, order_no: order_no || null }
+          }).eq('key', key);
+        }
+      }
+    }
+
     res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -52,15 +98,32 @@ async function getAKey(key, def = {}) {
   return data?.data ?? def;
 }
 
+// Aggregate daily counts from a key-value store entry over last N days
+function sumDays(data, days = 30) {
+  const now = new Date();
+  let total = 0;
+  for (let i = 0; i < days; i++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const ds = d.toISOString().slice(0, 10);
+    total += data[ds] || 0;
+  }
+  return total;
+}
+
 // GET /api/analytics — full analytics summary for admin dashboard
 router.get('/', auth, async (req, res) => {
   try {
-    const [visits, pageViews, productViews, { data: carts }] = await Promise.all([
+    const [visits, pageViews, productViews, funnelCart, funnelCheckout, funnelOrder, { data: carts }, { data: checkoutSessions }] = await Promise.all([
       getAKey('visits', {}),
       getAKey('page_views', {}),
       getAKey('product_views', {}),
+      getAKey('funnel_add_to_cart', {}),
+      getAKey('funnel_checkout_start', {}),
+      getAKey('funnel_order_placed', {}),
       supabase.from('abandoned_carts').select('*').eq('recovered', false)
         .order('updated_at', { ascending: false }).limit(200),
+      supabase.from('store_analytics').select('key,data').like('key', '_cs_%').order('id', { ascending: false }).limit(100),
     ]);
 
     const now = new Date();
@@ -116,12 +179,37 @@ router.get('/', auth, async (req, res) => {
     const todayVisits = visits[TODAY()] || 0;
     const thisMonthVisits = monthly[11]?.count || 0;
 
+    // Funnel — last 30 days
+    const funnelData = {
+      visits:          sumDays(visits, 30),
+      add_to_cart:     sumDays(funnelCart, 30),
+      checkout_start:  sumDays(funnelCheckout, 30),
+      order_placed:    sumDays(funnelOrder, 30),
+    };
+
+    // Abandoned checkouts with customer info (for follow-up)
+    const abandonedCheckouts = (checkoutSessions || [])
+      .map(row => row.data)
+      .filter(d => d && !d.recovered && (d.customer_phone || d.customer_name))
+      .map(d => ({
+        customer_name: d.customer_name,
+        customer_phone: d.customer_phone,
+        customer_email: d.customer_email,
+        cart_total: d.cart_total || 0,
+        items: (d.items || []).map(i => i.name).join(', '),
+        item_count: (d.items || []).length,
+        updated_at: d.updated_at,
+      }))
+      .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+
     res.json({
       visits: { daily, monthly, yearly, total: totalVisits, today: todayVisits, thisMonth: thisMonthVisits },
       topPages,
       topProductViews,
       topAbandoned,
       abandonedCartCount: (carts || []).length,
+      funnel: funnelData,
+      abandonedCheckouts,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
