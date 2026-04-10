@@ -143,6 +143,25 @@ function detectOrderIntent(messages) {
   return /track|where.*order|order.*status|delivery.*status|when.*deliver|dispatch|shipped|out for delivery|my order/i.test(t);
 }
 
+// ── Sensitive data detection — block BEFORE sending to AI ────────────────────
+const SENSITIVE_PATTERNS = [
+  { re: /\b\d{4}[\s\-]?\d{4}[\s\-]?\d{4}[\s\-]?\d{4}\b/, label: 'card number' },
+  { re: /\bcvv\b|\bcvc\b|\bsecurity\s*code\b/i,            label: 'CVV/security code' },
+  { re: /\b\d{3,4}\s*(?:is\s+my\s+)?(cvv|cvc|pin)\b/i,   label: 'CVV/PIN' },
+  { re: /\botp\b.*\d{4,8}|\d{4,8}.*\botp\b/i,             label: 'OTP' },
+  { re: /\bnet\s*banking\s*(id|password|login|user)/i,     label: 'NetBanking credentials' },
+  { re: /\b(account\s*no|acc\s*no|account\s*number)\s*:?\s*\d{9,18}\b/i, label: 'bank account number' },
+  { re: /\b[A-Z]{4}0[A-Z0-9]{6}\b/,                       label: 'IFSC code' },
+  { re: /\bmy\s+(password|pin)\s+(is|:)\s*\S+/i,           label: 'password/PIN' },
+];
+
+function detectSensitiveData(text) {
+  for (const { re, label } of SENSITIVE_PATTERNS) {
+    if (re.test(text)) return label;
+  }
+  return null;
+}
+
 // ── Issue keyword detection ───────────────────────────────────────────────────
 const ISSUE_PATTERNS = [
   /can'?t\s+(order|checkout|buy|add|place|pay|complete)/i,
@@ -224,6 +243,20 @@ router.post('/', chatLimiter, async (req, res) => {
     return res.status(400).json({ error: 'No messages provided' });
   }
 
+  // ── Hard block: sensitive data in last user message ─────────────────────────
+  const lastUserText = messages.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
+  const sensitiveType = detectSensitiveData(lastUserText);
+  if (sensitiveType) {
+    return res.json({
+      reply: `🔒 Please never share ${sensitiveType} here — chat is not a secure channel for payment details!\n\nFor your safety, all payments are handled securely through our checkout page (Razorpay bank-grade encryption). Go to sathvam.in → Shop → Add to cart → Checkout to pay safely.\n\nIf you need help placing the order, WhatsApp us at +91 70921 77092 and we will assist you.`,
+      showWhatsApp: true,
+      showB2B: false,
+      prefillText: 'Hi Sathvam, I need help placing an order',
+      orderFound: false,
+      securityWarning: true,
+    });
+  }
+
   // Save lead on first message
   if (lead?.name && lead?.phone) {
     await saveLead(lead.name, lead.phone, lead.email);
@@ -282,12 +315,22 @@ ${productContext}
 ${orderContext}
 ${couponContext}
 
+━━━━ SECURITY — ABSOLUTE RULES (never break these) ━━━━
+NEVER ask for or accept in chat:
+→ Card number, CVV, expiry date, OTP
+→ UPI PIN, NetBanking password or login
+→ Bank account number, IFSC code
+→ Any payment credentials of any kind
+→ Full home address (city/state is OK for delivery info only)
+
+If a customer tries to share payment details: immediately stop them with a safety warning and redirect to the secure checkout page. Example: "Please never share card/payment details here — for your safety, complete payment securely on sathvam.in/checkout which uses Razorpay bank-grade encryption."
+
 ━━━━ WHEN CUSTOMER WANTS TO BUY / ORDER ━━━━
 1. Confirm product & price from the live list ("Groundnut Oil 1L is ₹X + 5% GST — in stock!")
-2. Give 2 options:
-   → Website: Tap "Shop" in the menu, add to cart, pay in 2 mins (UPI/card/net banking)
-   → WhatsApp: Send your order to +91 70921 77092 and team will confirm
-NEVER ask for address, phone, payment in chat. Website checkout handles everything.
+2. Direct ONLY to these two safe channels:
+   → Website checkout: sathvam.in → Shop → Add to cart → Checkout (secure, 2 mins)
+   → WhatsApp: +91 70921 77092 (team will send a safe payment link)
+NEVER collect order details, address, or payment in this chat. Checkout page handles everything securely.
 
 ━━━━ WHEN CUSTOMER ASKS TO TRACK ORDER ━━━━
 ${orderContext ? '' : 'Ask for their order number (e.g. ORD-001) and the phone number used while ordering.'}
