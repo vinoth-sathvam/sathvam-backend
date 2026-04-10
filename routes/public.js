@@ -330,4 +330,160 @@ router.delete('/cart/:sessionId', async (req, res) => {
   } catch { res.json({ ok: false }); }
 });
 
+// GET /api/public/image-search?q=... — search product images via Wikipedia + Wikimedia Commons
+router.get('/image-search', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  const q = (req.query.q || '').trim();
+  if (!q) return res.json({ images: [] });
+  try {
+    const images = [];
+
+    // Wikipedia page images
+    const wpSearch = await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q+' food')}&format=json&srlimit=5`);
+    const wpData = await wpSearch.json();
+    const titles = (wpData.query?.search || []).map(r => r.title).slice(0, 5);
+    if (titles.length) {
+      const wpImg = await fetch(`https://en.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(titles.join('|'))}&prop=pageimages&format=json&pithumbsize=600`);
+      const wpImgData = await wpImg.json();
+      for (const page of Object.values(wpImgData.query?.pages || {})) {
+        if (page.thumbnail?.source) images.push(page.thumbnail.source);
+      }
+    }
+
+    // Wikimedia Commons images
+    const cmSearch = await fetch(`https://commons.wikimedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&srnamespace=6&format=json&srlimit=8`);
+    const cmData = await cmSearch.json();
+    const fileNames = (cmData.query?.search || []).map(r => r.title).slice(0, 6);
+    if (fileNames.length) {
+      const cmImg = await fetch(`https://commons.wikimedia.org/w/api.php?action=query&titles=${encodeURIComponent(fileNames.join('|'))}&prop=imageinfo&iiprop=url&iiurlwidth=600&format=json`);
+      const cmImgData = await cmImg.json();
+      for (const page of Object.values(cmImgData.query?.pages || {})) {
+        const url = page.imageinfo?.[0]?.thumburl;
+        if (url) images.push(url);
+      }
+    }
+
+    res.json({ images: [...new Set(images)].slice(0, 9) });
+  } catch (e) {
+    res.status(500).json({ error: e.message, images: [] });
+  }
+});
+
+// GET /api/public/blog — list published posts
+router.get('/blog', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { data, error } = await supabase
+      .from('blog_posts')
+      .select('id,title,slug,excerpt,category,author,published_at,read_time,cover_image,keywords')
+      .eq('published', true)
+      .order('published_at', { ascending: false })
+      .limit(200);
+    if (error) throw error;
+    res.json({ posts: data || [] });
+  } catch (e) {
+    res.status(500).json({ error: e.message, posts: [] });
+  }
+});
+
+// GET /api/public/blog/:slug — single post
+router.get('/blog/:slug', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { data, error } = await supabase
+      .from('blog_posts')
+      .select('*')
+      .eq('slug', req.params.slug)
+      .eq('published', true)
+      .single();
+    if (error || !data) return res.status(404).json({ error: 'Post not found' });
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/public/recent-activity — anonymized recent orders for social proof
+router.get('/recent-activity', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const since = new Date(); since.setDate(since.getDate() - 7);
+    const { data } = await supabase
+      .from('webstore_orders')
+      .select('customer,items,created_at')
+      .in('status', ['confirmed','shipped','delivered','paid'])
+      .gte('created_at', since.toISOString())
+      .order('created_at', { ascending: false })
+      .limit(30);
+
+    const activities = (data || []).flatMap(o => {
+      const name = (o.customer?.name || '').split(' ')[0] || 'Someone';
+      const city = o.customer?.city || 'India';
+      return (o.items || []).slice(0, 2).map(item => ({
+        name,
+        city,
+        product: item.name || item.productName || 'a product',
+        time: o.created_at,
+      }));
+    }).slice(0, 20);
+
+    res.json({ activities });
+  } catch (e) {
+    res.json({ activities: [] });
+  }
+});
+
+// POST /api/public/coupons/validate — check coupon code at checkout
+router.post('/coupons/validate', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  const { code, cart_total } = req.body;
+  if (!code) return res.status(400).json({ error: 'No code provided' });
+  try {
+    const { data, error } = await supabase
+      .from('coupons')
+      .select('code,type,value,min_order,max_uses,used_count,expires_at,description')
+      .ilike('code', code.trim())
+      .eq('active', true)
+      .single();
+
+    if (error || !data) return res.status(404).json({ error: 'Invalid coupon code' });
+    if (data.expires_at && new Date(data.expires_at) < new Date())
+      return res.status(400).json({ error: 'This coupon has expired' });
+    if (data.max_uses && data.used_count >= data.max_uses)
+      return res.status(400).json({ error: 'This coupon has reached its usage limit' });
+    if (data.min_order && cart_total < data.min_order)
+      return res.status(400).json({ error: `Minimum order ₹${data.min_order} required for this coupon` });
+
+    const discount = data.type === 'percent'
+      ? Math.round((cart_total * data.value) / 100)
+      : Math.min(data.value, cart_total);
+
+    res.json({ valid: true, code: data.code, type: data.type, value: data.value, discount, description: data.description });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/public/reviews — submit customer review from website
+router.post('/reviews', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  const { name, city, rating, text, prod } = req.body;
+  if (!name || !text || !prod) return res.status(400).json({ error: 'Missing required fields' });
+  try {
+    const { error } = await supabase.from('product_reviews').insert({
+      product_name: prod,
+      reviewer_name: name + (city ? ` (${city})` : ''),
+      rating: Math.min(5, Math.max(1, parseInt(rating) || 5)),
+      body: text,
+      title: '',
+      status: 'pending',
+      source: 'website',
+    });
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;
