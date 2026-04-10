@@ -486,4 +486,189 @@ router.post('/reviews', async (req, res) => {
   }
 });
 
+// POST /api/public/notify-me — save out-of-stock notification request
+router.post('/notify-me', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  const { product_id, product_name, email, phone } = req.body;
+  if (!product_id || (!email && !phone)) return res.status(400).json({ error: 'product_id and email or phone required' });
+  try {
+    const key = `notify_me_${product_id}`;
+    const { data } = await supabase.from('store_analytics').select('data').eq('key', key).maybeSingle();
+    const existing = data?.data || [];
+    const entry = { email: email || null, phone: phone || null, product_name, created_at: new Date().toISOString() };
+    const updated = [...existing, entry];
+    await supabase.from('store_analytics').upsert({ key, data: updated, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/public/reviews?product_id=... — get approved reviews for a product
+router.get('/reviews', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  const { product_id, product_name } = req.query;
+  try {
+    let query = supabase.from('product_reviews')
+      .select('id,reviewer_name,rating,body,title,created_at,product_name')
+      .eq('status', 'approved')
+      .order('created_at', { ascending: false })
+      .limit(20);
+    if (product_id) query = query.eq('product_id', product_id);
+    else if (product_name) query = query.ilike('product_name', `%${product_name}%`);
+    const { data, error } = await query;
+    if (error) throw error;
+    res.json({ reviews: data || [] });
+  } catch (e) { res.status(500).json({ error: e.message, reviews: [] }); }
+});
+
+// GET /api/public/live-viewers — count active sessions per product in last 3 minutes
+router.get('/live-viewers', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { data } = await supabase.from('store_analytics').select('key,data,updated_at')
+      .like('key', '_cs_%')
+      .gte('updated_at', new Date(Date.now() - 3 * 60 * 1000).toISOString());
+    // Also get product view sessions from analytics tracking
+    const { data: pvData } = await supabase.from('store_analytics').select('data').eq('key', 'live_product_views').maybeSingle();
+    const liveViews = pvData?.data || {};
+    const now = Date.now();
+    // Clean old entries (> 3 min)
+    const cleaned = {};
+    for (const [prodId, sessions] of Object.entries(liveViews)) {
+      const active = (sessions || []).filter(s => now - new Date(s.ts).getTime() < 3 * 60 * 1000);
+      if (active.length > 0) cleaned[prodId] = active;
+    }
+    const counts = {};
+    for (const [prodId, sessions] of Object.entries(cleaned)) {
+      counts[prodId] = sessions.length;
+    }
+    res.json({ counts });
+  } catch { res.json({ counts: {} }); }
+});
+
+// POST /api/public/live-viewers — record that a session is viewing a product
+router.post('/live-viewers', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  const { product_id, session_id } = req.body;
+  if (!product_id || !session_id) return res.json({ ok: false });
+  try {
+    const { data } = await supabase.from('store_analytics').select('data').eq('key', 'live_product_views').maybeSingle();
+    const liveViews = data?.data || {};
+    const now = new Date().toISOString();
+    const nowMs = Date.now();
+    // Keep only sessions from last 3 min
+    const existing = (liveViews[product_id] || []).filter(s => nowMs - new Date(s.ts).getTime() < 3 * 60 * 1000);
+    // Upsert current session
+    const updated = [...existing.filter(s => s.sid !== session_id), { sid: session_id, ts: now }];
+    liveViews[product_id] = updated;
+    // Limit total keys to avoid bloat
+    const keys = Object.keys(liveViews);
+    if (keys.length > 100) {
+      const toDelete = keys.slice(0, keys.length - 100);
+      for (const k of toDelete) delete liveViews[k];
+    }
+    await supabase.from('store_analytics').upsert({ key: 'live_product_views', data: liveViews, updated_at: now }, { onConflict: 'key' });
+    const count = updated.length;
+    res.json({ ok: true, count });
+  } catch { res.json({ ok: false, count: 1 }); }
+});
+
+// GET /api/public/sitemap.xml — dynamic sitemap with all products + blog posts
+router.get('/sitemap.xml', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const [{ data: products }, { data: posts }] = await Promise.all([
+      supabase.from('products').select('id,name,active,cat').eq('active', true).neq('cat', 'raw'),
+      supabase.from('blog_posts').select('slug,published_at').eq('published', true),
+    ]);
+
+    const staticUrls = [
+      { loc: 'https://www.sathvam.in/', priority: '1.0', changefreq: 'weekly' },
+      { loc: 'https://www.sathvam.in/shop', priority: '0.9', changefreq: 'daily' },
+      { loc: 'https://www.sathvam.in/about', priority: '0.7', changefreq: 'monthly' },
+      { loc: 'https://www.sathvam.in/contact', priority: '0.7', changefreq: 'monthly' },
+      { loc: 'https://www.sathvam.in/blog', priority: '0.8', changefreq: 'daily' },
+    ].map(u => `  <url><loc>${u.loc}</loc><lastmod>${today}</lastmod><changefreq>${u.changefreq}</changefreq><priority>${u.priority}</priority></url>`).join('\n');
+
+    const productUrls = (products || []).map(p =>
+      `  <url><loc>https://www.sathvam.in/product/${p.id}</loc><lastmod>${today}</lastmod><changefreq>weekly</changefreq><priority>0.85</priority></url>`
+    ).join('\n');
+
+    const blogUrls = (posts || []).map(p => {
+      const lastmod = p.published_at ? p.published_at.slice(0, 10) : today;
+      return `  <url><loc>https://www.sathvam.in/blog/${p.slug}</loc><lastmod>${lastmod}</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>`;
+    }).join('\n');
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${staticUrls}
+${productUrls}
+${blogUrls}
+</urlset>`;
+    res.send(xml);
+  } catch (e) {
+    res.status(500).send(`<?xml version="1.0"?><error>${e.message}</error>`);
+  }
+});
+
+// GET /api/public/shopping-feed — Google Merchant Center product feed (RSS/XML)
+router.get('/shopping-feed', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'application/xml; charset=utf-8');
+  try {
+    const { data: products } = await supabase
+      .from('products')
+      .select('id,name,sku,cat,pack_size,pack_unit,gst,price,website_price,description,image_url,active')
+      .eq('active', true)
+      .neq('cat', 'raw');
+
+    const items = (products || []).filter(p => (p.website_price || p.price) > 0).map(p => {
+      const price = (p.website_price || p.price || 0);
+      const gstAmt = price * ((p.gst || 0) / 100);
+      const mrp = (price + gstAmt).toFixed(2);
+      const name = p.name || '';
+      const packInfo = p.pack_size ? ` ${p.pack_size}${p.pack_unit || ''}` : '';
+      const desc = (p.description || `${name} — Pure natural product from Sathvam Natural Products, Karur, Tamil Nadu. No chemicals, no preservatives.`).slice(0, 5000);
+      const imgUrl = p.image_url || 'https://www.sathvam.in/logo.jpg';
+      const catMap = { oil: 'Food, Beverages &amp; Tobacco > Food Items > Cooking Oils', grain: 'Food, Beverages &amp; Tobacco > Food Items > Grains &amp; Rice', spice: 'Food, Beverages &amp; Tobacco > Food Items > Seasonings', sweetener: 'Food, Beverages &amp; Tobacco > Food Items > Sweeteners', other: 'Food, Beverages &amp; Tobacco > Food Items' };
+      const gCategory = catMap[p.cat] || catMap.other;
+      return `
+    <item>
+      <g:id>${p.id}</g:id>
+      <g:title>${name}${packInfo}</g:title>
+      <g:description>${desc.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</g:description>
+      <g:link>https://www.sathvam.in/?product=${p.id}</g:link>
+      <g:image_link>${imgUrl}</g:image_link>
+      <g:condition>new</g:condition>
+      <g:availability>in stock</g:availability>
+      <g:price>${mrp} INR</g:price>
+      <g:brand>Sathvam Natural Products</g:brand>
+      <g:mpn>${p.sku || p.id}</g:mpn>
+      <g:google_product_category>${gCategory}</g:google_product_category>
+      <g:product_type>Natural Products &gt; ${p.cat === 'oil' ? 'Cold Pressed Oils' : p.cat === 'grain' ? 'Millets &amp; Grains' : p.cat === 'spice' ? 'Spices' : 'Natural Foods'}</g:product_type>
+      <g:custom_label_0>${p.cat}</g:custom_label_0>
+      <g:shipping>
+        <g:country>IN</g:country>
+        <g:service>Standard</g:service>
+        <g:price>80.00 INR</g:price>
+      </g:shipping>
+    </item>`;
+    }).join('\n');
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
+  <channel>
+    <title>Sathvam Natural Products</title>
+    <link>https://www.sathvam.in</link>
+    <description>Cold-pressed oils, organic millets, spices — factory direct from Karur, Tamil Nadu</description>
+    ${items}
+  </channel>
+</rss>`;
+    res.send(xml);
+  } catch (e) {
+    res.status(500).send(`<?xml version="1.0"?><error>${e.message}</error>`);
+  }
+});
+
 module.exports = router;
