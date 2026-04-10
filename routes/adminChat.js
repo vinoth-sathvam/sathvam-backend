@@ -575,6 +575,25 @@ const TOOLS = [
     description: 'Get coupon usage stats — which coupons are used most, usage counts, active/inactive.',
     input_schema: { type: 'object', properties: {} },
   },
+  {
+    name: 'write_seo_blog_post',
+    description: 'Write and publish an SEO-optimised blog article for www.sathvam.in. The article targets a specific search keyword to bring organic Google traffic. Write 700–900 words, use Markdown headings, include practical tips. Auto-publishes to the blog. IMPORTANT: Every article must naturally weave in Sathvam\'s 4 brand pillars — (1) Purity: uncompromised purity, pure from source to bottle; (2) Healthy: real nutrition, nourish your family, healthier life; (3) Hygienic: hygienically processed, clean from farm to bottle, food-safe facility; (4) Quality Seeds for Grinding: hand-picked quality seeds, premium seeds for pressing, quality starts at the source. Make these feel natural and authentic, not like marketing.',
+    input_schema: {
+      type: 'object',
+      required: ['keyword', 'title'],
+      properties: {
+        keyword:  { type: 'string', description: 'Target Google search keyword e.g. "benefits of cold pressed groundnut oil"' },
+        title:    { type: 'string', description: 'Blog post title' },
+        category: { type: 'string', enum: ['oils','millets','spices','health','recipes','farming'], description: 'Post category' },
+        content:  { type: 'string', description: 'Full blog post content in Markdown (600–900 words). If not provided, the tool returns a template prompt.' },
+      },
+    },
+  },
+  {
+    name: 'get_blog_posts',
+    description: 'Get list of published blog posts on www.sathvam.in',
+    input_schema: { type: 'object', properties: {} },
+  },
 ];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1437,6 +1456,33 @@ async function executeTool(name, input) {
         return { coupons:data||[], active_count:active.length, inactive_count:inactive.length, total_uses:totalUses, top_coupons:(data||[]).slice(0,5).map(c=>({ code:c.code, type:c.type, value:c.value, uses:c.uses_count })), summary:`${active.length} active coupons, ${totalUses} total uses` };
       }
 
+      case 'write_seo_blog_post': {
+        const { keyword, title, category, content } = input;
+        if (!content) {
+          return { status: 'needs_content', message: `Please write a 600-900 word Markdown article titled "${title}" targeting the keyword "${keyword}". Then call write_seo_blog_post again with the content field filled in.` };
+        }
+        const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 80);
+        const excerpt = content.replace(/[#*>\n`]/g, ' ').replace(/\s+/g,' ').trim().slice(0, 200);
+        const readTime = Math.max(1, Math.ceil(content.split(' ').length / 200));
+        const { data, error } = await supabase.from('blog_posts').insert({
+          title, slug, excerpt, content,
+          keywords: [keyword],
+          category: category || 'health',
+          author: 'Sathvam Team',
+          read_time: readTime,
+          published: true,
+          published_at: new Date().toISOString(),
+        }).select('id,slug').single();
+        if (error) return { error: error.message };
+        return { success: true, slug: data.slug, url: `https://www.sathvam.in/?view=post&slug=${data.slug}`, message: `Blog post published! URL: https://www.sathvam.in/?view=post&slug=${data.slug}` };
+      }
+
+      case 'get_blog_posts': {
+        const { data, error } = await supabase.from('blog_posts').select('id,title,slug,category,published_at,published').order('published_at',{ascending:false}).limit(10);
+        if (error) return { error: error.message };
+        return { posts: data || [], count: (data||[]).length };
+      }
+
       default:
         return { error: `Unknown tool: ${name}` };
     }
@@ -1555,3 +1601,5 @@ router.get('/briefing', ...adminOnly, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.executeTool = executeTool;
+module.exports.TOOLS = TOOLS;
