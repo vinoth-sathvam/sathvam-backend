@@ -671,4 +671,100 @@ router.get('/shopping-feed', async (req, res) => {
   }
 });
 
+// POST /api/public/contact — Save contact form submission
+router.post('/contact', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  const { name, phone, email, message } = req.body;
+  if (!name || !message) return res.status(400).json({ error: 'name and message required' });
+  try {
+    const key = `contact_submissions`;
+    const { data } = await supabase.from('store_analytics').select('data').eq('key', key).maybeSingle();
+    const existing = data?.data || [];
+    const entry = { name, phone: phone||null, email: email||null, message, created_at: new Date().toISOString() };
+    await supabase.from('store_analytics').upsert({ key, data: [...existing, entry].slice(-500), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/public/newsletter — Save newsletter signup
+router.post('/newsletter', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  const { email } = req.body;
+  if (!email || !email.includes('@')) return res.status(400).json({ error: 'valid email required' });
+  try {
+    const key = 'newsletter_subscribers';
+    const { data } = await supabase.from('store_analytics').select('data').eq('key', key).maybeSingle();
+    const existing = data?.data || [];
+    if (!existing.find(e => e.email === email.toLowerCase())) {
+      await supabase.from('store_analytics').upsert({ key, data: [...existing, { email: email.toLowerCase(), subscribed_at: new Date().toISOString() }], updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    }
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/public/whatsapp-optin — Save WhatsApp opt-in
+router.post('/whatsapp-optin', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  const { phone, name, order_no } = req.body;
+  if (!phone) return res.status(400).json({ error: 'phone required' });
+  try {
+    const key = 'whatsapp_optins';
+    const { data } = await supabase.from('store_analytics').select('data').eq('key', key).maybeSingle();
+    const existing = data?.data || [];
+    await supabase.from('store_analytics').upsert({ key, data: [...existing, { phone, name: name||null, order_no: order_no||null, opted_at: new Date().toISOString() }].slice(-2000), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/public/b2b-inquiry — Save B2B wholesale inquiry
+router.post('/b2b-inquiry', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  const { businessName, contact, phone, email, requirement } = req.body;
+  if (!businessName || !phone) return res.status(400).json({ error: 'businessName and phone required' });
+  try {
+    const key = 'b2b_inquiries';
+    const { data } = await supabase.from('store_analytics').select('data').eq('key', key).maybeSingle();
+    const existing = data?.data || [];
+    const entry = { businessName, contact: contact||null, phone, email: email||null, requirement: requirement||null, created_at: new Date().toISOString() };
+    await supabase.from('store_analytics').upsert({ key, data: [...existing, entry].slice(-500), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/public/bought-together?product_id=X — Products frequently bought together
+router.get('/bought-together', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  const { product_id } = req.query;
+  if (!product_id) return res.status(400).json({ error: 'product_id required' });
+  try {
+    // Get recent orders containing this product
+    const since = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+    const { data: orders } = await supabase.from('webstore_orders')
+      .select('items').gte('created_at', since).in('status', ['confirmed','paid','dispatched','delivered']);
+
+    // Count co-occurrences
+    const coCount = {};
+    for (const order of (orders || [])) {
+      const items = order.items || [];
+      const hasTarget = items.some(i => (i.id || i.productId) === product_id);
+      if (!hasTarget) continue;
+      for (const item of items) {
+        const pid = item.id || item.productId;
+        if (!pid || pid === product_id) continue;
+        coCount[pid] = (coCount[pid] || 0) + 1;
+      }
+    }
+
+    // Get top 3 co-purchased product IDs
+    const topIds = Object.entries(coCount).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([id])=>id);
+    if (!topIds.length) return res.json({ products: [] });
+
+    const { data: products } = await supabase.from('products')
+      .select('id,name,sku,cat,pack_size,pack_unit,price,website_price,image_url,active')
+      .in('id', topIds).eq('active', true);
+
+    res.json({ products: (products || []).map(p => ({ ...p, websitePrice: p.website_price, packSize: p.pack_size, packUnit: p.pack_unit })) });
+  } catch (e) { res.status(500).json({ error: e.message, products: [] }); }
+});
+
 module.exports = router;
