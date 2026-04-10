@@ -68,6 +68,17 @@ async function oauthFindOrCreate(email, name, avatarUrl) {
   return created;
 }
 
+// Helper — check 2FA and return pre-auth token or full JWT
+function oauthRespond(res, cust) {
+  if (cust.totp_enabled) {
+    const { issuePreAuthToken } = require('./twoFactor');
+    const preAuthToken = issuePreAuthToken({ id: cust.id });
+    return res.json({ requiresTOTP: true, preAuthToken });
+  }
+  const token = jwt.sign({ id: cust.id, email: cust.email, name: cust.name }, JWT_SECRET, { expiresIn: '30d' });
+  res.json({ customer: { id: cust.id, name: cust.name, email: cust.email, phone: cust.phone, address: cust.address, city: cust.city, state: cust.state, pincode: cust.pincode }, token });
+}
+
 // POST /api/customer/oauth/google
 router.post('/oauth/google', async (req, res) => {
   try {
@@ -79,8 +90,9 @@ router.post('/oauth/google', async (req, res) => {
     const ticket = await client.verifyIdToken({ idToken: credential, audience: clientId });
     const payload = ticket.getPayload();
     const cust = await oauthFindOrCreate(payload.email, payload.name, payload.picture);
-    const token = jwt.sign({ id: cust.id, email: cust.email, name: cust.name }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ customer: cust, token });
+    // Re-fetch with totp_enabled to enforce 2FA
+    const { data: full } = await supabase.from('customers').select('*').eq('id', cust.id).single();
+    oauthRespond(res, full || cust);
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
@@ -102,8 +114,9 @@ router.post('/oauth/facebook', async (req, res) => {
     const fbUser = await userRes.json();
     if (!fbUser.email) return res.status(400).json({ error: 'Facebook account has no email. Please use email signup instead.' });
     const cust = await oauthFindOrCreate(fbUser.email, fbUser.name, fbUser.picture?.data?.url);
-    const token = jwt.sign({ id: cust.id, email: cust.email, name: cust.name }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ customer: cust, token });
+    // Re-fetch with totp_enabled to enforce 2FA
+    const { data: full } = await supabase.from('customers').select('*').eq('id', cust.id).single();
+    oauthRespond(res, full || cust);
   } catch (err) { res.status(400).json({ error: err.message }); }
 });
 
