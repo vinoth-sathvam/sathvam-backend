@@ -68,6 +68,81 @@ async function saveLead(name, phone, email) {
   }
 }
 
+// ── Order lookup ──────────────────────────────────────────────────────────────
+async function lookupOrder(orderNo, phone) {
+  try {
+    const { data, error } = await supabase
+      .from('webstore_orders')
+      .select('id,order_no,status,delivered_date,items,customer,created_at')
+      .ilike('order_no', orderNo.trim())
+      .maybeSingle();
+    if (error || !data) return null;
+    const orderPhone = (data.customer?.phone || '').replace(/\D/g,'');
+    const inputPhone = phone.trim().replace(/\D/g,'');
+    if (inputPhone.length >= 10 && !orderPhone.endsWith(inputPhone.slice(-10))) return null;
+    return data;
+  } catch (e) { console.error('lookupOrder error:', e.message); return null; }
+}
+
+// ── Fetch active coupons ──────────────────────────────────────────────────────
+async function getActiveCoupons() {
+  try {
+    const now = new Date().toISOString();
+    const { data } = await supabase
+      .from('coupons')
+      .select('code,type,value,min_order,description,expires_at')
+      .eq('active', true)
+      .limit(5);
+    return (data || []).filter(c => !c.expires_at || new Date(c.expires_at) > new Date());
+  } catch (e) { return []; }
+}
+
+// ── Save stock alert ──────────────────────────────────────────────────────────
+async function saveStockAlert(phone, productName, name) {
+  try {
+    await supabase.from('stock_alerts').insert({
+      phone, product_name: productName, customer_name: name || '',
+      created_at: new Date().toISOString(),
+    });
+  } catch (e) { console.warn('stock_alerts save skipped:', e.message); }
+}
+
+// ── Extract order number from messages ───────────────────────────────────────
+function extractOrderNo(messages) {
+  const text = messages.filter(m => m.role === 'user').map(m => m.content).join(' ');
+  const m = text.match(/\b([A-Z]{2,6}-\d{3,})\b/i) || text.match(/\b(ORD\d+|SALE\d+|WS\d+|SW\d+)\b/i);
+  return m ? m[1].toUpperCase() : null;
+}
+
+// ── Extract phone from messages ───────────────────────────────────────────────
+function extractPhone(messages, lead) {
+  if (lead?.phone) return lead.phone;
+  const text = messages.filter(m => m.role === 'user').map(m => m.content).join(' ');
+  const m = text.match(/(?:\+91[\s-]?)?([6-9]\d{9})\b/);
+  return m ? m[1] : null;
+}
+
+// ── Detect intents ────────────────────────────────────────────────────────────
+function detectCouponIntent(messages) {
+  const t = (messages.slice(-2).map(m => m.content).join(' ')).toLowerCase();
+  return /offer|discount|coupon|promo|code|deal|cashback|save/.test(t);
+}
+function detectB2BIntent(messages) {
+  const t = messages.map(m => m.content).join(' ');
+  return /\b(bulk|wholesale|distributor|reseller|b2b|business order|\d{2,}\s*(kg|l|litre|liter|units|bottles|pcs))\b/i.test(t);
+}
+function detectOOSInterest(messages) {
+  const bots = messages.filter(m => m.role === 'assistant');
+  const lastBot = bots.slice(-1)[0]?.content || '';
+  const lastUser = messages.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
+  return /out of stock|not available|unavailable/i.test(lastBot) &&
+         /notify|alert|inform|when.*available|back.*stock|still want|interested/i.test(lastUser);
+}
+function detectOrderIntent(messages) {
+  const t = messages.map(m => m.content).join(' ');
+  return /track|where.*order|order.*status|delivery.*status|when.*deliver|dispatch|shipped|out for delivery|my order/i.test(t);
+}
+
 // ── Issue keyword detection ───────────────────────────────────────────────────
 const ISSUE_PATTERNS = [
   /can'?t\s+(order|checkout|buy|add|place|pay|complete)/i,
@@ -157,52 +232,104 @@ router.post('/', chatLimiter, async (req, res) => {
   // Build system prompt with live data
   const productContext = await getLiveContext();
 
-  const systemPrompt = `You are Sathvam's friendly AI sales assistant embedded on www.sathvam.in.
-Sathvam Natural Products is a factory-direct brand in Karur, Tamil Nadu — cold pressed oils, millets, spices, all natural, no chemicals.
-Be warm, short, and action-focused. Respond in Tamil if the customer writes in Tamil.
+  // ── Build order context ────────────────────────────────────────────────────
+  let orderContext = '';
+  const isOrderIntent = detectOrderIntent(messages);
+  if (isOrderIntent) {
+    const orderNo = extractOrderNo(messages);
+    const phone   = extractPhone(messages, lead);
+    if (orderNo && phone) {
+      const order = await lookupOrder(orderNo, phone);
+      if (order) {
+        const items = (order.items || []).map(i => `${i.qty}x ${i.productName||i.name}`).join(', ');
+        orderContext = `\nORDER FOUND:
+Order No: ${order.order_no}
+Status: ${order.status?.toUpperCase()}
+Items: ${items}
+${order.delivered_date ? 'Delivered on: ' + order.delivered_date : ''}
+${order.created_at ? 'Ordered on: ' + new Date(order.created_at).toLocaleDateString('en-IN') : ''}`;
+      } else if (orderNo) {
+        orderContext = `\nORDER LOOKUP: Order "${orderNo}" not found or phone doesn't match.`;
+      }
+    }
+  }
 
-FORMATTING — plain text chat bubble only:
-- No markdown: no **, no *, no #, no tables, no dashes
-- Use → for lists. Keep each reply under 4 lines.
+  // ── Build coupon context ───────────────────────────────────────────────────
+  let couponContext = '';
+  if (detectCouponIntent(messages)) {
+    const coupons = await getActiveCoupons();
+    if (coupons.length > 0) {
+      couponContext = 'ACTIVE OFFERS:\n' + coupons.map(c => {
+        const disc = c.type === 'percent' ? `${c.value}% off` : `₹${c.value} off`;
+        const min  = c.min_order > 0 ? ` on orders above ₹${c.min_order}` : '';
+        const desc = c.description ? ` (${c.description})` : '';
+        return `→ Code: ${c.code} — ${disc}${min}${desc}`;
+      }).join('\n');
+    } else {
+      couponContext = 'No active coupon codes right now. Check back soon or follow us on Instagram @sathvam.in for offers!';
+    }
+  }
 
-LIVE PRODUCTS (name | pack | price | stock):
+  const systemPrompt = `You are Sathvam's friendly AI sales assistant on www.sathvam.in.
+Sathvam Natural Products — factory-direct from Karur, Tamil Nadu. Cold pressed oils, millets, spices. 100% natural, zero chemicals.
+Be warm, concise, action-focused. Max 4 lines per reply. If customer writes in Tamil, reply ONLY in Tamil.
+
+FORMATTING — plain text chat only, no markdown:
+- No **, no *, no #, no tables, no dashes. Use → for lists.
+
+━━━━ LIVE PRODUCTS (name | pack | price | stock) ━━━━
 ${productContext}
+${orderContext}
+${couponContext}
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-HOW TO HANDLE ORDERING — THIS IS CRITICAL:
-━━━━━━━━━━━━━━━━━━━━━━━━
-When a customer says they want to buy, order, or purchase ANY product, do THIS and ONLY THIS:
+━━━━ WHEN CUSTOMER WANTS TO BUY / ORDER ━━━━
+1. Confirm product & price from the live list ("Groundnut Oil 1L is ₹X + 5% GST — in stock!")
+2. Give 2 options:
+   → Website: Tap "Shop" in the menu, add to cart, pay in 2 mins (UPI/card/net banking)
+   → WhatsApp: Send your order to +91 70921 77092 and team will confirm
+NEVER ask for address, phone, payment in chat. Website checkout handles everything.
 
-1. Confirm the product and price from the live list above (e.g. "Groundnut Oil 1L is ₹X + GST, in stock!")
-2. Give them 2 simple ways to order:
-   → Website: Tap "Shop" in the menu, add to cart, checkout in 2 minutes (UPI / card / net banking)
-   → WhatsApp: Send your order to +91 70921 77092 and our team will confirm + deliver
+━━━━ WHEN CUSTOMER ASKS TO TRACK ORDER ━━━━
+${orderContext ? '' : 'Ask for their order number (e.g. ORD-001) and the phone number used while ordering.'}
+If they say they don't have an order number, tell them to check the confirmation SMS/email or call +91 70921 77092.
 
-NEVER ask the customer for their address, phone number, payment details, or any personal info in this chat.
-NEVER say "to complete your order please provide..." — the website checkout handles all of that.
-NEVER pretend you can place orders — you cannot. Direct them to the website or WhatsApp.
+━━━━ HEALTH RECOMMENDATIONS ━━━━
+Use this when customers ask "what's good for [condition]":
+- Heart health / cholesterol → Groundnut Oil (rich in monounsaturated fats, Vitamin E)
+- Joint pain / inflammation → Sesame Oil (sesamol, anti-inflammatory)
+- Immunity / thyroid → Coconut Oil (lauric acid, MCTs)
+- Diabetes / blood sugar → Finger Millet (ragi), Foxtail Millet, Little Millet
+- Bone health / calcium → Finger Millet (highest calcium of all millets)
+- Weight loss / digestion → Millets (high fibre), Jaggery (replaces refined sugar)
+- Iron deficiency / anaemia → Jaggery, Finger Millet
+- Skin / hair → Sesame Oil, Coconut Oil, Castor Oil
+- Cooking (high heat) → Groundnut Oil or Coconut Oil (high smoke point)
 
-Example — if customer says "I want to order groundnut oil 1L":
-"Groundnut Oil 1L is ₹[price] + 5% GST — in stock!
-2 easy ways to order:
-→ Website: Tap Shop above, add to cart, pay in 2 mins
-→ WhatsApp: Send 'Groundnut Oil 1L' to +91 70921 77092 and we'll confirm your order"
+━━━━ POPULAR COMBOS (suggest when relevant) ━━━━
+- "Oil Trio" → Groundnut 1L + Sesame 500ml + Coconut 1L (crosses ₹2500 = free delivery!)
+- "Millet Pack" → Finger Millet + Foxtail Millet + Little Millet (all 500g)
+- "Kitchen Starter" → Groundnut Oil 1L + Turmeric 100g + Sambar Powder 200g
+- "Diabetic Friendly" → Finger Millet + Foxtail Millet + Coconut Oil
+Mention free delivery if combo crosses ₹2500.
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-DELIVERY & PAYMENT:
-- Free delivery on orders above ₹2500
+━━━━ BULK / B2B ━━━━
+If customer asks for bulk (10+ litres / 5+ kg / wholesale / business), say:
+"For bulk orders, WhatsApp us at +91 70921 77092 or email sales@sathvam.in — we offer special pricing for businesses and distributors!"
+
+━━━━ OFFERS / COUPONS ━━━━
+${couponContext || 'Tell customers to check the website for latest offers, or ask the team on WhatsApp.'}
+
+━━━━ DELIVERY & PAYMENT ━━━━
+- Free delivery above ₹2500 (combine products to qualify!)
 - Pay via UPI, cards, net banking (Razorpay)
-- Delivered in 3–5 business days
+- Delivered in 3–5 business days; same-day dispatch for orders before 2 PM
 
-CONTACT:
-- WhatsApp/Phone: +91 70921 77092
+━━━━ CONTACT ━━━━
+- WhatsApp/Phone: +91 70921 77092 (Mon–Sat 9 AM–6 PM)
 - Email: sales@sathvam.in
-- Hours: Mon–Sat 9 AM – 6 PM
 
-RETURNS: 7 days if product is damaged or wrong.
-
-If customer wants to speak to a human: "Sure! WhatsApp us at +91 70921 77092 — Mon–Sat 9 AM–6 PM 💬"
-Never make up prices or stock beyond what is listed above.`;
+RETURNS: 7 days if product damaged or wrong.
+NEVER make up prices or stock. If unsure, say "Check +91 70921 77092 for latest info."`;
 
   const recentMessages = messages.slice(-10).map(m => ({
     role: m.role === 'assistant' ? 'assistant' : 'user',
@@ -234,13 +361,33 @@ Never make up prices or stock beyond what is listed above.`;
     const data = await response.json();
     const reply = data.content?.[0]?.text ?? "Sorry, I couldn't generate a response.";
 
-    // Detect WhatsApp handoff trigger — show WA button when ordering or human requested
+    // Intent flags for frontend
     const lastUserMsg = messages.filter(m => m.role === 'user').slice(-1)[0]?.content || '';
     const buyingIntent = /\b(order|buy|purchase|want|need|get|add to cart|place order|book)\b/i.test(lastUserMsg);
-    const wantsHuman = buyingIntent || /whatsapp|speak to|talk to|human|agent|\+91 70921/i.test(reply);
+    const wantsHuman   = /whatsapp|speak to|talk to|human|agent|\+91 70921/i.test(reply);
+    const showWhatsApp = buyingIntent || wantsHuman;
+    const showB2B      = detectB2BIntent(messages);
+
+    // Build pre-filled WhatsApp text
+    let prefillText = 'Hi Sathvam, I need help with my order';
+    if (buyingIntent) {
+      const prodMatch = lastUserMsg.match(/(?:order|buy|purchase|want|need)\s+(.{3,40})/i);
+      if (prodMatch) prefillText = `Hi Sathvam, I want to order ${prodMatch[1].trim()}`;
+    }
+
+    // Back-in-stock alert save
+    const allMessages = [...messages, { role: 'assistant', content: reply }];
+    if (detectOOSInterest(allMessages) && lead?.phone) {
+      const productMatch = allMessages.slice(-4).find(m =>
+        m.role === 'assistant' && /out of stock|not available/i.test(m.content)
+      );
+      if (productMatch) {
+        const pMatch = productMatch.content.match(/([A-Z][a-z]+(?:\s+[A-Z]?[a-z]+)*(?:\s+\d+[A-Za-z]+)?)/);
+        if (pMatch) saveStockAlert(lead.phone, pMatch[1], lead.name).catch(() => {});
+      }
+    }
 
     // Save session + detect issues (non-blocking)
-    const allMessages = [...messages, { role: 'assistant', content: reply }];
     if (sessionId) {
       setImmediate(async () => {
         try {
@@ -255,7 +402,7 @@ Never make up prices or stock beyond what is listed above.`;
       });
     }
 
-    res.json({ reply, showWhatsApp: wantsHuman });
+    res.json({ reply, showWhatsApp, showB2B, prefillText, orderFound: !!orderContext && isOrderIntent });
   } catch (err) {
     console.error('Chat route error:', err);
     res.status(500).json({ error: 'Internal error' });
