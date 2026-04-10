@@ -177,4 +177,78 @@ router.post('/wishlist', custAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── LOYALTY POINTS ─────────────────────────────────────────────────────────
+
+// GET /api/customer/loyalty — get points balance
+router.get('/loyalty', custAuth, async (req, res) => {
+  try {
+    const key = `cust_loyalty_${req.customer.id}`;
+    const { data } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
+    const loyalty = data?.value || { points: 0, history: [] };
+    res.json(loyalty);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/customer/loyalty/earn — earn points after order (called from frontend)
+router.post('/loyalty/earn', custAuth, async (req, res) => {
+  try {
+    const { order_total, order_no } = req.body;
+    if (!order_total || !order_no) return res.status(400).json({ error: 'order_total and order_no required' });
+    const key = `cust_loyalty_${req.customer.id}`;
+    const { data } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
+    const loyalty = data?.value || { points: 0, history: [] };
+    const earned = Math.floor(order_total / 100); // 1 point per ₹100
+    loyalty.points = (loyalty.points || 0) + earned;
+    loyalty.history = [{ type: 'earn', points: earned, order_no, date: new Date().toISOString().slice(0, 10) }, ...(loyalty.history || [])].slice(0, 50);
+    await supabase.from('settings').upsert({ key, value: loyalty }, { onConflict: 'key' });
+    res.json({ ok: true, earned, total: loyalty.points });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/customer/loyalty/redeem — redeem points at checkout
+router.post('/loyalty/redeem', custAuth, async (req, res) => {
+  try {
+    const { points, order_no } = req.body;
+    if (!points || points <= 0) return res.status(400).json({ error: 'points required' });
+    const key = `cust_loyalty_${req.customer.id}`;
+    const { data } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
+    const loyalty = data?.value || { points: 0, history: [] };
+    if ((loyalty.points || 0) < points) return res.status(400).json({ error: 'Insufficient points' });
+    const discount = Math.floor(points / 2); // 2 points = ₹1 discount
+    loyalty.points = (loyalty.points || 0) - points;
+    loyalty.history = [{ type: 'redeem', points: -points, discount, order_no, date: new Date().toISOString().slice(0, 10) }, ...(loyalty.history || [])].slice(0, 50);
+    await supabase.from('settings').upsert({ key, value: loyalty }, { onConflict: 'key' });
+    res.json({ ok: true, discount, remaining: loyalty.points });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── REFERRAL PROGRAM ───────────────────────────────────────────────────────
+
+// GET /api/customer/referral — get or generate referral code
+router.get('/referral', custAuth, async (req, res) => {
+  try {
+    const key = `cust_referral_${req.customer.id}`;
+    const { data } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
+    if (data?.value) return res.json(data.value);
+    // Generate unique code
+    const code = 'SAT' + req.customer.name.split(' ')[0].toUpperCase().slice(0, 5) + Math.random().toString(36).slice(2, 6).toUpperCase();
+    const referral = { code, referred_count: 0, discount_earned: 0, created_at: new Date().toISOString() };
+    await supabase.from('settings').upsert({ key, value: referral }, { onConflict: 'key' });
+    // Also index by code for lookup
+    await supabase.from('settings').upsert({ key: `ref_code_${code}`, value: { customer_id: req.customer.id, customer_name: req.customer.name } }, { onConflict: 'key' });
+    res.json(referral);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/customer/referral/validate — validate a referral code at signup (public, no auth)
+router.post('/referral/validate', async (req, res) => {
+  try {
+    const { code } = req.body;
+    if (!code) return res.status(400).json({ error: 'code required' });
+    const { data } = await supabase.from('settings').select('value').eq('key', `ref_code_${code.toUpperCase()}`).maybeSingle();
+    if (!data?.value) return res.status(404).json({ error: 'Invalid referral code' });
+    res.json({ valid: true, discount: 50, code: code.toUpperCase() }); // ₹50 discount for using referral
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 module.exports = router;

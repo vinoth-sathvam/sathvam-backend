@@ -1,9 +1,32 @@
 const express = require('express');
+const https = require('https');
+const http = require('http');
 const supabase = require('../config/supabase');
 const { auth } = require('../middleware/auth');
 const router = express.Router();
 
 const TODAY = () => new Date().toISOString().slice(0, 10);
+
+// IP geolocation using ip-api.com (free tier — HTTP only, no key needed)
+const geoCache = new Map();
+async function geoIP(ip) {
+  if (!ip || ip === '::1' || ip.startsWith('127.') || ip.startsWith('192.168.') || ip.startsWith('10.')) return null;
+  if (geoCache.has(ip)) return geoCache.get(ip);
+  return new Promise((resolve) => {
+    http.get(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city`, (res) => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(d);
+          const geo = j.status === 'success' ? { country: j.country, state: j.regionName, city: j.city } : null;
+          geoCache.set(ip, geo);
+          resolve(geo);
+        } catch { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+  });
+}
 
 // Helper — atomic upsert of a JSON blob in store_analytics
 async function updateAnalytics(key, updater, def = {}) {
@@ -26,6 +49,16 @@ router.post('/track', async (req, res) => {
 
     if (type === 'visit') {
       await updateAnalytics('visits', d => ({ ...d, [today]: (d[today] || 0) + 1 }));
+
+      // Geo tracking — fire and forget, don't block response
+      const ip = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
+      geoIP(ip).then(geo => {
+        if (!geo) return;
+        const stateKey = geo.state || 'Unknown';
+        const cityKey  = geo.city  || 'Unknown';
+        updateAnalytics('visits_by_state', d => ({ ...d, [stateKey]: (d[stateKey] || 0) + 1 })).catch(e => console.error('[GEO] state write error:', e.message));
+        updateAnalytics('visits_by_city',  d => ({ ...d, [cityKey]:  (d[cityKey]  || 0) + 1 })).catch(e => console.error('[GEO] city write error:', e.message));
+      }).catch(e => console.error('[GEO] lookup error:', e.message));
     }
 
     if (type === 'page_view' && path) {
@@ -133,7 +166,7 @@ router.get('/', auth, async (req, res) => {
     const thirtyDaysAgo = new Date(); thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
     const thirtyDaysAgoStr = thirtyDaysAgo.toISOString().slice(0, 10);
 
-    const [visits, pageViews, productViews, productCartAdds, productInterest, funnelCart, funnelCheckout, funnelOrder, { data: carts }, { data: checkoutSessions }, { data: recentOrders }] = await Promise.all([
+    const [visits, pageViews, productViews, productCartAdds, productInterest, funnelCart, funnelCheckout, funnelOrder, visitsByState, visitsByCity, { data: carts }, { data: checkoutSessions }, { data: recentOrders }] = await Promise.all([
       getAKey('visits', {}),
       getAKey('page_views', {}),
       getAKey('product_views', {}),
@@ -142,6 +175,8 @@ router.get('/', auth, async (req, res) => {
       getAKey('funnel_add_to_cart', {}),
       getAKey('funnel_checkout_start', {}),
       getAKey('funnel_order_placed', {}),
+      getAKey('visits_by_state', {}),
+      getAKey('visits_by_city', {}),
       supabase.from('abandoned_carts').select('*').eq('recovered', false)
         .order('updated_at', { ascending: false }).limit(200),
       supabase.from('store_analytics').select('key,data').like('key', '_cs_%').order('id', { ascending: false }).limit(100),
@@ -253,6 +288,18 @@ router.get('/', auth, async (req, res) => {
     .sort((a, b) => b.views - a.views)
     .slice(0, 20);
 
+    // State breakdown — sorted by visits
+    const topStates = Object.entries(visitsByState)
+      .map(([state, count]) => ({ state, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 15);
+
+    // City breakdown — sorted by visits
+    const topCities = Object.entries(visitsByCity)
+      .map(([city, count]) => ({ city, count }))
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 15);
+
     res.json({
       visits: { daily, monthly, yearly, total: totalVisits, today: todayVisits, thisMonth: thisMonthVisits },
       topPages,
@@ -262,6 +309,8 @@ router.get('/', auth, async (req, res) => {
       funnel: funnelData,
       abandonedCheckouts,
       productOpportunities,
+      topStates,
+      topCities,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
