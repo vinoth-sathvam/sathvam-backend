@@ -47,6 +47,23 @@ router.post('/track', async (req, res) => {
 
     if (type === 'add_to_cart') {
       await updateAnalytics('funnel_add_to_cart', d => ({ ...d, [today]: (d[today] || 0) + 1 }));
+      // Also track per-product
+      if (product_id) {
+        await updateAnalytics('product_cart_adds', d => {
+          const entry = d[product_id] || { name: product_name || product_id, count: 0 };
+          return { ...d, [product_id]: { ...entry, name: product_name || entry.name, count: entry.count + 1 } };
+        });
+      }
+    }
+
+    if (type === 'product_interest') {
+      // Customer spent 25+ seconds on a product page — high intent signal
+      if (product_id) {
+        await updateAnalytics('product_interest', d => {
+          const entry = d[product_id] || { name: product_name || product_id, count: 0 };
+          return { ...d, [product_id]: { ...entry, name: product_name || entry.name, count: entry.count + 1 } };
+        });
+      }
     }
 
     if (type === 'checkout_start') {
@@ -114,16 +131,23 @@ function sumDays(data, days = 30) {
 // GET /api/analytics — full analytics summary for admin dashboard
 router.get('/', auth, async (req, res) => {
   try {
-    const [visits, pageViews, productViews, funnelCart, funnelCheckout, funnelOrder, { data: carts }, { data: checkoutSessions }] = await Promise.all([
+    const thirtyDaysAgo = new Date(); thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const thirtyDaysAgoStr = thirtyDaysAgo.toISOString().slice(0, 10);
+
+    const [visits, pageViews, productViews, productCartAdds, productInterest, funnelCart, funnelCheckout, funnelOrder, { data: carts }, { data: checkoutSessions }, { data: recentOrders }] = await Promise.all([
       getAKey('visits', {}),
       getAKey('page_views', {}),
       getAKey('product_views', {}),
+      getAKey('product_cart_adds', {}),
+      getAKey('product_interest', {}),
       getAKey('funnel_add_to_cart', {}),
       getAKey('funnel_checkout_start', {}),
       getAKey('funnel_order_placed', {}),
       supabase.from('abandoned_carts').select('*').eq('recovered', false)
         .order('updated_at', { ascending: false }).limit(200),
       supabase.from('store_analytics').select('key,data').like('key', '_cs_%').order('id', { ascending: false }).limit(100),
+      supabase.from('webstore_orders').select('items').gte('date', thirtyDaysAgoStr)
+        .in('status', ['confirmed','shipped','delivered','paid']).limit(500),
     ]);
 
     const now = new Date();
@@ -202,6 +226,34 @@ router.get('/', auth, async (req, res) => {
       }))
       .sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
 
+    // Product opportunities — join views, cart adds, interest, orders
+    const orderCountsByProduct = {};
+    for (const order of (recentOrders || [])) {
+      for (const item of (order.items || [])) {
+        const key = item.id || item.name;
+        if (key) orderCountsByProduct[key] = (orderCountsByProduct[key] || 0) + (item.qty || 1);
+      }
+    }
+    // Build combined product table
+    const allProductIds = new Set([
+      ...Object.keys(productViews),
+      ...Object.keys(productCartAdds),
+      ...Object.keys(productInterest),
+    ]);
+    const productOpportunities = Array.from(allProductIds).map(id => {
+      const views    = productViews[id]?.count || 0;
+      const cartAdds = productCartAdds[id]?.count || 0;
+      const interest = productInterest[id]?.count || 0;
+      const orders   = orderCountsByProduct[id] || 0;
+      const name     = productViews[id]?.name || productCartAdds[id]?.name || productInterest[id]?.name || id;
+      const cartRate = views > 0 ? Math.round(cartAdds / views * 100) : 0;
+      const orderRate = views > 0 ? Math.round(orders / views * 100) : 0;
+      return { id, name, views, cartAdds, interest, orders, cartRate, orderRate };
+    })
+    .filter(p => p.views > 0)
+    .sort((a, b) => b.views - a.views)
+    .slice(0, 20);
+
     res.json({
       visits: { daily, monthly, yearly, total: totalVisits, today: todayVisits, thisMonth: thisMonthVisits },
       topPages,
@@ -210,6 +262,7 @@ router.get('/', auth, async (req, res) => {
       abandonedCartCount: (carts || []).length,
       funnel: funnelData,
       abandonedCheckouts,
+      productOpportunities,
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
