@@ -7,14 +7,13 @@ const TODAY = () => new Date().toISOString().slice(0, 10);
 
 // Helper — atomic upsert of a JSON blob in store_analytics
 async function updateAnalytics(key, updater, def = {}) {
-  const { data } = await supabase.from('store_analytics').select('id,data').eq('key', key).single();
+  const { data } = await supabase.from('store_analytics').select('data').eq('key', key).maybeSingle();
   const current = data?.data ?? def;
   const updated = updater(current);
-  if (data?.id) {
-    await supabase.from('store_analytics').update({ data: updated }).eq('key', key);
-  } else {
-    await supabase.from('store_analytics').insert({ key, data: updated });
-  }
+  await supabase.from('store_analytics').upsert(
+    { key, data: updated, updated_at: new Date().toISOString() },
+    { onConflict: 'key' }
+  );
 }
 
 // POST /api/analytics/track  (public — called from website, no auth)
