@@ -65,6 +65,7 @@ app.use('/api/flour-batches', flourBatches);
 app.use('/api/webstore-orders', webstoreOrders);
 app.use('/api/customer',       require('./routes/customer'));
 app.use('/api/payments',      require('./routes/payments'));
+app.use('/api/webhooks',      require('./routes/payments')); // alias — Razorpay dashboard may use this URL
 app.use('/api/b2b/auth',      authLimiter, b2bAuth);
 app.use('/api/b2b/customers', b2bCustomers);
 app.use('/api/b2b/orders',    b2bOrders);
@@ -97,6 +98,7 @@ app.use('/api/tasks',             require('./routes/tasks'));
 app.use('/api/compliance',        require('./routes/compliance'));
 app.use('/api/campaigns',         require('./routes/campaigns'));
 app.use('/api/messages',          require('./routes/messages'));
+app.use('/api/blog',              require('./routes/blog'));
 
 // ── Weekly report manual trigger ──────────────────────────────────────────────
 const { startScheduler, buildWeeklyReport } = require('./config/scheduler');
