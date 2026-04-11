@@ -99,6 +99,7 @@ app.use('/api/payroll',    require('./routes/payroll'));
 app.use('/api/expenses',   require('./routes/expenses'));
 app.use('/api/tts',              require('./routes/tts'));
 app.use('/api/packing-inventory', require('./routes/packingInventory'));
+app.use('/api/packing-procurement', require('./routes/packingProcurement'));
 app.use('/api/raw-stock',         require('./routes/rawStock'));
 app.use('/api/finished-goods',    require('./routes/finishedGoods'));
 app.use('/api/maintenance',       require('./routes/maintenance'));

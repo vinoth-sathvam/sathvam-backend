@@ -47,7 +47,7 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
 // ── PUT update material ────────────────────────────────────────────────────────
 router.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const u = { updated_at: new Date().toISOString() };
-  const fields = ['name','category','product_name','size','cover_size','spec','unit','current_stock','min_stock','reorder_qty','unit_price','supplier','notes','active'];
+  const fields = ['name','category','product_name','size','cover_size','spec','unit','current_stock','min_stock','reorder_qty','unit_price','avg_cost','supplier','notes','active'];
   fields.forEach(f => { if (req.body[f] != null) u[f] = req.body[f]; });
   if (u.current_stock != null) u.current_stock = parseInt(u.current_stock);
   if (u.min_stock     != null) u.min_stock     = parseInt(u.min_stock);
