@@ -47,6 +47,7 @@ products.put('/batch', auth, requireRole('admin', 'manager'), async (req, res) =
     intl_carton_key: p.intlCartonKey ?? null,
     label_cost: p.labelCost || 0,
     pkg_type_key: p.pkgTypeKey ?? null,
+    packing_links: p.packingLinks ?? null,
     featured: p.featured || false,
     active: p.active !== false,
     image_url: p.imageUrl ?? undefined,
@@ -68,7 +69,9 @@ products.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
     intl_price:p.intlPrice, retail_profit_pct:p.retailProfitPct,
     web_profit_pct:p.webProfitPct, web_courier_charge:p.webCourierCharge,
     intl_profit_pct:p.intlProfitPct, intl_carton_key:p.intlCartonKey,
-    label_cost:p.labelCost, pkg_type_key:p.pkgTypeKey, featured:p.featured,
+    label_cost:p.labelCost, pkg_type_key:p.pkgTypeKey,
+    packing_links:p.packingLinks!==undefined?p.packingLinks:undefined,
+    featured:p.featured,
     image_url:p.imageUrl!==undefined?p.imageUrl:undefined,
     description:p.description!==undefined?p.description:undefined,
     hsn_code:p.hsnCode!==undefined?p.hsnCode:undefined

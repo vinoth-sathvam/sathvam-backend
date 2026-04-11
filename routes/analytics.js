@@ -324,17 +324,33 @@ router.get('/pnl', auth, async (req, res) => {
     const start = req.query.start || new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0,10);
     const end   = req.query.end   || today;
 
-    const [salesRes, wsoRes, b2bRes, procRes, expRes] = await Promise.allSettled([
-      // Revenue: local sales
+    // Compute previous period (same duration, immediately before)
+    const startD = new Date(start), endD = new Date(end);
+    const dur = Math.round((endD - startD) / (1000*86400));
+    const prevEnd = new Date(startD); prevEnd.setDate(prevEnd.getDate()-1);
+    const prevStart = new Date(prevEnd); prevStart.setDate(prevStart.getDate()-dur);
+    const prevStartStr = prevStart.toISOString().slice(0,10);
+    const prevEndStr   = prevEnd.toISOString().slice(0,10);
+
+    const LABOUR_PKG_CATS = ['labour','packaging','utilities','electricity','water'];
+
+    const [salesRes, wsoRes, b2bRes, procRes, expRes,
+           attRes, empRes,
+           pSalesRes, pWsoRes, pB2bRes, pProcRes, pExpRes] = await Promise.allSettled([
       supabase.from('sales').select('final_amount,date').gte('date',start).lte('date',end).eq('status','paid'),
-      // Revenue: webstore orders
       supabase.from('webstore_orders').select('total,date,created_at').gte('date',start).lte('date',end).in('status',['confirmed','shipped','delivered','paid']),
-      // Revenue: B2B orders
       supabase.from('b2b_orders').select('total_value,date').gte('date',start).lte('date',end).in('stage',['shipped','delivered','invoice_sent','paid']),
-      // Cost: procurement
       supabase.from('procurements').select('ordered_qty,ordered_price_per_kg,gst,date').gte('date',start).lte('date',end).in('status',['received','stocked','cleaned']),
-      // Cost: expenses
       supabase.from('company_expenses').select('amount,category,date').gte('date',start).lte('date',end).is('deleted_at',null),
+      // Payroll: attendance in period
+      supabase.from('attendance').select('employee_id,status').gte('date',start).lte('date',end),
+      supabase.from('employees').select('id,daily_rate'),
+      // Previous period
+      supabase.from('sales').select('final_amount,date').gte('date',prevStartStr).lte('date',prevEndStr).eq('status','paid'),
+      supabase.from('webstore_orders').select('total,date,created_at').gte('date',prevStartStr).lte('date',prevEndStr).in('status',['confirmed','shipped','delivered','paid']),
+      supabase.from('b2b_orders').select('total_value,date').gte('date',prevStartStr).lte('date',prevEndStr).in('stage',['shipped','delivered','invoice_sent','paid']),
+      supabase.from('procurements').select('ordered_qty,ordered_price_per_kg,gst,date').gte('date',prevStartStr).lte('date',prevEndStr).in('status',['received','stocked','cleaned']),
+      supabase.from('company_expenses').select('amount,category,date').gte('date',prevStartStr).lte('date',prevEndStr).is('deleted_at',null),
     ]);
 
     const sales   = salesRes.value?.data || [];
@@ -342,21 +358,59 @@ router.get('/pnl', auth, async (req, res) => {
     const b2b     = b2bRes.value?.data || [];
     const procs   = procRes.value?.data || [];
     const expenses= expRes.value?.data || [];
+    const attendance = attRes.value?.data || [];
+    const empList    = empRes.value?.data || [];
 
+    const pSales   = pSalesRes.value?.data || [];
+    const pWso     = pWsoRes.value?.data || [];
+    const pB2b     = pB2bRes.value?.data || [];
+    const pProcs   = pProcRes.value?.data || [];
+    const pExpenses= pExpRes.value?.data || [];
+
+    // Revenue
     const rev_sales   = sales.reduce((s,r)=>s+parseFloat(r.final_amount||0),0);
     const rev_webstore= wso.reduce((s,r)=>s+parseFloat(r.total||0),0);
     const rev_b2b     = b2b.reduce((s,r)=>s+parseFloat(r.total_value||0),0);
     const total_revenue = rev_sales + rev_webstore + rev_b2b;
 
+    // Procurement cost
     const cost_procurement = procs.reduce((s,r)=>{
       const qty = parseFloat(r.ordered_qty||0);
       const rate= parseFloat(r.ordered_price_per_kg||0);
       const gst = parseFloat(r.gst||0);
       return s + qty * rate * (1 + gst/100);
     },0);
-    const cost_expenses = expenses.reduce((s,r)=>s+parseFloat(r.amount||0),0);
-    const total_cost    = cost_procurement + cost_expenses;
-    const gross_profit  = total_revenue - total_cost;
+
+    // Payroll for period
+    const empRateMap = {};
+    for (const e of empList) empRateMap[e.id] = parseFloat(e.daily_rate||0);
+    const payrollCost = attendance.reduce((s,a)=>{
+      const rate = empRateMap[a.employee_id] || 0;
+      const mult = a.status==='present' ? 1 : a.status==='half_day' ? 0.5 : 0;
+      return s + rate*mult;
+    },0);
+
+    // Expenses split
+    const labour_packaging_expenses = expenses.reduce((s,r)=>
+      LABOUR_PKG_CATS.includes((r.category||'').toLowerCase()) ? s+parseFloat(r.amount||0) : s, 0);
+    const other_expenses = expenses.reduce((s,r)=>
+      !LABOUR_PKG_CATS.includes((r.category||'').toLowerCase()) ? s+parseFloat(r.amount||0) : s, 0);
+    const cost_expenses = labour_packaging_expenses + other_expenses;
+
+    // 3-level profit
+    const gross_profit    = total_revenue - cost_procurement;
+    const operating_profit= gross_profit - payrollCost - labour_packaging_expenses;
+    const net_profit      = operating_profit - other_expenses;
+
+    // GST
+    const gst_output = total_revenue * 0.05;
+    const gst_input  = procs.reduce((s,r)=>{
+      const qty = parseFloat(r.ordered_qty||0);
+      const rate= parseFloat(r.ordered_price_per_kg||0);
+      const gstPct = parseFloat(r.gst||0);
+      return s + qty * rate * (gstPct/100);
+    },0);
+    const gst_payable = gst_output - gst_input;
 
     // Revenue by day for chart
     const revenueByDay = {};
@@ -371,12 +425,30 @@ router.get('/pnl', auth, async (req, res) => {
       expByCategory[cat] = (expByCategory[cat] || 0) + parseFloat(r.amount||0);
     }
 
+    // Previous period totals
+    const prev_rev = pSales.reduce((s,r)=>s+parseFloat(r.final_amount||0),0)
+                   + pWso.reduce((s,r)=>s+parseFloat(r.total||0),0)
+                   + pB2b.reduce((s,r)=>s+parseFloat(r.total_value||0),0);
+    const prev_proc = pProcs.reduce((s,r)=>{
+      const qty=parseFloat(r.ordered_qty||0),rate=parseFloat(r.ordered_price_per_kg||0),gst=parseFloat(r.gst||0);
+      return s+qty*rate*(1+gst/100);
+    },0);
+    const prev_exp = pExpenses.reduce((s,r)=>s+parseFloat(r.amount||0),0);
+    const prev_gross = prev_rev - prev_proc;
+    const prev_net   = prev_gross - prev_exp;
+
     res.json({
       period: { start, end },
+      prev_period: { start: prevStartStr, end: prevEndStr, revenue: prev_rev, procurement: prev_proc, expenses: prev_exp, gross_profit: prev_gross, net_profit: prev_net },
       revenue: { sales: rev_sales, webstore: rev_webstore, b2b: rev_b2b, total: total_revenue },
-      costs:   { procurement: cost_procurement, expenses: cost_expenses, total: total_cost },
+      costs:   { procurement: cost_procurement, payroll: payrollCost, labour_packaging: labour_packaging_expenses, other_expenses, expenses: cost_expenses, total: cost_procurement+cost_expenses+payrollCost },
       gross_profit,
+      operating_profit,
+      net_profit,
       margin_pct: total_revenue > 0 ? ((gross_profit / total_revenue) * 100).toFixed(1) : 0,
+      operating_margin_pct: total_revenue > 0 ? ((operating_profit / total_revenue) * 100).toFixed(1) : 0,
+      net_margin_pct: total_revenue > 0 ? ((net_profit / total_revenue) * 100).toFixed(1) : 0,
+      gst: { output: gst_output, input: gst_input, payable: gst_payable },
       revenue_by_day: revenueByDay,
       expenses_by_category: expByCategory,
       counts: { sales: sales.length, webstore_orders: wso.length, b2b_orders: b2b.length },
