@@ -370,7 +370,7 @@ settings.get('/env-config', auth, requireRole('admin'), (req, res) => {
   const config = {};
   for (const key of EDITABLE_KEYS) {
     const val = process.env[key] || '';
-    config[key] = SECRET_KEYS.has(key) ? (val ? '••••••••' : '') : val;
+    config[key] = val; // return actual value — admin-only authenticated endpoint
     config[`${key}__set`] = !!val;
   }
   res.json(config);
