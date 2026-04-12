@@ -351,18 +351,9 @@ sales.delete('/:id', auth, requireRole('admin'), async (req, res) => {
 });
 
 const settings = express.Router();
-settings.get('/:key', auth, async (req, res) => {
-  const { data, error } = await supabase.from('settings').select('value').eq('key', req.params.key).single();
-  if (error) return res.status(404).json({ error: 'Not found' });
-  res.json(data.value);
-});
-settings.put('/:key', auth, requireRole('admin','manager'), async (req, res) => {
-  const { data, error } = await supabase.from('settings').upsert({ key:req.params.key, value:req.body, updated_at:new Date() }).select().single();
-  if (error) return res.status(400).json({ error: error.message });
-  res.json(data.value);
-});
 
 // Safe keys that can be read/written via the admin UI
+// NOTE: these specific routes must come BEFORE the /:key wildcard below
 const EDITABLE_KEYS = [
   'SMTP_USER','SMTP_PASS','SMTP_FROM','SMTP_HOST','SMTP_PORT',
   'RAZORPAY_KEY_ID','RAZORPAY_KEY_SECRET','RAZORPAY_WEBHOOK_SECRET',
@@ -419,6 +410,18 @@ settings.post('/smtp-config/test', auth, requireRole('admin'), async (req, res) 
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
+});
+
+// Wildcard key-value routes — must come AFTER specific named routes above
+settings.get('/:key', auth, async (req, res) => {
+  const { data, error } = await supabase.from('settings').select('value').eq('key', req.params.key).single();
+  if (error) return res.status(404).json({ error: 'Not found' });
+  res.json(data.value);
+});
+settings.put('/:key', auth, requireRole('admin','manager'), async (req, res) => {
+  const { data, error } = await supabase.from('settings').upsert({ key:req.params.key, value:req.body, updated_at:new Date() }).select().single();
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(data.value);
 });
 
 const users = express.Router();
