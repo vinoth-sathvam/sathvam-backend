@@ -1,7 +1,25 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const fs = require('fs');
+const path = require('path');
+const nodemailer = require('nodemailer');
 const supabase = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
+
+const ENV_PATH = path.join(__dirname, '../.env');
+
+function updateEnvVar(key, value) {
+  let content = fs.readFileSync(ENV_PATH, 'utf8');
+  const regex = new RegExp(`^${key}=.*`, 'm');
+  const line = `${key}=${value}`;
+  if (regex.test(content)) {
+    content = content.replace(regex, line);
+  } else {
+    content += `\n${line}`;
+  }
+  fs.writeFileSync(ENV_PATH, content, 'utf8');
+  process.env[key] = value;
+}
 
 const products = express.Router();
 products.get('/', auth, async (req, res) => {
@@ -342,6 +360,65 @@ settings.put('/:key', auth, requireRole('admin','manager'), async (req, res) => 
   const { data, error } = await supabase.from('settings').upsert({ key:req.params.key, value:req.body, updated_at:new Date() }).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data.value);
+});
+
+// Safe keys that can be read/written via the admin UI
+const EDITABLE_KEYS = [
+  'SMTP_USER','SMTP_PASS','SMTP_FROM','SMTP_HOST','SMTP_PORT',
+  'RAZORPAY_KEY_ID','RAZORPAY_KEY_SECRET','RAZORPAY_WEBHOOK_SECRET',
+  'WA_ACCESS_TOKEN','WA_PHONE_NUMBER_ID','WA_WABA_ID','WA_NOTIFY_TO','WA_ORDER_TEMPLATE','WA_WEBHOOK_VERIFY_TOKEN',
+  'ZOHO_CLIENT_ID','ZOHO_CLIENT_SECRET','ZOHO_ORG_ID','ZOHO_REFRESH_TOKEN',
+  'VAPID_PUBLIC_KEY','VAPID_PRIVATE_KEY','VAPID_SUBJECT',
+  'ANTHROPIC_API_KEY',
+  'GOOGLE_CLIENT_ID',
+  'FRONTEND_URL','PORTAL_URL',
+];
+const SECRET_KEYS = new Set(['SMTP_PASS','RAZORPAY_KEY_SECRET','RAZORPAY_WEBHOOK_SECRET','WA_ACCESS_TOKEN','ZOHO_CLIENT_SECRET','ZOHO_REFRESH_TOKEN','VAPID_PRIVATE_KEY','ANTHROPIC_API_KEY']);
+
+settings.get('/env-config', auth, requireRole('admin'), (req, res) => {
+  const config = {};
+  for (const key of EDITABLE_KEYS) {
+    const val = process.env[key] || '';
+    config[key] = SECRET_KEYS.has(key) ? (val ? '••••••••' : '') : val;
+    config[`${key}__set`] = !!val;
+  }
+  res.json(config);
+});
+
+settings.post('/env-config', auth, requireRole('admin'), async (req, res) => {
+  const updates = req.body;
+  const saved = [];
+  for (const [key, value] of Object.entries(updates)) {
+    if (!EDITABLE_KEYS.includes(key)) continue;
+    if (value === '' || value === '••••••••') continue; // skip blanks and masked placeholders
+    updateEnvVar(key, value);
+    saved.push(key);
+  }
+  res.json({ success: true, saved });
+});
+
+settings.post('/smtp-config/test', auth, requireRole('admin'), async (req, res) => {
+  const smtpUser = process.env.SMTP_USER;
+  const smtpPass = process.env.SMTP_PASS;
+  const { to } = req.body;
+  if (!smtpUser || !smtpPass) return res.status(400).json({ error: 'SMTP not configured yet' });
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: parseInt(process.env.SMTP_PORT || '587'),
+    secure: false,
+    auth: { user: smtpUser, pass: smtpPass },
+  });
+  try {
+    await transporter.sendMail({
+      from: process.env.SMTP_FROM || `Sathvam <${smtpUser}>`,
+      to: to || smtpUser,
+      subject: 'Sathvam SMTP Test ✅',
+      html: '<h2>SMTP is working!</h2><p>Your email settings are correctly configured on sathvam.in.</p>',
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 const users = express.Router();

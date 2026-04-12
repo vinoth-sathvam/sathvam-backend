@@ -330,40 +330,50 @@ router.delete('/cart/:sessionId', async (req, res) => {
   } catch { res.json({ ok: false }); }
 });
 
-// GET /api/public/image-search?q=... — search product images via Wikipedia + Wikimedia Commons
+// Blocked domains for image search (low quality / not product images)
+const IMG_BLOCK = ['wikipedia.org','wikimedia.org','wikidata.org','wiki','upload.wikimedia'];
+
+// GET /api/public/image-search?q=... — search product images via DuckDuckGo
 router.get('/image-search', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
   const q = (req.query.q || '').trim();
   if (!q) return res.json({ images: [] });
   try {
-    const images = [];
+    // Append "product buy" to bias toward e-commerce / product photos
+    const query = `${q} product buy`;
 
-    // Wikipedia page images
-    const wpSearch = await fetch(`https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q+' food')}&format=json&srlimit=5`);
-    const wpData = await wpSearch.json();
-    const titles = (wpData.query?.search || []).map(r => r.title).slice(0, 5);
-    if (titles.length) {
-      const wpImg = await fetch(`https://en.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(titles.join('|'))}&prop=pageimages&format=json&pithumbsize=600`);
-      const wpImgData = await wpImg.json();
-      for (const page of Object.values(wpImgData.query?.pages || {})) {
-        if (page.thumbnail?.source) images.push(page.thumbnail.source);
-      }
-    }
+    // Step 1: get vqd token from DuckDuckGo
+    const initRes = await fetch(`https://duckduckgo.com/?q=${encodeURIComponent(query)}&iax=images&ia=images`, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36' }
+    });
+    const initHtml = await initRes.text();
+    const vqdMatch = initHtml.match(/vqd=['"]([^'"]+)['"]/);
+    if (!vqdMatch) return res.json({ images: [] });
+    const vqd = vqdMatch[1];
 
-    // Wikimedia Commons images
-    const cmSearch = await fetch(`https://commons.wikimedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&srnamespace=6&format=json&srlimit=8`);
-    const cmData = await cmSearch.json();
-    const fileNames = (cmData.query?.search || []).map(r => r.title).slice(0, 6);
-    if (fileNames.length) {
-      const cmImg = await fetch(`https://commons.wikimedia.org/w/api.php?action=query&titles=${encodeURIComponent(fileNames.join('|'))}&prop=imageinfo&iiprop=url&iiurlwidth=600&format=json`);
-      const cmImgData = await cmImg.json();
-      for (const page of Object.values(cmImgData.query?.pages || {})) {
-        const url = page.imageinfo?.[0]?.thumburl;
-        if (url) images.push(url);
-      }
-    }
+    // Step 2: fetch image results (request more so we have enough after filtering)
+    const imgRes = await fetch(
+      `https://duckduckgo.com/i.js?q=${encodeURIComponent(query)}&vqd=${encodeURIComponent(vqd)}&o=json&p=1&f=,,,,,&l=us-en`,
+      { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36', 'Referer': 'https://duckduckgo.com/' } }
+    );
+    const imgData = await imgRes.json();
 
-    res.json({ images: [...new Set(images)].slice(0, 9) });
+    const images = (imgData.results || [])
+      .filter(r => {
+        const url = (r.image || '').toLowerCase();
+        if (!url) return false;
+        if (url.endsWith('.svg') || url.endsWith('.gif')) return false;
+        if (IMG_BLOCK.some(b => url.includes(b))) return false;
+        return true;
+      })
+      // Sort largest first for HD quality
+      .sort((a, b) => (b.width * b.height) - (a.width * a.height))
+      // Only keep images with reasonable size (at least 300px wide)
+      .filter(r => !r.width || r.width >= 300)
+      .map(r => r.image)
+      .slice(0, 9);
+
+    res.json({ images });
   } catch (e) {
     res.status(500).json({ error: e.message, images: [] });
   }
