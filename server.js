@@ -89,6 +89,7 @@ app.use('/api/b2b/customers', b2bCustomers);
 app.use('/api/b2b/orders',    b2bOrders);
 app.use('/api/projects',      projects);
 app.use('/api/b2b/item-progress', b2bItemProgress);
+app.use('/api/admin/init',     require('./routes/adminInit'));
 app.use('/api/analytics', require('./routes/analytics'));
 app.use('/api/zoho-customers', require('./routes/zohoCustomers'));
 app.use('/api/upload',   require('./routes/upload'));
