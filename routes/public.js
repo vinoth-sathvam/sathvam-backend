@@ -2,9 +2,30 @@ const express = require('express');
 const supabase = require('../config/supabase');
 const router = express.Router();
 
+// ── Simple in-memory cache (avoids Supabase round-trip on every page load) ──
+const cache = {};
+const CACHE_TTL = 3 * 60 * 1000; // 3 minutes
+
+function getCached(key) {
+  const entry = cache[key];
+  if (entry && Date.now() - entry.ts < CACHE_TTL) return entry.data;
+  return null;
+}
+function setCached(key, data) {
+  cache[key] = { data, ts: Date.now() };
+}
+// Allow admin to bust cache (called after product/settings updates)
+router.post('/cache-bust', (req, res) => {
+  Object.keys(cache).forEach(k => delete cache[k]);
+  res.json({ ok: true });
+});
+
 // GET /api/public/products — no auth, returns website-enabled products + tamil names
 router.get('/products', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
+  res.header('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
+  const cached = getCached('products');
+  if (cached) return res.json(cached);
   try {
     const [{ data: products, error }, { data: settings }] = await Promise.all([
       supabase.from('products').select('id,name,sku,cat,unit,pack_size,pack_unit,gst,price,website_price,retail_price,featured,active,hsn_code,description,image_url').eq('active', true).order('name'),
@@ -26,7 +47,9 @@ router.get('/products', async (req, res) => {
     const tamilNames = (rawTamil && typeof rawTamil === 'object' && rawTamil.value && typeof rawTamil.value === 'object')
       ? rawTamil.value : (rawTamil || {});
 
-    res.json({ products: websiteProducts, tamilNames });
+    const result = { products: websiteProducts, tamilNames };
+    setCached('products', result);
+    res.json(result);
   } catch (err) {
     res.status(500).json({ error: "Server error" });
   }
@@ -37,6 +60,9 @@ router.get('/products', async (req, res) => {
 // Other products: stock_ledger in - out
 router.get('/stock', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
+  res.header('Cache-Control', 'public, max-age=60, stale-while-revalidate=120');
+  const cached = getCached('stock');
+  if (cached) return res.json(cached);
   try {
     const [
       { data: ledger },
@@ -133,6 +159,7 @@ router.get('/stock', async (req, res) => {
       if (stock[id] < 0) stock[id] = 0;
     }
 
+    setCached('stock', { stock });
     res.json({ stock });
   } catch (err) {
     res.status(500).json({ error: "Server error" });
