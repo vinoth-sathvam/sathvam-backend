@@ -266,7 +266,29 @@ function startScheduler() {
     } catch (e) { console.error('Evening check failed:', e.message); }
   });
 
-  console.log('Scheduler started — weekly report Mon 8 AM, daily reminders 9 AM / 1:30 PM / 7 PM IST');
+  // ── AI Monitor Agent: 9:00 AM IST (3:30 AM UTC) daily ────────────────────
+  cron.schedule('30 3 * * *', async () => {
+    try {
+      // Lazy-require to avoid circular dependency at startup
+      const monitorAgent = require('../routes/monitorAgent');
+      // monitorAgent exports the router — use the runAgent via a direct import
+      const { runMonitorAgent } = require('../routes/monitorAgent');
+      if (typeof runMonitorAgent === 'function') {
+        const report = await runMonitorAgent();
+        const criticals = (report.issues||[]).filter(i=>i.severity==='CRITICAL').length;
+        const highs     = (report.issues||[]).filter(i=>i.severity==='CRITICAL'||i.severity==='HIGH').length;
+        if (highs > 0) {
+          await sendReminders([
+            `🤖 Monitor Agent found ${criticals} CRITICAL + ${highs} HIGH issues`,
+            `Score: ${report.score}/100 — ${report.summary}`,
+          ], 'Daily Monitor Agent Alert');
+        }
+        console.log(`Monitor agent ran — score: ${report.score}, issues: ${(report.issues||[]).length}`);
+      }
+    } catch(e) { console.error('Monitor agent scheduler error:', e.message); }
+  });
+
+  console.log('Scheduler started — weekly report Mon 8 AM, daily reminders 9 AM / 1:30 PM / 7 PM IST, monitor agent 9 AM IST');
 }
 
 module.exports = { startScheduler, buildWeeklyReport, checkDailyTasks, sendReminders };

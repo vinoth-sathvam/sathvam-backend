@@ -95,6 +95,7 @@ app.use('/api/upload',   require('./routes/upload'));
 app.use('/api/chat',     require('./routes/chat'));
 app.use('/api/social',      require('./routes/social'));
 app.use('/api/admin-chat', require('./routes/adminChat'));
+app.use('/api/monitor-agent', require('./routes/monitorAgent'));
 app.use('/api/payroll',    require('./routes/payroll'));
 app.use('/api/expenses',   require('./routes/expenses'));
 app.use('/api/tts',              require('./routes/tts'));
