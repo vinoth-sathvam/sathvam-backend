@@ -245,6 +245,112 @@ router.get('/', auth, async (req, res) => {
   res.json(data || []);
 });
 
+// ── Status-change notification helpers ───────────────────────────────────────
+const STATUS_LABELS = {
+  confirmed:  'Order Confirmed ✅',
+  packed:     'Order Packed 📦',
+  dispatched: 'Order Dispatched 🚚',
+  delivered:  'Order Delivered 🎉',
+  cancelled:  'Order Cancelled ❌',
+};
+
+async function sendStatusEmail(order, newStatus) {
+  const cust  = order.customer || {};
+  const email = cust.email || '';
+  if (!email || !process.env.SMTP_USER) return;
+
+  const label    = STATUS_LABELS[newStatus] || newStatus;
+  const orderNo  = order.order_no || order.orderNo || '';
+  const courier  = order.courier  || '';
+  const awb      = order.awb_number || '';
+  const trackLine = (newStatus === 'dispatched' && (courier || awb))
+    ? `<p style="margin:8px 0;font-size:14px;color:#374151">🚚 <strong>Courier:</strong> ${courier} &nbsp;|&nbsp; <strong>AWB:</strong> ${awb}</p>`
+    : '';
+
+  const msgMap = {
+    confirmed:  `We've confirmed your order and it's being prepared for packing.`,
+    packed:     `Your order is packed and will be handed to the courier shortly.`,
+    dispatched: `Your order is on its way! ${courier ? `It's with ${courier}` : ''} ${awb ? `(AWB: ${awb})` : ''}.`.trim(),
+    delivered:  `Your order has been delivered. We hope you love it! 🌿`,
+    cancelled:  `Your order has been cancelled. If you have questions, please contact us at sales@sathvam.in.`,
+  };
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden">
+      <div style="background:linear-gradient(135deg,#2d1a0e,#5c3317);padding:24px 32px">
+        <div style="color:#f5a800;font-size:20px;font-weight:900;letter-spacing:2px">SATHVAM</div>
+        <div style="color:rgba(255,255,255,0.7);font-size:12px;margin-top:4px">Order Update</div>
+      </div>
+      <div style="padding:28px 32px">
+        <div style="font-size:18px;font-weight:800;color:#1f2937;margin-bottom:12px">${label}</div>
+        <p style="margin:0 0 16px;font-size:14px;color:#374151">Hi ${cust.name || 'there'},</p>
+        <p style="margin:0 0 16px;font-size:14px;color:#374151">${msgMap[newStatus] || `Your order status has been updated to <strong>${newStatus}</strong>.`}</p>
+        ${trackLine}
+        <div style="background:#f9fafb;border-radius:8px;padding:14px 18px;margin:20px 0;font-size:13px;color:#6b7280">
+          Order: <strong style="color:#1f2937">${orderNo}</strong>
+        </div>
+        <p style="font-size:13px;color:#9ca3af;margin:0">Questions? Reply to this email or WhatsApp us at +91 70921 77092.</p>
+      </div>
+      <div style="background:#f9fafb;padding:14px 32px;border-top:1px solid #e5e7eb;font-size:11px;color:#9ca3af">
+        Sathvam Natural Products · export@sathvam.in · +91 70921 77092
+      </div>
+    </div>`;
+
+  try {
+    await mailer.sendMail({
+      from:    process.env.SMTP_FROM    || 'Sathvam Natural Products <noreply@sathvam.in>',
+      replyTo: process.env.SMTP_REPLY_TO || 'sales@sathvam.in',
+      to:      email,
+      subject: `${label} — Order ${orderNo}`,
+      html,
+    });
+  } catch (e) {
+    console.error('Status email error:', e.message);
+  }
+}
+
+async function sendStatusWhatsApp(order, newStatus) {
+  const phoneId = process.env.WA_PHONE_NUMBER_ID;
+  const token   = process.env.WA_ACCESS_TOKEN;
+  if (!phoneId || !token) return;
+
+  const cust  = order.customer || {};
+  const phone = (cust.phone || '').replace(/\D/g, '');
+  if (!phone) return;
+
+  const orderNo = order.order_no || order.orderNo || '';
+  const courier = order.courier  || '';
+  const awb     = order.awb_number || '';
+
+  const msgMap = {
+    confirmed:  `✅ *Order Confirmed!*\n\nHi ${cust.name || 'there'}, your Sathvam order *${orderNo}* is confirmed and being packed.\n\nFor help: +91 70921 77092`,
+    packed:     `📦 *Order Packed!*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* is packed and ready for dispatch soon.\n\nFor help: +91 70921 77092`,
+    dispatched: `🚚 *Order Dispatched!*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* is on its way!${courier ? `\nCourier: ${courier}` : ''}${awb ? `\nAWB: ${awb}` : ''}\n\nFor help: +91 70921 77092`,
+    delivered:  `🎉 *Order Delivered!*\n\nHi ${cust.name || 'there'}, your Sathvam order *${orderNo}* has been delivered. Enjoy the goodness! 🌿\n\nFor help: +91 70921 77092`,
+    cancelled:  `❌ *Order Cancelled*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* has been cancelled. Questions? Email sales@sathvam.in or WhatsApp +91 70921 77092.`,
+  };
+
+  const text = msgMap[newStatus];
+  if (!text) return;
+
+  try {
+    const res = await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
+      method:  'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to:   phone,
+        type: 'text',
+        text: { body: text },
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) console.error('WA status notify error:', data?.error?.message);
+  } catch (e) {
+    console.error('WA status notify error:', e.message);
+  }
+}
+
 // Admin: update order status + dispatch info
 async function updateOrder(req, res) {
   const { status, notes, courier, awb_number, dispatch_date, delivered_date } = req.body;
@@ -262,6 +368,15 @@ async function updateOrder(req, res) {
     .select()
     .single();
   if (error) return res.status(400).json({ error: error.message });
+
+  // Fire-and-forget notifications when status changes
+  if (status && data) {
+    setImmediate(async () => {
+      await sendStatusEmail(data, status);
+      await sendStatusWhatsApp(data, status);
+    });
+  }
+
   res.json(data);
 }
 router.put('/:id',   auth, updateOrder);
