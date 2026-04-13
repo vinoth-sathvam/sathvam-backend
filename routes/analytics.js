@@ -501,4 +501,31 @@ router.get('/dashboard', auth, async (req, res) => {
   }
 });
 
+// GET /api/analytics/carts — admin cart tracking (Live / Abandoned / Failed / Recovered)
+router.get('/carts', auth, async (req, res) => {
+  try {
+    const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+
+    const [{ data: allCarts }, { data: csSessions }] = await Promise.all([
+      supabase.from('abandoned_carts').select('*').order('updated_at', { ascending: false }).limit(500),
+      supabase.from('store_analytics').select('key,data').like('key', '_cs_%').order('id', { ascending: false }).limit(200),
+    ]);
+
+    const carts = allCarts || [];
+    const sessions = (csSessions || []).map(r => ({ id: r.key.replace('_cs_', ''), ...r.data }));
+
+    // Live = updated in last 30 min, not recovered
+    const live = carts.filter(c => !c.recovered && c.updated_at >= thirtyMinAgo);
+    // Abandoned = not recovered, older than 30 min
+    const abandoned = carts.filter(c => !c.recovered && c.updated_at < thirtyMinAgo);
+    // Failed payments = started checkout (have name/phone) but never placed order
+    const failedPayments = sessions.filter(s => !s.recovered && (s.customer_name || s.customer_phone));
+    // Recovered = carts that converted + checkout sessions that converted
+    const recoveredCarts = carts.filter(c => c.recovered);
+    const recoveredSessions = sessions.filter(s => s.recovered);
+
+    res.json({ live, abandoned, failedPayments, recovered: [...recoveredCarts, ...recoveredSessions] });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 module.exports = router;

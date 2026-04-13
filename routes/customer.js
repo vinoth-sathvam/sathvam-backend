@@ -1,10 +1,18 @@
-const express  = require('express');
-const supabase  = require('../config/supabase');
-const bcrypt    = require('bcryptjs');
-const jwt       = require('jsonwebtoken');
+const express    = require('express');
+const supabase   = require('../config/supabase');
+const bcrypt     = require('bcryptjs');
+const jwt        = require('jsonwebtoken');
+const nodemailer = require('nodemailer');
 const { OAuth2Client } = require('google-auth-library');
-const make2FA   = require('./twoFactor');
-const router    = express.Router();
+const make2FA    = require('./twoFactor');
+const router     = express.Router();
+
+const mailer = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || 'smtp.gmail.com',
+  port: parseInt(process.env.SMTP_PORT || '587'),
+  secure: false,
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+});
 
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) { console.error('FATAL: JWT_SECRET not set'); process.exit(1); }
@@ -271,6 +279,68 @@ router.post('/referral/validate', async (req, res) => {
     if (!data?.value) return res.status(404).json({ error: 'Invalid referral code' });
     res.json({ valid: true, discount: 50, code: code.toUpperCase() }); // ₹50 discount for using referral
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/customer/cart-reminder — send cart abandonment email to logged-in customer
+router.post('/cart-reminder', custAuth, async (req, res) => {
+  try {
+    const { items } = req.body;
+    if (!items || !items.length) return res.json({ ok: true });
+    if (!process.env.SMTP_USER || !process.env.SMTP_PASS) return res.json({ ok: true });
+
+    // Fetch fresh customer record to get email and name
+    const { data: cust } = await supabase.from('customers')
+      .select('name,email').eq('id', req.customer.id).maybeSingle();
+    if (!cust?.email) return res.json({ ok: true });
+
+    const firstName = (cust.name || 'there').split(' ')[0];
+    const rows = items.map(i =>
+      `<tr>
+        <td style="padding:8px 12px;border-bottom:1px solid #f3f4f6">${i.name}</td>
+        <td style="padding:8px 12px;text-align:center;border-bottom:1px solid #f3f4f6">${i.qty}</td>
+        <td style="padding:8px 12px;text-align:right;border-bottom:1px solid #f3f4f6;font-weight:700">₹${((i.qty||1)*(i.price||0)).toLocaleString('en-IN')}</td>
+      </tr>`
+    ).join('');
+    const total = items.reduce((s, i) => s + (i.qty||1)*(i.price||0), 0);
+
+    const html = `
+<div style="font-family:sans-serif;max-width:540px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e5e7eb">
+  <div style="background:linear-gradient(135deg,#2d1a0e,#5c3317);color:#fff;padding:24px 28px">
+    <div style="font-size:22px;font-weight:800;margin-bottom:4px">🛒 You left something behind!</div>
+    <div style="font-size:14px;opacity:0.85">Hi ${firstName}, your cart is waiting for you at Sathvam Natural Products</div>
+  </div>
+  <div style="padding:24px 28px">
+    <p style="color:#374151;font-size:15px;margin-top:0">We noticed you added items to your cart but haven't completed your order. Your fresh, cold-pressed goodness is just a click away! 🌿</p>
+    <table style="width:100%;border-collapse:collapse;margin:16px 0;background:#f9fafb;border-radius:8px;overflow:hidden">
+      <thead>
+        <tr style="background:#f3f4f6">
+          <th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280">ITEM</th>
+          <th style="padding:8px 12px;text-align:center;font-size:12px;color:#6b7280">QTY</th>
+          <th style="padding:8px 12px;text-align:right;font-size:12px;color:#6b7280">AMOUNT</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <p style="text-align:right;font-size:16px;font-weight:800;color:#1f2937">Total: ₹${total.toLocaleString('en-IN')}</p>
+    <div style="text-align:center;margin:24px 0">
+      <a href="https://sathvam.in" style="background:linear-gradient(135deg,#2d1a0e,#5c3317);color:#fff;text-decoration:none;padding:14px 36px;border-radius:10px;font-size:16px;font-weight:700;display:inline-block">Complete My Order →</a>
+    </div>
+    <p style="color:#9ca3af;font-size:12px;text-align:center">Questions? Reply to this email or call us at +91 70921 77092.<br>Sathvam Natural Products — Pure. Natural. Cold-pressed.</p>
+  </div>
+</div>`;
+
+    await mailer.sendMail({
+      from: process.env.SMTP_FROM || 'Sathvam Natural Products <noreply@sathvam.in>',
+      replyTo: process.env.SMTP_REPLY_TO || 'sales@sathvam.in',
+      to: cust.email,
+      subject: `${firstName}, your cart is waiting 🛒 — Sathvam Natural Products`,
+      html,
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('cart-reminder email:', err.message);
+    res.json({ ok: true }); // always 200 — frontend doesn't need to know
+  }
 });
 
 // 2FA routes — /api/customer/2fa/*

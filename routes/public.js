@@ -1,6 +1,14 @@
-const express = require('express');
-const supabase = require('../config/supabase');
-const router = express.Router();
+const express    = require('express');
+const supabase   = require('../config/supabase');
+const nodemailer = require('nodemailer');
+const router     = express.Router();
+
+const mailer = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || 'smtp.gmail.com',
+  port: parseInt(process.env.SMTP_PORT || '587'),
+  secure: false,
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+});
 
 // ── Simple in-memory cache (avoids Supabase round-trip on every page load) ──
 const cache = {};
@@ -802,6 +810,72 @@ router.get('/bought-together', async (req, res) => {
 
     res.json({ products: (products || []).map(p => ({ ...p, websitePrice: p.website_price, packSize: p.pack_size, packUnit: p.pack_unit })) });
   } catch (e) { res.status(500).json({ error: e.message, products: [] }); }
+});
+
+// POST /api/public/cart-reminder — guest cart abandonment email (no auth required)
+router.post('/cart-reminder', async (req, res) => {
+  res.json({ ok: true }); // always respond immediately
+  try {
+    const { email, name, items } = req.body;
+    if (!email || !items?.length) return;
+    if (!process.env.SMTP_USER || !process.env.SMTP_PASS) return;
+
+    const firstName = (name || email.split('@')[0]) || 'there';
+    const rows = items.map(i =>
+      `<tr>
+        <td style="padding:8px 12px;border-bottom:1px solid #f3f4f6">${i.name || 'Product'}</td>
+        <td style="padding:8px 12px;text-align:center;border-bottom:1px solid #f3f4f6">${i.qty || 1}</td>
+        <td style="padding:8px 12px;text-align:right;border-bottom:1px solid #f3f4f6;font-weight:700">₹${((i.qty||1)*(i.price||0)).toLocaleString('en-IN')}</td>
+      </tr>`
+    ).join('');
+    const total = items.reduce((s, i) => s + (i.qty||1)*(i.price||0), 0);
+
+    const html = `
+<div style="font-family:sans-serif;max-width:540px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e5e7eb">
+  <div style="background:linear-gradient(135deg,#2d1a0e,#5c3317);color:#fff;padding:24px 28px">
+    <div style="font-size:22px;font-weight:800;margin-bottom:4px">🛒 You left something behind!</div>
+    <div style="font-size:14px;opacity:0.85">Hi ${firstName}, your cart is waiting at Sathvam Natural Products</div>
+  </div>
+  <div style="padding:24px 28px">
+    <p style="color:#374151;font-size:15px;margin-top:0">Your fresh, cold-pressed goodness is just one click away! 🌿 We saved your cart so you can pick up right where you left off.</p>
+    <table style="width:100%;border-collapse:collapse;margin:16px 0;background:#f9fafb;border-radius:8px;overflow:hidden">
+      <thead>
+        <tr style="background:#f3f4f6">
+          <th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280">ITEM</th>
+          <th style="padding:8px 12px;text-align:center;font-size:12px;color:#6b7280">QTY</th>
+          <th style="padding:8px 12px;text-align:right;font-size:12px;color:#6b7280">AMOUNT</th>
+        </tr>
+      </thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <p style="text-align:right;font-size:16px;font-weight:800;color:#1f2937">Total: ₹${total.toLocaleString('en-IN')}</p>
+    <div style="text-align:center;margin:24px 0">
+      <a href="https://sathvam.in" style="background:linear-gradient(135deg,#2d1a0e,#5c3317);color:#fff;text-decoration:none;padding:14px 36px;border-radius:10px;font-size:16px;font-weight:700;display:inline-block">Complete My Order →</a>
+    </div>
+    <p style="color:#9ca3af;font-size:12px;text-align:center">Questions? Call us at +91 70921 77092.<br>Sathvam Natural Products — Pure. Natural. Cold-pressed.</p>
+  </div>
+</div>`;
+
+    await mailer.sendMail({
+      from: process.env.SMTP_FROM || 'Sathvam Natural Products <noreply@sathvam.in>',
+      replyTo: process.env.SMTP_REPLY_TO || 'sales@sathvam.in',
+      to: email,
+      subject: `Your cart is waiting 🛒 — Sathvam Natural Products`,
+      html,
+    });
+  } catch (e) { console.error('guest cart-reminder email:', e.message); }
+});
+
+// GET /api/public/store-config — lightweight config for the webstore (no auth needed)
+router.get('/store-config', async (req, res) => {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'web_settings').maybeSingle();
+    const cfg = data?.value || {};
+    res.json({
+      couponsEnabled:    cfg.couponsEnabled    !== false,
+      giftPackingEnabled: cfg.giftPackingEnabled !== false,
+    });
+  } catch (e) { res.json({ couponsEnabled: true, giftPackingEnabled: true }); }
 });
 
 module.exports = router;

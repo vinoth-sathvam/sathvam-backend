@@ -33,6 +33,7 @@ async function sendMagicLink(email, companyName, token) {
   const link = `${portalBase}?b2btoken=${token}`;
   await transporter.sendMail({
     from: process.env.SMTP_FROM || 'Sathvam Exports <noreply@sathvam.in>',
+    replyTo: process.env.SMTP_REPLY_TO || 'sales@sathvam.in',
     to: email,
     subject: 'Your Sathvam B2B Portal Access Link',
     html: `

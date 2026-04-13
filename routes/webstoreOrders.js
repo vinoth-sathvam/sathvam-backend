@@ -215,6 +215,7 @@ router.post('/:id/send-invoice', auth, async (req, res) => {
     const html = buildInvoiceHtml(o, false);
     await mailer.sendMail({
       from:    process.env.SMTP_FROM || 'Sathvam Oils <sales@sathvam.in>',
+      replyTo: process.env.SMTP_REPLY_TO || 'sales@sathvam.in',
       to:      email,
       subject: `Your Invoice ${o.order_no} — Sathvam Oils & Spices`,
       html,
@@ -245,7 +246,7 @@ router.get('/', auth, async (req, res) => {
 });
 
 // Admin: update order status + dispatch info
-router.put('/:id', auth, async (req, res) => {
+async function updateOrder(req, res) {
   const { status, notes, courier, awb_number, dispatch_date, delivered_date } = req.body;
   const updates = {};
   if (status         !== undefined) updates.status         = status;
@@ -262,7 +263,9 @@ router.put('/:id', auth, async (req, res) => {
     .single();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
-});
+}
+router.put('/:id',   auth, updateOrder);
+router.patch('/:id', auth, updateOrder);
 
 // Bulk insert — used once to migrate existing localStorage data
 router.post('/bulk', auth, async (req, res) => {
@@ -420,4 +423,41 @@ router.get('/crm', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Exported helper: send order confirmation + invoice email to customer ───────
+async function sendCustomerInvoice(order, paymentId) {
+  const cust  = order.customer || {};
+  const email = cust.email || order.email;
+  if (!email) return; // no email — skip silently
+  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) return;
+  try {
+    const html = buildInvoiceHtml(order, false);
+    await mailer.sendMail({
+      from:    process.env.SMTP_FROM || 'Sathvam Natural Products <noreply@sathvam.in>',
+      replyTo: process.env.SMTP_REPLY_TO || 'sales@sathvam.in',
+      to:      email,
+      subject: `Your Order Confirmation — ${order.orderNo || order.order_no} 🌿`,
+      html: `<div style="font-family:sans-serif;max-width:640px;margin:0 auto">
+  <div style="background:linear-gradient(135deg,#1a5c2a,#2d7a3a);color:#fff;padding:20px 28px;border-radius:10px 10px 0 0;text-align:center">
+    <div style="font-size:32px;margin-bottom:6px">🌿</div>
+    <h2 style="margin:0;font-size:20px">Order Confirmed!</h2>
+    <div style="opacity:.85;font-size:13px;margin-top:4px">Thank you for choosing Sathvam Natural Products</div>
+  </div>
+  <div style="border:1px solid #e5e7eb;border-top:none;padding:20px 28px;background:#fffdf7;border-radius:0 0 10px 10px">
+    <p style="color:#1f2937;font-size:15px;margin-top:0">Hi <strong>${cust.name || 'there'}</strong>! 👋</p>
+    <p style="color:#374151;font-size:14px;line-height:1.6">
+      Your order <strong>#${order.orderNo || order.order_no}</strong> has been placed successfully and will be dispatched within 1–2 business days.
+      ${paymentId ? `<br><span style="color:#6b7280;font-size:12px">Payment ID: ${paymentId}</span>` : ''}
+    </p>
+    <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px 16px;margin:16px 0;font-size:13px;color:#166534">
+      📦 We'll send you a WhatsApp/SMS update once your order is dispatched with tracking details.
+    </div>
+    <p style="color:#374151;font-size:13px">Your invoice is attached below for reference:</p>
+  </div>
+</div>
+<div style="margin-top:16px">${html}</div>`,
+    });
+  } catch (e) { console.error('Customer invoice email error:', e.message); }
+}
+
 module.exports = router;
+module.exports.sendCustomerInvoice = sendCustomerInvoice;

@@ -4,6 +4,7 @@ const crypto       = require('crypto');
 const nodemailer   = require('nodemailer');
 const supabase     = require('../config/supabase');
 const { createInvoice, recordPayment } = require('../config/zoho');
+const { sendCustomerInvoice } = require('./webstoreOrders');
 
 // ── Email transporter ─────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -188,11 +189,14 @@ router.post('/verify', async (req, res) => {
       })));
     }
 
-    // Non-blocking: WhatsApp alert + Zoho invoice
+    // Non-blocking: WhatsApp alert + Zoho invoice + customer confirmation
     setImmediate(async () => {
       // WhatsApp + email notifications to owner
       await sendWhatsAppAlert({ ...o, paymentId: razorpay_payment_id });
       await sendOrderEmail(o, razorpay_payment_id);
+
+      // Invoice/confirmation email to customer
+      await sendCustomerInvoice({ ...o, orderNo: o.orderNo }, razorpay_payment_id);
 
       // Zoho Books invoice
       try {

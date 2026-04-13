@@ -388,8 +388,8 @@ NEVER make up prices or stock. If unsure, say "Check +91 70921 77092 for latest 
         'content-type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 450,
+        model: 'claude-sonnet-4-6',
+        max_tokens: 650,
         system: systemPrompt,
         messages: recentMessages,
       }),
@@ -471,6 +471,77 @@ router.get('/sessions/:id', auth, async (req, res) => {
   const { data, error } = await supabase.from('chat_sessions').select('*').eq('id', req.params.id).single();
   if (error) return res.status(404).json({ error: error.message });
   res.json(data);
+});
+
+// ── POST /api/chat/sessions/:id/retry-email — send payment retry email to customer
+router.post('/sessions/:id/retry-email', auth, async (req, res) => {
+  try {
+    const { data: session, error } = await supabase.from('chat_sessions').select('*').eq('id', req.params.id).single();
+    if (error || !session) return res.status(404).json({ error: 'Session not found' });
+
+    const { customNote, overrideEmail } = req.body;
+    const email = overrideEmail?.trim() || session.lead_email;
+    if (!email) return res.status(400).json({ error: 'No email address provided' });
+    const name = session.lead_name || 'Valued Customer';
+
+    if (!process.env.SMTP_USER || !process.env.SMTP_PASS) return res.status(503).json({ error: 'Email not configured' });
+    const nodemailer = require('nodemailer');
+    const mailer = nodemailer.createTransport({
+      host: process.env.SMTP_HOST || 'smtp.gmail.com',
+      port: parseInt(process.env.SMTP_PORT || '587'),
+      secure: false,
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+
+    const noteHtml = customNote ? `<p style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:12px 16px;color:#92400e;margin:16px 0">${customNote.replace(/</g,'&lt;')}</p>` : '';
+
+    await mailer.sendMail({
+      from: process.env.SMTP_FROM || 'Sathvam Natural Products <noreply@sathvam.in>',
+      replyTo: process.env.SMTP_REPLY_TO || 'sales@sathvam.in',
+      to: email,
+      subject: `We noticed you had trouble ordering — we're here to help! 🌿`,
+      html: `<div style="font-family:sans-serif;max-width:560px;margin:0 auto">
+  <div style="background:linear-gradient(135deg,#1a5c2a,#2d7a3a);color:#fff;padding:24px 28px;border-radius:12px 12px 0 0;text-align:center">
+    <div style="font-size:36px;margin-bottom:8px">🌿</div>
+    <h2 style="margin:0;font-size:20px">Sathvam Natural Products</h2>
+    <div style="opacity:.85;font-size:13px;margin-top:4px">Pure. Natural. Cold-pressed.</div>
+  </div>
+  <div style="border:1px solid #e5e7eb;border-top:none;padding:24px 28px;border-radius:0 0 12px 12px;background:#fff">
+    <p style="color:#1f2937;font-size:15px;margin-top:0">Hi <strong>${name}</strong>,</p>
+    <p style="color:#374151;font-size:14px;line-height:1.6">We noticed you reached out to us recently and may have had some trouble completing your order. We're sorry for the inconvenience — and we'd love to make it right!</p>
+    ${noteHtml}
+    <p style="color:#374151;font-size:14px;line-height:1.6">Your cart is ready and waiting. Just click the button below to head back and complete your order — it only takes a minute:</p>
+    <div style="text-align:center;margin:24px 0">
+      <a href="https://sathvam.in" style="display:inline-block;background:linear-gradient(135deg,#1a5c2a,#2d7a3a);color:#fff;text-decoration:none;padding:14px 36px;border-radius:10px;font-size:16px;font-weight:700">
+        Complete My Order →
+      </a>
+    </div>
+    <div style="background:#f9fafb;border-radius:8px;padding:14px 16px;margin:16px 0">
+      <div style="font-weight:700;color:#1f2937;margin-bottom:8px;font-size:13px">💳 Payment options available:</div>
+      <div style="font-size:13px;color:#4b5563;line-height:1.8">→ UPI (Google Pay, PhonePe, Paytm)<br>→ Debit / Credit Card<br>→ Net Banking<br>→ Wallets</div>
+    </div>
+    <p style="color:#374151;font-size:14px;line-height:1.6">If you continue to face any issues, please don't hesitate to reach out — we're happy to help you place the order directly over WhatsApp!</p>
+    <div style="text-align:center;margin:20px 0">
+      <a href="https://wa.me/917092177092?text=Hi%20Sathvam%2C%20I%20need%20help%20placing%20my%20order" style="display:inline-block;background:#25D366;color:#fff;text-decoration:none;padding:11px 28px;border-radius:8px;font-size:14px;font-weight:700">
+        💬 WhatsApp Us
+      </a>
+    </div>
+    <p style="color:#9ca3af;font-size:12px;text-align:center;margin-top:20px">
+      Sathvam Natural Products · Karur, Tamil Nadu<br>
+      📞 +91 70921 77092 · sales@sathvam.in
+    </p>
+  </div>
+</div>`,
+    });
+
+    // Mark session as retry-emailed in notes
+    await supabase.from('chat_sessions').update({
+      notes: (session.notes ? session.notes + '\n' : '') + `[${new Date().toLocaleDateString('en-IN')}] Retry email sent by admin`,
+      updated_at: new Date().toISOString(),
+    }).eq('id', session.id);
+
+    res.json({ ok: true, sentTo: email });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── PATCH /api/chat/sessions/:id — update status/notes ───────────────────────

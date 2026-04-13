@@ -59,6 +59,9 @@ router.post('/validate', couponLimiter, async (req, res) => {
   try {
     const { code, cart_total } = req.body;
     if (!code) return res.status(400).json({ error: 'Code required' });
+    // Global on/off switch
+    const { data: cfg } = await supabase.from('settings').select('value').eq('key', 'web_settings').maybeSingle();
+    if (cfg?.value?.couponsEnabled === false) return res.status(400).json({ error: 'Coupons are not available right now' });
     const { data: coupon, error } = await supabase.from('coupons')
       .select('*').eq('code', code.toUpperCase().trim()).eq('active', true).maybeSingle();
     if (error || !coupon) return res.status(404).json({ error: 'Invalid or expired coupon' });
