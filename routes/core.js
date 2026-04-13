@@ -136,6 +136,14 @@ products.post('/stock/bulk', auth, async (req, res) => {
   res.json({ synced: rows.length });
 });
 
+// DELETE /api/products/stock/by-proc/:procId — delete stock ledger entries linked to a procurement
+products.delete('/stock/by-proc/:procId', auth, requireRole('admin'), async (req, res) => {
+  const suffix = req.params.procId.slice(-6);
+  const { error } = await supabase.from('stock_ledger').delete().ilike('reference', `%Procurement ${suffix}%`);
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ message: 'Stock entries deleted' });
+});
+
 // POST /api/products/seed-images — bulk-set image_url by product name (admin only)
 products.post('/seed-images', auth, requireRole('admin'), async (req, res) => {
   const map = req.body; // { "Product Name": "https://..." }

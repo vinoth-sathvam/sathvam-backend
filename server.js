@@ -30,8 +30,8 @@ app.use(cors({ origin: allowedOrigins, credentials: true }));
 
 const rateLimitOpts = { validate: { xForwardedForHeader: false } };
 
-// General rate limit — 300 req/15min per IP
-app.use(rateLimit({ windowMs: 15*60*1000, max: 300, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests, please try again later' }, ...rateLimitOpts }));
+// General rate limit — 1200 req/15min per IP (admin panel has polling + bulk init calls)
+app.use(rateLimit({ windowMs: 15*60*1000, max: 1200, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests, please try again later' }, ...rateLimitOpts }));
 
 // Auth limiter — 10 attempts/15min per IP (brute force protection)
 const authLimiter = rateLimit({
@@ -119,6 +119,7 @@ app.use('/api/tasks',             require('./routes/tasks'));
 app.use('/api/compliance',        require('./routes/compliance'));
 app.use('/api/campaigns',         require('./routes/campaigns'));
 app.use('/api/messages',          require('./routes/messages'));
+app.use('/api/calls',             rateLimit({ windowMs: 60*1000, max: 200, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests' }, ...rateLimitOpts }), require('./routes/calls'));
 app.use('/api/blog',              require('./routes/blog'));
 app.use('/api/notifications',     require('./routes/notifications'));
 app.use('/api/whatsapp',          require('./routes/whatsapp'));      // WhatsApp Business API
