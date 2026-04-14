@@ -617,6 +617,40 @@ router.post('/live-viewers', async (req, res) => {
   } catch { res.json({ ok: false, count: 1 }); }
 });
 
+// POST /api/public/heartbeat — store frontend pings every 30s to signal active session
+router.post('/heartbeat', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  const { session_id, page } = req.body;
+  if (!session_id) return res.json({ ok: false });
+  try {
+    const now = new Date().toISOString();
+    const { data } = await supabase.from('store_analytics').select('data').eq('key', 'live_sessions').maybeSingle();
+    const sessions = data?.data || {};
+    // Prune sessions older than 2 minutes, then upsert current
+    const nowMs = Date.now();
+    for (const [sid, s] of Object.entries(sessions)) {
+      if (nowMs - new Date(s.ts).getTime() > 2 * 60 * 1000) delete sessions[sid];
+    }
+    sessions[session_id] = { ts: now, page: page || '/' };
+    await supabase.from('store_analytics').upsert({ key: 'live_sessions', data: sessions, updated_at: now }, { onConflict: 'key' });
+    res.json({ ok: true, count: Object.keys(sessions).length });
+  } catch { res.json({ ok: false }); }
+});
+
+// GET /api/public/live-count — current active visitor count (last 2 min)
+router.get('/live-count', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { data } = await supabase.from('store_analytics').select('data').eq('key', 'live_sessions').maybeSingle();
+    if (!data?.data) return res.json({ count: 0, pages: {} });
+    const nowMs = Date.now();
+    const active = Object.entries(data.data).filter(([, s]) => nowMs - new Date(s.ts).getTime() < 2 * 60 * 1000);
+    const pages = {};
+    active.forEach(([, s]) => { const p = s.page || '/'; pages[p] = (pages[p] || 0) + 1; });
+    res.json({ count: active.length, pages });
+  } catch { res.json({ count: 0, pages: {} }); }
+});
+
 // GET /api/public/sitemap.xml — dynamic sitemap with all products + blog posts
 router.get('/sitemap.xml', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
