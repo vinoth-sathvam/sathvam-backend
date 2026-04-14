@@ -5,6 +5,7 @@ const jwt        = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const { OAuth2Client } = require('google-auth-library');
 const make2FA    = require('./twoFactor');
+const { encrypt, decrypt, hmac, encryptCustomer, decryptCustomer } = require('../config/crypto');
 const router     = express.Router();
 
 const mailer = nodemailer.createTransport({
@@ -29,15 +30,25 @@ router.post('/signup', async (req, res) => {
   try {
     const { name, email, phone, password } = req.body;
     if (!name || !email) return res.status(400).json({ error: 'Name and email are required' });
-    const { data: existing } = await supabase.from('customers').select('id').eq('email', email.toLowerCase().trim()).maybeSingle();
+    const normEmail = email.toLowerCase().trim();
+    const eHash = hmac(normEmail);
+    // Use HMAC hash for duplicate check (email column is encrypted after migration)
+    const { data: existing } = await supabase.from('customers').select('id').eq('email_hash', eHash).maybeSingle();
     if (existing) return res.status(400).json({ error: 'Email already registered. Please login.' });
-    const hash = password ? await bcrypt.hash(password, 10) : null;
+    const passwordHash = password ? await bcrypt.hash(password, 10) : null;
     const { data: cust, error } = await supabase.from('customers')
-      .insert({ name: name.trim(), email: email.toLowerCase().trim(), phone: phone||null, password_hash: hash })
+      .insert({
+        name:          encrypt(name.trim()),
+        email:         encrypt(normEmail),
+        email_hash:    eHash,
+        phone:         phone ? encrypt(phone) : null,
+        password_hash: passwordHash,
+      })
       .select('id,name,email,phone,address,city,state,pincode').single();
     if (error) return res.status(400).json({ error: error.message });
-    const token = jwt.sign({ id: cust.id, email: cust.email, name: cust.name }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ customer: cust, token });
+    const plain = decryptCustomer(cust);
+    const token = jwt.sign({ id: plain.id, email: normEmail, name: plain.name }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ customer: plain, token });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -46,8 +57,24 @@ router.post('/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required' });
-    const { data: cust } = await supabase.from('customers').select('*').eq('email', email.toLowerCase().trim()).maybeSingle();
+    const normEmail = email.toLowerCase().trim();
+    const eHash = hmac(normEmail);
+
+    // Primary lookup: by HMAC hash (encrypted rows)
+    let { data: cust } = await supabase.from('customers').select('*').eq('email_hash', eHash).maybeSingle();
+
+    // Fallback: plaintext lookup for rows that haven't been migrated yet
+    if (!cust) {
+      const { data: plain } = await supabase.from('customers').select('*').eq('email', normEmail).maybeSingle();
+      if (plain) {
+        cust = plain;
+        // Lazy-migrate: encrypt this row so future logins use the hash path
+        setImmediate(() => migrateCustomerRow(cust.id, cust));
+      }
+    }
+
     if (!cust) return res.status(400).json({ error: 'No account found with this email. Please sign up.' });
+
     if (cust.password_hash && password) {
       const valid = await bcrypt.compare(password, cust.password_hash);
       if (!valid) return res.status(400).json({ error: 'Incorrect password' });
@@ -60,31 +87,81 @@ router.post('/login', async (req, res) => {
       return res.json({ requiresTOTP: true, preAuthToken });
     }
 
-    const token = jwt.sign({ id: cust.id, email: cust.email, name: cust.name }, JWT_SECRET, { expiresIn: '30d' });
-    res.json({ customer: { id: cust.id, name: cust.name, email: cust.email, phone: cust.phone, address: cust.address, city: cust.city, state: cust.state, pincode: cust.pincode }, token });
+    const plain = decryptCustomer(cust);
+    const token = jwt.sign({ id: plain.id, email: normEmail, name: plain.name }, JWT_SECRET, { expiresIn: '30d' });
+    res.json({ customer: { id: plain.id, name: plain.name, email: normEmail, phone: plain.phone, address: plain.address, city: plain.city, state: plain.state, pincode: plain.pincode }, token });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// Lazy-migrate: encrypt a pre-existing plaintext customer row in the background.
+async function migrateCustomerRow(id, existing) {
+  try {
+    const plainEmail = existing.email || '';
+    if (!plainEmail || plainEmail.startsWith('ENC:')) return; // already encrypted or empty
+    const updates = {
+      name:       encrypt(existing.name  || ''),
+      email:      encrypt(plainEmail),
+      email_hash: hmac(plainEmail.toLowerCase().trim()),
+      phone:      existing.phone   ? encrypt(existing.phone)   : null,
+      address:    existing.address ? encrypt(existing.address) : null,
+      city:       existing.city    ? encrypt(existing.city)    : null,
+      state:      existing.state   ? encrypt(existing.state)   : null,
+      pincode:    existing.pincode ? encrypt(existing.pincode) : null,
+    };
+    await supabase.from('customers').update(updates).eq('id', id);
+  } catch (e) {
+    console.error('Lazy customer migration failed for', id, e.message);
+  }
+}
+
 // Helper — find or create customer by email+name (used by OAuth)
 async function oauthFindOrCreate(email, name, avatarUrl) {
-  const { data: existing } = await supabase.from('customers').select('id,name,email,phone,address,city,state,pincode').eq('email', email).maybeSingle();
+  const normEmail = email.toLowerCase().trim();
+  const eHash = hmac(normEmail);
+
+  // Try encrypted lookup first
+  let { data: existing } = await supabase.from('customers')
+    .select('id,name,email,phone,address,city,state,pincode,totp_enabled,totp_secret,email_hash')
+    .eq('email_hash', eHash).maybeSingle();
+
+  // Fallback to plaintext (pre-migration rows)
+  if (!existing) {
+    const { data: plain } = await supabase.from('customers')
+      .select('id,name,email,phone,address,city,state,pincode,totp_enabled,totp_secret,email_hash')
+      .eq('email', normEmail).maybeSingle();
+    if (plain) {
+      existing = plain;
+      setImmediate(() => migrateCustomerRow(plain.id, plain));
+    }
+  }
+
   if (existing) return existing;
+
+  // Create new customer with encrypted PII
   const { data: created, error } = await supabase.from('customers')
-    .insert({ name, email, avatar_url: avatarUrl || null })
-    .select('id,name,email,phone,address,city,state,pincode').single();
+    .insert({
+      name:       encrypt(name),
+      email:      encrypt(normEmail),
+      email_hash: eHash,
+      avatar_url: avatarUrl || null,
+    })
+    .select('id,name,email,phone,address,city,state,pincode,totp_enabled,totp_secret,email_hash').single();
   if (error) throw new Error(error.message);
   return created;
 }
 
 // Helper — check 2FA and return pre-auth token or full JWT
 function oauthRespond(res, cust) {
+  const plain = decryptCustomer(cust);
   if (cust.totp_enabled) {
     const { issuePreAuthToken } = require('./twoFactor');
     const preAuthToken = issuePreAuthToken({ id: cust.id });
     return res.json({ requiresTOTP: true, preAuthToken });
   }
-  const token = jwt.sign({ id: cust.id, email: cust.email, name: cust.name }, JWT_SECRET, { expiresIn: '30d' });
-  res.json({ customer: { id: cust.id, name: cust.name, email: cust.email, phone: cust.phone, address: cust.address, city: cust.city, state: cust.state, pincode: cust.pincode }, token });
+  // Use normalised email from HMAC path (plain.email is already decrypted)
+  const normEmail = (plain.email || '').toLowerCase().trim();
+  const token = jwt.sign({ id: plain.id, email: normEmail, name: plain.name }, JWT_SECRET, { expiresIn: '30d' });
+  res.json({ customer: { id: plain.id, name: plain.name, email: normEmail, phone: plain.phone, address: plain.address, city: plain.city, state: plain.state, pincode: plain.pincode }, token });
 }
 
 // POST /api/customer/oauth/google
@@ -131,17 +208,24 @@ router.post('/oauth/facebook', async (req, res) => {
 // GET /api/customer/me
 router.get('/me', custAuth, async (req, res) => {
   const { data } = await supabase.from('customers').select('id,name,email,phone,address,city,state,pincode').eq('id', req.customer.id).single();
-  res.json(data || {});
+  res.json(data ? decryptCustomer(data) : {});
 });
 
 // GET /api/customer/orders
 router.get('/orders', custAuth, async (req, res) => {
   try {
+    const eHash = hmac(req.customer.email);
     const { data } = await supabase.from('webstore_orders')
       .select('*')
-      .filter('customer->>email', 'eq', req.customer.email)
+      .eq('customer_email_hash', eHash)
       .order('created_at', { ascending: false });
-    res.json(data || []);
+    // Decrypt customer JSONB in each order before returning
+    const { decryptCustomer: dc } = require('../config/crypto');
+    const orders = (data || []).map(o => ({
+      ...o,
+      customer: o.customer ? dc(o.customer) : o.customer,
+    }));
+    res.json(orders);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -150,15 +234,15 @@ router.post('/update', custAuth, async (req, res) => {
   try {
     const { name, phone, address, city, state, pincode } = req.body;
     const updates = {};
-    if (name)    updates.name    = name.trim();
-    if (phone)   updates.phone   = phone;
-    if (address) updates.address = address;
-    if (city)    updates.city    = city;
-    if (state)   updates.state   = state;
-    if (pincode) updates.pincode = pincode;
+    if (name)    updates.name    = encrypt(name.trim());
+    if (phone)   updates.phone   = encrypt(phone);
+    if (address) updates.address = encrypt(address);
+    if (city)    updates.city    = encrypt(city);
+    if (state)   updates.state   = encrypt(state);
+    if (pincode) updates.pincode = encrypt(pincode);
     const { data, error } = await supabase.from('customers').update(updates).eq('id', req.customer.id).select('id,name,email,phone,address,city,state,pincode').single();
     if (error) return res.status(400).json({ error: error.message });
-    res.json({ customer: data });
+    res.json({ customer: decryptCustomer(data) });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -289,9 +373,10 @@ router.post('/cart-reminder', custAuth, async (req, res) => {
     if (!process.env.SMTP_USER || !process.env.SMTP_PASS) return res.json({ ok: true });
 
     // Fetch fresh customer record to get email and name
-    const { data: cust } = await supabase.from('customers')
+    const { data: custRaw } = await supabase.from('customers')
       .select('name,email').eq('id', req.customer.id).maybeSingle();
-    if (!cust?.email) return res.json({ ok: true });
+    if (!custRaw?.email) return res.json({ ok: true });
+    const cust = decryptCustomer(custRaw);
 
     const firstName = (cust.name || 'there').split(' ')[0];
     const rows = items.map(i =>

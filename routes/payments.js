@@ -6,6 +6,7 @@ const supabase     = require('../config/supabase');
 const { createInvoice, recordPayment } = require('../config/zoho');
 const { sendCustomerInvoice } = require('./webstoreOrders');
 const { auth, requireRole } = require('../middleware/auth');
+const { encrypt, hmac, encryptCustomer } = require('../config/crypto');
 
 // ── Email transporter ─────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -140,43 +141,48 @@ router.post('/verify', async (req, res) => {
       // Non-blocking: continue if Razorpay API is unavailable — signature already verified
     }
 
-    // Save webstore order
+    // Save webstore order — encrypt customer PII before storing
     const o = order;
+    const rawCustomer = o.customer || {};
+    const encCustomer = encryptCustomer(rawCustomer);
+    const custEmailHash = hmac(rawCustomer.email || '');
     const dbId = crypto.randomUUID(); // always use a proper UUID for the DB row
     const { error: wsErr } = await supabase.from('webstore_orders').upsert({
-      id:       dbId,
-      order_no: o.orderNo,
-      date:     o.date || new Date().toISOString().slice(0, 10),
-      customer: o.customer || {},
-      items:    o.items || [],
-      subtotal: parseFloat(o.subtotal) || 0,
-      gst:      parseFloat(o.gst) || 0,
-      shipping: parseFloat(o.shipping) || 0,
-      total:    parseFloat(o.total) || 0,
-      status:   'confirmed',
-      channel:  'website',
-      notes:    `Razorpay: ${razorpay_payment_id}`,
+      id:                  dbId,
+      order_no:            o.orderNo,
+      date:                o.date || new Date().toISOString().slice(0, 10),
+      customer:            encCustomer,
+      customer_email_hash: custEmailHash,
+      items:               o.items || [],
+      subtotal:            parseFloat(o.subtotal) || 0,
+      gst:                 parseFloat(o.gst) || 0,
+      shipping:            parseFloat(o.shipping) || 0,
+      total:               parseFloat(o.total) || 0,
+      status:              'confirmed',
+      channel:             'website',
+      notes:               `Razorpay: ${razorpay_payment_id}`,
     }, { onConflict: 'id' });
     if (wsErr) {
       console.error('Webstore order save error:', wsErr.message, 'order_no:', o.orderNo, 'payment:', razorpay_payment_id);
       return res.status(500).json({ error: 'Order save failed: ' + wsErr.message });
     }
 
-    // Save factory sale
+    // Save factory sale — encrypt customer PII
     const customer = o.customer || {};
+    const addrNote = `${customer.address || ''}, ${customer.city || ''}, ${customer.state || ''} - ${customer.pincode || ''}`;
     const { data: sale } = await supabase.from('sales').insert({
       order_no:       o.orderNo,
       date:           o.date || new Date().toISOString().slice(0, 10),
       channel:        'website',
       status:         'pending',
-      customer_name:  customer.name || '',
-      customer_phone: customer.phone || '',
+      customer_name:  encrypt(customer.name  || ''),
+      customer_phone: encrypt(customer.phone || ''),
       total_amount:   parseFloat(o.subtotal) || 0,
       discount:       0,
       final_amount:   parseFloat(o.total) || 0,
       amount_paid:    parseFloat(o.total) || 0,
       payment_method: 'online',
-      notes:          `${customer.address || ''}, ${customer.city || ''}, ${customer.state || ''} - ${customer.pincode || ''} | Razorpay: ${razorpay_payment_id}`,
+      notes:          encrypt(`${addrNote} | Razorpay: ${razorpay_payment_id}`),
     }).select().single();
 
     if (sale && Array.isArray(o.items) && o.items.length > 0) {

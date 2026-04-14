@@ -3,7 +3,18 @@ const nodemailer   = require('nodemailer');
 const supabase     = require('../config/supabase');
 const { auth }     = require('../middleware/auth');
 const rateLimit    = require('express-rate-limit');
+const { decryptCustomer, hmac, encryptCustomer } = require('../config/crypto');
 const router       = express.Router();
+
+// Decrypt the customer JSONB field of a single order
+function decryptOrder(order) {
+  if (!order) return order;
+  return { ...order, customer: order.customer ? decryptCustomer(order.customer) : order.customer };
+}
+// Decrypt an array of orders
+function decryptOrders(orders) {
+  return (orders || []).map(decryptOrder);
+}
 
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -204,10 +215,11 @@ function buildInvoiceHtml(o, autoPrint = false) {
 // POST /api/webstore-orders/:id/send-invoice — send invoice to customer via email
 router.post('/:id/send-invoice', auth, async (req, res) => {
   try {
-    const { data: o, error } = await supabase
+    const { data: rawO, error } = await supabase
       .from('webstore_orders').select('*').eq('id', req.params.id).single();
-    if (error || !o) return res.status(404).json({ error: 'Order not found' });
+    if (error || !rawO) return res.status(404).json({ error: 'Order not found' });
 
+    const o     = decryptOrder(rawO);
     const cust  = o.customer || {};
     const email = cust.email || '';
     if (!email) return res.status(400).json({ error: 'Customer has no email address' });
@@ -242,7 +254,7 @@ router.get('/', auth, async (req, res) => {
     .order('created_at', { ascending: false })
     .limit(2000);
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+  res.json(decryptOrders(data));
 });
 
 // ── Status-change notification helpers ───────────────────────────────────────
@@ -378,15 +390,17 @@ async function updateOrder(req, res) {
     .single();
   if (error) return res.status(400).json({ error: error.message });
 
-  // Fire-and-forget notifications when status changes
-  if (status && data) {
+  const decrypted = decryptOrder(data);
+
+  // Fire-and-forget notifications when status changes (needs plaintext customer data)
+  if (status && decrypted) {
     setImmediate(async () => {
-      await sendStatusEmail(data, status, cancel_reason);
-      await sendStatusWhatsApp(data, status, cancel_reason);
+      await sendStatusEmail(decrypted, status, cancel_reason);
+      await sendStatusWhatsApp(decrypted, status, cancel_reason);
     });
   }
 
-  res.json(data);
+  res.json(decrypted);
 }
 router.put('/:id',   auth, updateOrder);
 router.patch('/:id', auth, updateOrder);
@@ -423,7 +437,9 @@ router.get('/status', async (req, res) => {
     .ilike('order_no', order_no.trim())
     .single();
   if (error || !data) return res.status(404).json({ error: 'Order not found' });
-  const orderPhone = (data.customer?.phone || '').replace(/\D/g,'');
+  // Decrypt customer field before comparing phone number
+  const plainCustomer = data.customer ? decryptCustomer(data.customer) : {};
+  const orderPhone = (plainCustomer.phone || '').replace(/\D/g,'');
   const inputPhone = phone.trim().replace(/\D/g,'');
   if (!orderPhone.endsWith(inputPhone.slice(-10)) && !inputPhone.endsWith(orderPhone.slice(-10)))
     return res.status(403).json({ error: 'Phone number does not match' });
@@ -549,12 +565,14 @@ router.get('/crm', auth, async (req, res) => {
 
 // ── Exported helper: send order confirmation + invoice email to customer ───────
 async function sendCustomerInvoice(order, paymentId) {
-  const cust  = order.customer || {};
-  const email = cust.email || order.email;
+  // Decrypt customer PII — caller may pass encrypted data from DB
+  const decOrder = decryptOrder(order);
+  const cust  = decOrder.customer || {};
+  const email = cust.email || decOrder.email;
   if (!email) return; // no email — skip silently
   if (!process.env.SMTP_USER || !process.env.SMTP_PASS) return;
   try {
-    const html = buildInvoiceHtml(order, false);
+    const html = buildInvoiceHtml(decOrder, false);
     await mailer.sendMail({
       from:    process.env.SMTP_FROM || 'Sathvam Natural Products <noreply@sathvam.in>',
       replyTo: process.env.SMTP_REPLY_TO || 'sales@sathvam.in',
