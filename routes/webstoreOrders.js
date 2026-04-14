@@ -254,7 +254,7 @@ const STATUS_LABELS = {
   cancelled:  'Order Cancelled ❌',
 };
 
-async function sendStatusEmail(order, newStatus) {
+async function sendStatusEmail(order, newStatus, cancelReason) {
   const cust  = order.customer || {};
   const email = cust.email || '';
   if (!email || !process.env.SMTP_USER) return;
@@ -267,12 +267,16 @@ async function sendStatusEmail(order, newStatus) {
     ? `<p style="margin:8px 0;font-size:14px;color:#374151">🚚 <strong>Courier:</strong> ${courier} &nbsp;|&nbsp; <strong>AWB:</strong> ${awb}</p>`
     : '';
 
+  const cancelMsg = cancelReason
+    ? `Your order has been cancelled.<br><strong>Reason:</strong> ${cancelReason}<br><br>If you have paid online, your refund will be processed within 5–7 business days. For questions, contact us at sales@sathvam.in.`
+    : `Your order has been cancelled. If you have questions, please contact us at sales@sathvam.in.`;
+
   const msgMap = {
     confirmed:  `We've confirmed your order and it's being prepared for packing.`,
     packed:     `Your order is packed and will be handed to the courier shortly.`,
     dispatched: `Your order is on its way! ${courier ? `It's with ${courier}` : ''} ${awb ? `(AWB: ${awb})` : ''}.`.trim(),
     delivered:  `Your order has been delivered. We hope you love it! 🌿`,
-    cancelled:  `Your order has been cancelled. If you have questions, please contact us at sales@sathvam.in.`,
+    cancelled:  cancelMsg,
   };
 
   const html = `
@@ -309,7 +313,7 @@ async function sendStatusEmail(order, newStatus) {
   }
 }
 
-async function sendStatusWhatsApp(order, newStatus) {
+async function sendStatusWhatsApp(order, newStatus, cancelReason) {
   const phoneId = process.env.WA_PHONE_NUMBER_ID;
   const token   = process.env.WA_ACCESS_TOKEN;
   if (!phoneId || !token) return;
@@ -322,12 +326,16 @@ async function sendStatusWhatsApp(order, newStatus) {
   const courier = order.courier  || '';
   const awb     = order.awb_number || '';
 
+  const cancelText = cancelReason
+    ? `❌ *Order Cancelled*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* has been cancelled.\n📋 *Reason:* ${cancelReason}\n\nIf paid online, refund will be processed in 5–7 business days.\nQuestions? WhatsApp +91 70921 77092.`
+    : `❌ *Order Cancelled*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* has been cancelled. Questions? Email sales@sathvam.in or WhatsApp +91 70921 77092.`;
+
   const msgMap = {
     confirmed:  `✅ *Order Confirmed!*\n\nHi ${cust.name || 'there'}, your Sathvam order *${orderNo}* is confirmed and being packed.\n\nFor help: +91 70921 77092`,
     packed:     `📦 *Order Packed!*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* is packed and ready for dispatch soon.\n\nFor help: +91 70921 77092`,
     dispatched: `🚚 *Order Dispatched!*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* is on its way!${courier ? `\nCourier: ${courier}` : ''}${awb ? `\nAWB: ${awb}` : ''}\n\nFor help: +91 70921 77092`,
     delivered:  `🎉 *Order Delivered!*\n\nHi ${cust.name || 'there'}, your Sathvam order *${orderNo}* has been delivered. Enjoy the goodness! 🌿\n\nFor help: +91 70921 77092`,
-    cancelled:  `❌ *Order Cancelled*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* has been cancelled. Questions? Email sales@sathvam.in or WhatsApp +91 70921 77092.`,
+    cancelled:  cancelText,
   };
 
   const text = msgMap[newStatus];
@@ -353,7 +361,7 @@ async function sendStatusWhatsApp(order, newStatus) {
 
 // Admin: update order status + dispatch info
 async function updateOrder(req, res) {
-  const { status, notes, courier, awb_number, dispatch_date, delivered_date } = req.body;
+  const { status, notes, courier, awb_number, dispatch_date, delivered_date, cancel_reason } = req.body;
   const updates = {};
   if (status         !== undefined) updates.status         = status;
   if (notes          !== undefined) updates.notes          = notes;
@@ -361,6 +369,7 @@ async function updateOrder(req, res) {
   if (awb_number     !== undefined) updates.awb_number     = awb_number;
   if (dispatch_date  !== undefined) updates.dispatch_date  = dispatch_date;
   if (delivered_date !== undefined) updates.delivered_date = delivered_date;
+  if (cancel_reason  !== undefined) updates.cancel_reason  = cancel_reason;
   const { data, error } = await supabase
     .from('webstore_orders')
     .update(updates)
@@ -372,8 +381,8 @@ async function updateOrder(req, res) {
   // Fire-and-forget notifications when status changes
   if (status && data) {
     setImmediate(async () => {
-      await sendStatusEmail(data, status);
-      await sendStatusWhatsApp(data, status);
+      await sendStatusEmail(data, status, cancel_reason);
+      await sendStatusWhatsApp(data, status, cancel_reason);
     });
   }
 

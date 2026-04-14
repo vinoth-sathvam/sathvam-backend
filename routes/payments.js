@@ -5,6 +5,7 @@ const nodemailer   = require('nodemailer');
 const supabase     = require('../config/supabase');
 const { createInvoice, recordPayment } = require('../config/zoho');
 const { sendCustomerInvoice } = require('./webstoreOrders');
+const { auth, requireRole } = require('../middleware/auth');
 
 // ── Email transporter ─────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -128,9 +129,10 @@ router.post('/verify', async (req, res) => {
     try {
       const rzpPayment = await razorpay.payments.fetch(razorpay_payment_id);
       const paidAmount = rzpPayment.amount / 100; // paise → rupees
-      const orderTotal = parseFloat(order?.total || 0);
-      if (Math.abs(paidAmount - orderTotal) > 1) { // allow ₹1 rounding tolerance
-        console.error(`Amount mismatch: paid ₹${paidAmount}, order ₹${orderTotal}`);
+      // chargedAmount = what Razorpay actually charged (cartFinal, before loyalty discount)
+      const chargedAmount = parseFloat(order?.total || 0) + parseFloat(order?.loyalty_discount || 0);
+      if (Math.abs(paidAmount - chargedAmount) > 1) { // allow ₹1 rounding tolerance
+        console.error(`Amount mismatch: paid ₹${paidAmount}, charged ₹${chargedAmount} (order ₹${order?.total} + loyalty ₹${order?.loyalty_discount||0})`);
         return res.status(400).json({ error: 'Payment amount mismatch' });
       }
     } catch (amtErr) {
@@ -216,6 +218,156 @@ router.post('/verify', async (req, res) => {
   }
 });
 
+// Helper: actually call Razorpay and mark order refunded
+async function executeRefund(order, reason, approvedBy) {
+  const match = (order.notes || '').match(/Razorpay:\s*(pay_\S+)/);
+  if (!match) throw new Error('No Razorpay payment ID found on this order');
+  const paymentId = match[1];
+
+  const refund = await razorpay.payments.refund(paymentId, {
+    amount: Math.round(parseFloat(order.total) * 100),
+    speed:  'normal',
+    notes:  { order_no: order.order_no, reason: reason || 'Customer cancellation', approved_by: approvedBy || '' },
+  });
+
+  const orderStatus = refund.status === 'processed' ? 'refunded' : 'refund_initiated';
+  await supabase.from('webstore_orders').update({
+    status:                orderStatus,
+    refund_id:             refund.id,
+    refund_status:         refund.status,
+    refund_approval_status:'approved',
+    notes:                 (order.notes || '') + ` | Refund: ${refund.id}`,
+  }).eq('id', order.id);
+
+  console.log(`Refund initiated: ${refund.id} for order ${order.order_no} ₹${order.total} by ${approvedBy}`);
+  return { refund_id: refund.id, status: refund.status, order_status: orderStatus };
+}
+
+// POST /api/payments/refund
+// Manager → queues for approval; Admin/CEO → executes immediately
+router.post('/refund', auth, async (req, res) => {
+  try {
+    const { orderId, reason } = req.body;
+    if (!orderId) return res.status(400).json({ error: 'orderId required' });
+
+    const { data: order, error: fetchErr } = await supabase
+      .from('webstore_orders')
+      .select('id, order_no, total, status, notes, refund_id, refund_approval_status')
+      .eq('id', orderId)
+      .single();
+
+    if (fetchErr || !order) return res.status(404).json({ error: 'Order not found' });
+    if (order.refund_id)    return res.status(400).json({ error: 'Refund already initiated', refund_id: order.refund_id });
+
+    const role = req.user?.role;
+    const name = req.user?.name || req.user?.username || 'Unknown';
+
+    // Manager: queue for approval
+    if (role === 'manager' || role === 'hr') {
+      await supabase.from('webstore_orders').update({
+        status:                'refund_pending_approval',
+        refund_approval_status:'pending',
+        cancel_reason:         reason || order.cancel_reason || 'Customer cancellation',
+        notes:                 (order.notes || '') + ` | Refund requested by ${name}`,
+      }).eq('id', orderId);
+      console.log(`Refund approval requested for order ${order.order_no} by ${name}`);
+      return res.json({ success: true, pending_approval: true, order_status: 'refund_pending_approval' });
+    }
+
+    // Admin/CEO: execute immediately
+    const result = await executeRefund({ ...order, notes: (order.notes||'') }, reason, name);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    const msg = err.error?.description || err.message || (err.statusCode ? `Razorpay error ${err.statusCode}` : JSON.stringify(err));
+    console.error('Refund error:', JSON.stringify(err));
+    res.status(err.statusCode || 500).json({ error: msg });
+  }
+});
+
+// POST /api/payments/approve-refund/:orderId
+// Admin/CEO approves a manager's refund request → executes Razorpay refund
+router.post('/approve-refund/:orderId', auth, requireRole('admin', 'ceo'), async (req, res) => {
+  try {
+    const { data: order, error: fetchErr } = await supabase
+      .from('webstore_orders')
+      .select('id, order_no, total, status, notes, refund_id, cancel_reason')
+      .eq('id', req.params.orderId)
+      .single();
+
+    if (fetchErr || !order) return res.status(404).json({ error: 'Order not found' });
+    if (order.refund_id)    return res.status(400).json({ error: 'Refund already initiated' });
+    if (order.status !== 'refund_pending_approval') return res.status(400).json({ error: 'No pending refund approval for this order' });
+
+    const approvedBy = req.user?.name || req.user?.username || 'Admin';
+    const result = await executeRefund(order, order.cancel_reason, approvedBy);
+    res.json({ success: true, ...result });
+  } catch (err) {
+    const msg = err.error?.description || err.message || (err.statusCode ? `Razorpay error ${err.statusCode}` : JSON.stringify(err));
+    console.error('Approve refund error:', JSON.stringify(err));
+    res.status(err.statusCode || 500).json({ error: msg });
+  }
+});
+
+// POST /api/payments/reject-refund/:orderId
+// Admin/CEO rejects a manager's refund request → status back to cancelled
+router.post('/reject-refund/:orderId', auth, requireRole('admin', 'ceo'), async (req, res) => {
+  try {
+    const { reason } = req.body;
+    const { data: order, error: fetchErr } = await supabase
+      .from('webstore_orders')
+      .select('id, order_no, status')
+      .eq('id', req.params.orderId)
+      .single();
+
+    if (fetchErr || !order) return res.status(404).json({ error: 'Order not found' });
+    if (order.status !== 'refund_pending_approval') return res.status(400).json({ error: 'No pending refund approval for this order' });
+
+    const rejectedBy = req.user?.name || req.user?.username || 'Admin';
+    await supabase.from('webstore_orders').update({
+      status:                'cancelled',
+      refund_approval_status:'rejected',
+      notes:                 `Refund rejected by ${rejectedBy}${reason ? ': ' + reason : ''}`,
+    }).eq('id', req.params.orderId);
+
+    console.log(`Refund rejected for order ${order.order_no} by ${rejectedBy}`);
+    res.json({ success: true, order_status: 'cancelled' });
+  } catch (err) {
+    console.error('Reject refund error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/payments/refund-status/:orderId
+router.get('/refund-status/:orderId', async (req, res) => {
+  try {
+    const { data: order, error } = await supabase
+      .from('webstore_orders')
+      .select('id, order_no, refund_id, refund_status')
+      .eq('id', req.params.orderId)
+      .single();
+
+    if (error || !order) return res.status(404).json({ error: 'Order not found' });
+    if (!order.refund_id)  return res.status(400).json({ error: 'No refund initiated for this order' });
+
+    const refund = await razorpay.refunds.fetch(order.refund_id);
+
+    // Update status in DB if changed
+    if (refund.status !== order.refund_status) {
+      const orderStatus = refund.status === 'processed' ? 'refunded' : 'refund_initiated';
+      await supabase.from('webstore_orders').update({
+        refund_status: refund.status,
+        status:        orderStatus,
+      }).eq('id', order.id);
+    }
+
+    res.json({ refund_id: refund.id, status: refund.status, amount: refund.amount / 100, speed: refund.speed_processed || refund.speed_requested });
+  } catch (err) {
+    const msg = err.error?.description || err.message || (err.statusCode ? `Razorpay error ${err.statusCode}` : JSON.stringify(err));
+    console.error('Refund status error:', JSON.stringify(err));
+    res.status(err.statusCode || 500).json({ error: msg });
+  }
+});
+
 // POST /api/webhooks/razorpay
 // Razorpay webhook — backup for payment.captured events
 router.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -232,6 +384,24 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
       const payment = event.payload.payment.entity;
       console.log(`Razorpay payment captured: ${payment.id} ₹${payment.amount / 100}`);
       // Order is already saved via /verify — this is just a backup log
+    }
+
+    if (event.event === 'refund.processed') {
+      const refund = event.payload.refund.entity;
+      console.log(`Razorpay refund processed: ${refund.id} ₹${refund.amount / 100}`);
+      // Find order by refund_id and mark as refunded
+      const { data: order } = await supabase
+        .from('webstore_orders')
+        .select('id, order_no')
+        .eq('refund_id', refund.id)
+        .single();
+      if (order) {
+        await supabase.from('webstore_orders').update({
+          status:        'refunded',
+          refund_status: 'processed',
+        }).eq('id', order.id);
+        console.log(`Order ${order.order_no} marked as refunded via webhook`);
+      }
     }
 
     res.json({ received: true });
