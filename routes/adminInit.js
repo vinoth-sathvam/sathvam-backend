@@ -6,6 +6,7 @@
 const express  = require('express');
 const supabase = require('../config/supabase');
 const { auth } = require('../middleware/auth');
+const { decryptCustomer } = require('../config/crypto');
 const router   = express.Router();
 
 router.get('/', auth, async (req, res) => {
@@ -15,6 +16,7 @@ router.get('/', auth, async (req, res) => {
       'retail_settings','prod_settings','prod_packed','price_history',
       'b2b_products','competitor_prices','competitors','user_custom_perms',
       'product_tamil_names','website_enabled_products','loyalty_data',
+      'cake_sales','seed_wastage','oil_lots','flour_lots',
     ];
 
     // Fire all Supabase queries in parallel — all server-side, single round-trip for browser
@@ -80,7 +82,7 @@ router.get('/', auth, async (req, res) => {
       stockLedger:   stockLedger   || [],
       purchases:     purchases     || [],
       flourBatches:  flourBatches  || [],
-      wsOrders:      wsOrders      || [],
+      wsOrders:      (wsOrders || []).map(o => o.customer ? { ...o, customer: decryptCustomer(o.customer) } : o),
       packingInv:    packingInv    || [],
       settings,
       users:         users         || [],
