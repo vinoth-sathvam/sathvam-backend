@@ -1,12 +1,15 @@
 const express = require('express');
 const supabase = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
+const { createInvoice, recordPayment, zoho } = require('../config/zoho');
 
 const b2bCustomers = express.Router();
+const B2B_CUST_SELECT = 'id,company_name,contact_name,email,country,currency,address,delivery_address,phone,gstin,pan,gst_treatment,payment_terms,active,registered_date';
+
 b2bCustomers.get('/', auth, requireRole('admin','manager','ceo'), async (req, res) => {
   const { data, error } = await supabase
     .from('b2b_customers')
-    .select('id,company_name,contact_name,email,country,currency,address,phone,active,registered_date')
+    .select(B2B_CUST_SELECT)
     .order('company_name')
     .limit(500);
   if (error) return res.status(500).json({ error: 'Failed to load customers' });
@@ -15,22 +18,32 @@ b2bCustomers.get('/', auth, requireRole('admin','manager','ceo'), async (req, re
 b2bCustomers.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const c = req.body;
   const updates = {};
-  if (c.companyName !== undefined) updates.company_name = c.companyName;
-  if (c.contactName !== undefined) updates.contact_name = c.contactName;
-  if (c.email      !== undefined) updates.email = c.email;
-  if (c.country    !== undefined) updates.country = c.country;
-  if (c.currency   !== undefined) updates.currency = c.currency;
-  if (c.address    !== undefined) updates.address = c.address;
-  if (c.phone      !== undefined) updates.phone = c.phone;
-  if (c.active     !== undefined) updates.active = c.active;
-  const { data, error } = await supabase.from('b2b_customers').update(updates).eq('id', req.params.id).select('id,company_name,contact_name,email,country,currency,address,phone,active,registered_date').single();
+  if (c.companyName       !== undefined) updates.company_name     = c.companyName;
+  if (c.contactName       !== undefined) updates.contact_name     = c.contactName;
+  if (c.email             !== undefined) updates.email            = c.email;
+  if (c.country           !== undefined) updates.country          = c.country;
+  if (c.currency          !== undefined) updates.currency         = c.currency;
+  if (c.address           !== undefined) updates.address          = c.address;
+  if (c.deliveryAddress   !== undefined) updates.delivery_address = c.deliveryAddress;
+  if (c.phone             !== undefined) updates.phone            = c.phone;
+  if (c.gstin             !== undefined) updates.gstin            = c.gstin;
+  if (c.pan               !== undefined) updates.pan              = c.pan;
+  if (c.gstTreatment      !== undefined) updates.gst_treatment    = c.gstTreatment;
+  if (c.paymentTerms      !== undefined) updates.payment_terms    = c.paymentTerms;
+  if (c.active            !== undefined) updates.active           = c.active;
+  const { data, error } = await supabase.from('b2b_customers').update(updates).eq('id', req.params.id).select(B2B_CUST_SELECT).single();
   if (error) return res.status(400).json({ error: 'Update failed' });
   res.json(data);
 });
 b2bCustomers.post('/', auth, requireRole('admin'), async (req, res) => {
   const c = req.body;
-  // Password is null — customer sets their own via magic link on first sign-in
-  const { data, error } = await supabase.from('b2b_customers').insert({ company_name:c.companyName, contact_name:c.contactName, email:c.email, password:null, country:c.country, currency:c.currency||'INR', address:c.address, phone:c.phone }).select('id,company_name,contact_name,email,country,active').single();
+  const { data, error } = await supabase.from('b2b_customers').insert({
+    company_name: c.companyName, contact_name: c.contactName, email: c.email,
+    password: null, country: c.country, currency: c.currency||'INR',
+    address: c.address, delivery_address: c.deliveryAddress||null,
+    phone: c.phone, gstin: c.gstin||null, pan: c.pan||null,
+    gst_treatment: c.gstTreatment||null, payment_terms: c.paymentTerms||null,
+  }).select(B2B_CUST_SELECT).single();
   if (error) return res.status(400).json({ error: 'Failed to create customer' });
   res.status(201).json(data);
 });
@@ -92,6 +105,42 @@ b2bOrders.put('/:id/stage', auth, requireRole('admin','manager','ceo'), async (r
   if (error) return res.status(400).json({ error: 'Stage update failed' });
   await supabase.from('b2b_order_stages').insert({ order_id:req.params.id, stage, date:date||new Date().toISOString().slice(0,10), note:note||('Stage: '+stage), updated_by:req.user ? req.user.name : 'Admin' });
   res.json(data);
+
+  // Non-blocking: sync to Zoho Books
+  if (!process.env.ZOHO_ORG_ID) return;
+  const orderId = req.params.id;
+  if (stage === 'invoice_sent') {
+    setImmediate(async () => {
+      try {
+        const { data: order } = await supabase.from('b2b_orders').select('*, b2b_order_items(*)').eq('id', orderId).single();
+        const { data: cust } = await supabase.from('b2b_customers').select('company_name,contact_name,email,phone').eq('id', order.customer_id).single();
+        const zohoOrder = {
+          orderNo:  order.order_no,
+          date:     order.date || new Date().toISOString().slice(0, 10),
+          customer: { name: cust?.company_name || order.buyer_name || 'B2B Customer', email: cust?.email || null, phone: cust?.phone || '' },
+          items:    (order.b2b_order_items || []).map(i => ({ name: i.product_name, qty: i.qty, price: i.unit_price })),
+          shipping: 0,
+          total:    parseFloat(order.total_value) || 0,
+        };
+        await createInvoice(zohoOrder);
+      } catch (ze) {
+        console.error('Zoho B2B invoice error:', ze.message);
+      }
+    });
+  } else if (stage === 'invoice_paid') {
+    setImmediate(async () => {
+      try {
+        const { data: order } = await supabase.from('b2b_orders').select('order_no,total_value').eq('id', orderId).single();
+        const result = await zoho('get', '/invoices', null, { reference_number: order.order_no, status: 'sent' });
+        const invoice = result?.invoices?.[0];
+        if (invoice) {
+          await recordPayment(invoice, order.total_value, 'bank', order.order_no);
+        }
+      } catch (ze) {
+        console.error('Zoho B2B payment error:', ze.message);
+      }
+    });
+  }
 });
 b2bOrders.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const o = req.body;

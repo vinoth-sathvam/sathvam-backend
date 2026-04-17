@@ -47,8 +47,10 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
 // ── PUT update material ────────────────────────────────────────────────────────
 router.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const u = { updated_at: new Date().toISOString() };
-  const fields = ['name','category','product_name','size','cover_size','spec','unit','current_stock','min_stock','reorder_qty','unit_price','avg_cost','supplier','notes','active'];
+  const fields = ['name','category','product_name','size','cover_size','unit','current_stock','min_stock','reorder_qty','unit_price','avg_cost','supplier','notes','active','pkg_type_key'];
   fields.forEach(f => { if (req.body[f] != null) u[f] = req.body[f]; });
+  // 'spec' is a frontend alias for 'size' — map it
+  if (req.body.spec != null) u.size = req.body.spec;
   if (u.current_stock != null) u.current_stock = parseInt(u.current_stock);
   if (u.min_stock     != null) u.min_stock     = parseInt(u.min_stock);
   if (u.reorder_qty   != null) u.reorder_qty   = parseInt(u.reorder_qty);
@@ -56,6 +58,28 @@ router.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const { data, error } = await supabase.from('packing_materials').update(u).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
+});
+
+// ── DELETE single material ─────────────────────────────────────────────────────
+router.delete('/:id', auth, requireRole('admin','manager'), async (req, res) => {
+  const { error } = await supabase
+    .from('packing_materials')
+    .update({ active: false, updated_at: new Date().toISOString() })
+    .eq('id', req.params.id);
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// ── POST bulk-delete ───────────────────────────────────────────────────────────
+router.post('/bulk-delete', auth, requireRole('admin','manager'), async (req, res) => {
+  const { ids } = req.body;
+  if (!Array.isArray(ids) || ids.length === 0) return res.status(400).json({ error: 'ids array required' });
+  const { error } = await supabase
+    .from('packing_materials')
+    .update({ active: false, updated_at: new Date().toISOString() })
+    .in('id', ids);
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ success: true, deleted: ids.length });
 });
 
 // ── POST audit — log stock count ──────────────────────────────────────────────

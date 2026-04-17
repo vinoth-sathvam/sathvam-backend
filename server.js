@@ -124,6 +124,7 @@ app.use('/api/blog',              require('./routes/blog'));
 app.use('/api/notifications',     require('./routes/notifications'));
 app.use('/api/whatsapp',          require('./routes/whatsapp'));      // WhatsApp Business API
 app.use('/api/competitor-prices', require('./routes/competitorPrices'));
+app.use('/api/security',         require('./routes/security'));
 
 // ── Weekly report manual trigger ──────────────────────────────────────────────
 const { startScheduler, buildWeeklyReport } = require('./config/scheduler');

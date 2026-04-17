@@ -28,6 +28,7 @@
     "node-cron": "^4.2.1",
     "node-gtts": "^2.0.2",
     "nodemailer": "^8.0.4",
+    "pg": "^8.20.0",
     "qrcode": "^1.5.4",
     "razorpay": "^2.9.6",
     "speakeasy": "^2.0.0",

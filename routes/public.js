@@ -3,6 +3,9 @@ const supabase   = require('../config/supabase');
 const nodemailer = require('nodemailer');
 const router     = express.Router();
 
+// Shared slug helper — keeps product URLs consistent with frontend toSlug()
+const toSlug = (name) => (name || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
   port: parseInt(process.env.SMTP_PORT || '587'),
@@ -281,6 +284,26 @@ router.get('/content', async (req, res) => {
     res.json({ content: { ...defaults, ...(data?.value || {}) } });
   } catch {
     res.json({ content: {} });
+  }
+});
+
+// ── Store feature flags (public — used by customer store to show/hide sections) ──
+router.get('/store-features', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  const defaults = {
+    giftHampers: true, recipeSection: true, transformationStories: true,
+    healthQuiz: true, subscribeAndSave: true, labReportLink: true, loyaltyTiers: true,
+    batchFreshness: true, farmTimeline: true, nutritionTable: true, whyColdPressed: true,
+    spinWheel: true, oilCalculator: true, cookingChallenge: true, communityRecipes: true,
+    festivalGuide: true, seasonalRec: true, oilPulling: true, backInStock: true,
+    corpGifting: true, bundleBuilder: true, reorderReminder: true, reviewFeed: true,
+    familiesCounter: true, expertQuotes: true,
+  };
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'store_features').single();
+    res.json({ ...(data?.value || defaults) });
+  } catch {
+    res.json(defaults);
   }
 });
 
@@ -671,7 +694,7 @@ router.get('/sitemap.xml', async (req, res) => {
     ].map(u => `  <url><loc>${u.loc}</loc><lastmod>${today}</lastmod><changefreq>${u.changefreq}</changefreq><priority>${u.priority}</priority></url>`).join('\n');
 
     const productUrls = (products || []).map(p =>
-      `  <url><loc>https://www.sathvam.in/product/${p.id}</loc><lastmod>${today}</lastmod><changefreq>weekly</changefreq><priority>0.85</priority></url>`
+      `  <url><loc>https://www.sathvam.in/product/${toSlug(p.name)}</loc><lastmod>${today}</lastmod><changefreq>weekly</changefreq><priority>0.85</priority></url>`
     ).join('\n');
 
     const blogUrls = (posts || []).map(p => {
@@ -717,7 +740,7 @@ router.get('/shopping-feed', async (req, res) => {
       <g:id>${p.id}</g:id>
       <g:title>${name}${packInfo}</g:title>
       <g:description>${desc.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}</g:description>
-      <g:link>https://www.sathvam.in/?product=${p.id}</g:link>
+      <g:link>https://www.sathvam.in/product/${toSlug(p.name)}</g:link>
       <g:image_link>${imgUrl}</g:image_link>
       <g:condition>new</g:condition>
       <g:availability>in stock</g:availability>
@@ -898,6 +921,92 @@ router.post('/cart-reminder', async (req, res) => {
       html,
     });
   } catch (e) { console.error('guest cart-reminder email:', e.message); }
+});
+
+// GET /api/public/batch-freshness — latest batch per oil type
+router.get('/batch-freshness', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { data } = await supabase.from('batches').select('id,date,oil_type').order('date', { ascending: false }).limit(40);
+    const latest = {};
+    for (const b of (data || [])) {
+      if (!latest[b.oil_type]) latest[b.oil_type] = b;
+    }
+    res.json({ batches: latest });
+  } catch { res.json({ batches: {} }); }
+});
+
+// GET /api/public/order-count — total paid orders (for families counter)
+router.get('/order-count', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { count } = await supabase.from('webstore_orders').select('id', { count: 'exact', head: true }).eq('payment_status', 'paid');
+    res.json({ count: count || 0 });
+  } catch { res.json({ count: 0 }); }
+});
+
+// GET /api/public/community-recipes — community submitted recipes
+router.get('/community-recipes', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'community_recipes').maybeSingle();
+    res.json({ recipes: data?.value || [] });
+  } catch { res.json({ recipes: [] }); }
+});
+
+// POST /api/public/community-recipes — submit a recipe
+router.post('/community-recipes', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { name, dish, oil, steps } = req.body;
+    if (!name || !dish || !steps) return res.status(400).json({ error: 'Missing fields' });
+    const { data: existing } = await supabase.from('settings').select('value').eq('key', 'community_recipes').maybeSingle();
+    const recipes = existing?.value || [];
+    recipes.unshift({ id: Date.now(), name: String(name).slice(0,60), dish: String(dish).slice(0,80), oil: String(oil||'Sesame Oil').slice(0,40), steps: String(steps).slice(0,600), votes: 0, date: new Date().toISOString().slice(0,10) });
+    await supabase.from('settings').upsert({ key: 'community_recipes', value: recipes.slice(0,50), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    res.json({ ok: true });
+  } catch { res.status(500).json({ error: 'Failed to save' }); }
+});
+
+// POST /api/public/community-recipes/vote
+router.post('/community-recipes/vote', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { id } = req.body;
+    const { data: existing } = await supabase.from('settings').select('value').eq('key', 'community_recipes').maybeSingle();
+    const recipes = (existing?.value || []).map(r => r.id === id ? { ...r, votes: (r.votes || 0) + 1 } : r);
+    await supabase.from('settings').upsert({ key: 'community_recipes', value: recipes, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    res.json({ ok: true });
+  } catch { res.json({ ok: false }); }
+});
+
+// POST /api/public/corporate-inquiry — corporate gifting inquiry
+router.post('/corporate-inquiry', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { company, contact, email, phone, qty, occasion, notes } = req.body;
+    await mailer.sendMail({
+      from: process.env.SMTP_FROM, to: process.env.SMTP_USER,
+      subject: `🏢 Corporate Gifting Inquiry — ${company || 'Unknown'}`,
+      html: `<h3>Corporate Gifting Inquiry</h3><table border="1" cellpadding="8"><tr><td>Company</td><td>${company}</td></tr><tr><td>Contact</td><td>${contact}</td></tr><tr><td>Email</td><td>${email}</td></tr><tr><td>Phone</td><td>${phone}</td></tr><tr><td>Quantity</td><td>${qty}</td></tr><tr><td>Occasion</td><td>${occasion}</td></tr><tr><td>Notes</td><td>${notes}</td></tr></table>`,
+    });
+    res.json({ ok: true });
+  } catch { res.json({ ok: true }); }
+});
+
+// POST /api/public/back-in-stock — email notification request
+router.post('/back-in-stock', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  try {
+    const { email, productName } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    await mailer.sendMail({
+      from: process.env.SMTP_FROM, to: process.env.SMTP_USER,
+      subject: `📦 Back-in-Stock Alert — ${productName}`,
+      html: `<p><strong>${email}</strong> wants to be notified when <strong>${productName}</strong> is back in stock.</p>`,
+    });
+    res.json({ ok: true });
+  } catch { res.json({ ok: true }); }
 });
 
 // GET /api/public/store-config — lightweight config for the webstore (no auth needed)

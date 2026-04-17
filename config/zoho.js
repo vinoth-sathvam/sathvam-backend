@@ -94,7 +94,7 @@ async function createInvoice(order) {
 
 // Record payment against an invoice in Zoho Books
 async function recordPayment(invoice, amount, paymentMethod, referenceNo) {
-  const methodMap = { upi: 'Cash', card: 'CreditCard', online: 'Cash' };
+  const methodMap = { upi: 'Cash', card: 'CreditCard', online: 'Cash', cash: 'Cash', bank: 'BankTransfer', neft: 'BankTransfer', rtgs: 'BankTransfer', cheque: 'Cheque' };
   const payload = {
     customer_id:      invoice.customer_id,
     payment_mode:     methodMap[paymentMethod] || 'Cash',

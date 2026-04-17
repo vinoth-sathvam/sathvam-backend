@@ -37,11 +37,12 @@ async function zohoGet(path, params = {}) {
 // GET /api/zoho-customers/local — list all customers from Supabase DB
 router.get('/local', auth, async (req, res) => {
   const supabase = require('../config/supabase');
+  const { decryptCustomer } = require('../config/crypto');
   const { data, error } = await supabase.from('customers')
     .select('id,name,email,phone,city,state,created_at')
     .order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+  res.json((data || []).map(c => decryptCustomer(c)));
 });
 
 // GET /api/zoho-customers — fetch all customers from Zoho Books (paginated)

@@ -259,11 +259,15 @@ router.get('/', auth, async (req, res) => {
 
 // ── Status-change notification helpers ───────────────────────────────────────
 const STATUS_LABELS = {
-  confirmed:  'Order Confirmed ✅',
-  packed:     'Order Packed 📦',
-  dispatched: 'Order Dispatched 🚚',
-  delivered:  'Order Delivered 🎉',
-  cancelled:  'Order Cancelled ❌',
+  confirmed:        'Order Confirmed ✅',
+  packed:           'Order Packed 📦',
+  dispatched:       'Order Dispatched 🚚',
+  delivered:        'Order Delivered 🎉',
+  cancelled:        'Order Cancelled ❌',
+  rejected:         'Order Rejected ❌',
+  refund_initiated: 'Refund Initiated 💸',
+  refunded:         'Refund Completed ✅',
+  partial_refund:   'Partial Refund Initiated 💸',
 };
 
 async function sendStatusEmail(order, newStatus, cancelReason) {
@@ -284,11 +288,15 @@ async function sendStatusEmail(order, newStatus, cancelReason) {
     : `Your order has been cancelled. If you have questions, please contact us at sales@sathvam.in.`;
 
   const msgMap = {
-    confirmed:  `We've confirmed your order and it's being prepared for packing.`,
-    packed:     `Your order is packed and will be handed to the courier shortly.`,
-    dispatched: `Your order is on its way! ${courier ? `It's with ${courier}` : ''} ${awb ? `(AWB: ${awb})` : ''}.`.trim(),
-    delivered:  `Your order has been delivered. We hope you love it! 🌿`,
-    cancelled:  cancelMsg,
+    confirmed:        `We've confirmed your order and it's being prepared for packing.`,
+    packed:           `Your order is packed and will be handed to the courier shortly.`,
+    dispatched:       `Your order is on its way! ${courier ? `It's with ${courier}` : ''} ${awb ? `(AWB: ${awb})` : ''}.`.trim(),
+    delivered:        `Your order has been delivered. We hope you love it! 🌿`,
+    cancelled:        cancelMsg,
+    rejected:         `We're sorry, your order could not be processed.${cancelReason ? `<br><strong>Reason:</strong> ${cancelReason}` : ''} If you have paid online, your refund will be processed within 5–7 business days. For questions, contact us at sales@sathvam.in.`,
+    refund_initiated: `Your refund of <strong>₹${order.total || ''}</strong> has been initiated and will reach your account within 5–7 business days.`,
+    refunded:         `Your refund of <strong>₹${order.total || ''}</strong> has been completed successfully. The amount should reflect in your account.`,
+    partial_refund:   `A partial refund for your order has been initiated and will reach your account within 5–7 business days. The remaining items will continue to be processed.`,
   };
 
   const html = `
@@ -343,11 +351,15 @@ async function sendStatusWhatsApp(order, newStatus, cancelReason) {
     : `❌ *Order Cancelled*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* has been cancelled. Questions? Email sales@sathvam.in or WhatsApp +91 70921 77092.`;
 
   const msgMap = {
-    confirmed:  `✅ *Order Confirmed!*\n\nHi ${cust.name || 'there'}, your Sathvam order *${orderNo}* is confirmed and being packed.\n\nFor help: +91 70921 77092`,
-    packed:     `📦 *Order Packed!*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* is packed and ready for dispatch soon.\n\nFor help: +91 70921 77092`,
-    dispatched: `🚚 *Order Dispatched!*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* is on its way!${courier ? `\nCourier: ${courier}` : ''}${awb ? `\nAWB: ${awb}` : ''}\n\nFor help: +91 70921 77092`,
-    delivered:  `🎉 *Order Delivered!*\n\nHi ${cust.name || 'there'}, your Sathvam order *${orderNo}* has been delivered. Enjoy the goodness! 🌿\n\nFor help: +91 70921 77092`,
-    cancelled:  cancelText,
+    confirmed:        `✅ *Order Confirmed!*\n\nHi ${cust.name || 'there'}, your Sathvam order *${orderNo}* is confirmed and being packed.\n\nFor help: +91 70921 77092`,
+    packed:           `📦 *Order Packed!*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* is packed and ready for dispatch soon.\n\nFor help: +91 70921 77092`,
+    dispatched:       `🚚 *Order Dispatched!*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* is on its way!${courier ? `\nCourier: ${courier}` : ''}${awb ? `\nAWB: ${awb}` : ''}\n\nFor help: +91 70921 77092`,
+    delivered:        `🎉 *Order Delivered!*\n\nHi ${cust.name || 'there'}, your Sathvam order *${orderNo}* has been delivered. Enjoy the goodness! 🌿\n\nFor help: +91 70921 77092`,
+    cancelled:        cancelText,
+    rejected:         `❌ *Order Rejected*\n\nHi ${cust.name || 'there'}, we're sorry your order *${orderNo}* could not be processed.${cancelReason ? `\n📋 *Reason:* ${cancelReason}` : ''}\n\nIf paid online, refund will be processed in 5–7 business days.\nQuestions? WhatsApp +91 70921 77092.`,
+    refund_initiated: `💸 *Refund Initiated*\n\nHi ${cust.name || 'there'}, your refund for order *${orderNo}* has been initiated.\n\nThe amount will reach your account within 5–7 business days.\nQuestions? WhatsApp +91 70921 77092.`,
+    refunded:         `✅ *Refund Completed*\n\nHi ${cust.name || 'there'}, your refund for order *${orderNo}* has been completed successfully. The amount should reflect in your account.\nQuestions? WhatsApp +91 70921 77092.`,
+    partial_refund:   `💸 *Partial Refund Initiated*\n\nHi ${cust.name || 'there'}, a partial refund for order *${orderNo}* has been initiated. The refund will reach your account within 5–7 business days.\nQuestions? WhatsApp +91 70921 77092.`,
   };
 
   const text = msgMap[newStatus];
@@ -444,6 +456,69 @@ router.get('/status', async (req, res) => {
   if (!orderPhone.endsWith(inputPhone.slice(-10)) && !inputPhone.endsWith(orderPhone.slice(-10)))
     return res.status(403).json({ error: 'Phone number does not match' });
   res.json({ id: data.id, order_no: data.order_no, status: data.status, delivered_date: data.delivered_date, items: data.items });
+});
+
+// ── BotSailor webhook — order status lookup for WhatsApp bot ─────────────────
+// BotSailor calls this when customer types "track order" or "where is my order"
+// Configure in BotSailor: API Integration → POST https://api.sathvam.in/api/webstore-orders/botsailor/track
+// Expected body from BotSailor: { phone, order_no } OR { phone } to get latest order
+router.post('/botsailor/track', async (req, res) => {
+  try {
+    const secret = process.env.BOTSAILOR_WEBHOOK_SECRET;
+    if (secret && req.headers['x-botsailor-secret'] !== secret)
+      return res.status(401).json({ error: 'Unauthorized' });
+
+    const rawPhone = (req.body.phone || req.body.customer_phone || '').replace(/\D/g, '');
+    const orderNo  = (req.body.order_no || req.body.orderNo || '').trim().toUpperCase();
+    if (!rawPhone) return res.status(400).json({ message: 'Please share your phone number to look up your order.' });
+
+    // Build query — by order number or by phone (latest order)
+    let query = supabase.from('webstore_orders').select('order_no,status,courier,awb_number,items,customer,date,dispatch_date,delivered_date');
+    if (orderNo) {
+      query = query.ilike('order_no', orderNo);
+    } else {
+      query = query.order('created_at', { ascending: false }).limit(10);
+    }
+    const { data: orders, error } = await query;
+    if (error || !orders?.length) return res.json({ message: `No orders found. Please check your order number or contact us at +91 70921 77092.` });
+
+    // Find order matching phone
+    let order = null;
+    for (const o of orders) {
+      const plain = o.customer ? decryptCustomer(o.customer) : {};
+      const oPhone = (plain.phone || '').replace(/\D/g, '');
+      if (oPhone.endsWith(rawPhone.slice(-10)) || rawPhone.endsWith(oPhone.slice(-10))) {
+        order = { ...o, customer: plain };
+        break;
+      }
+    }
+    if (!order) return res.json({ message: `No order found for this phone number. Contact us at +91 70921 77092 for help.` });
+
+    const STATUS_LABELS = {
+      confirmed:  '✅ Confirmed — being packed',
+      packed:     '📦 Packed — ready to dispatch',
+      dispatched: '🚚 Dispatched — on the way',
+      delivered:  '🎉 Delivered',
+      cancelled:  '❌ Cancelled',
+    };
+    const statusLabel = STATUS_LABELS[order.status] || order.status;
+    const trackingInfo = order.awb_number
+      ? `\n🔍 *AWB:* ${order.awb_number}${order.courier ? ` (${order.courier})` : ''}`
+      : '';
+    const deliveredOn = order.delivered_date ? `\n📅 Delivered on: ${order.delivered_date}` : '';
+
+    const message =
+      `📦 *Order Status — ${order.order_no}*\n\n` +
+      `📋 *Status:* ${statusLabel}${trackingInfo}${deliveredOn}\n` +
+      `📅 *Ordered:* ${order.date || ''}\n` +
+      `🛍️ *Items:* ${(order.items || []).map(i => `${i.name} ×${i.qty}`).join(', ')}\n\n` +
+      `Questions? Call *+91 70921 77092*`;
+
+    res.json({ message, order_no: order.order_no, status: order.status });
+  } catch (e) {
+    console.error('BotSailor track error:', e.message);
+    res.json({ message: 'Sorry, could not fetch order status. Please contact us at +91 70921 77092.' });
+  }
 });
 
 // ── Product Reviews ──────────────────────────────────────────────────────────
@@ -543,18 +618,19 @@ router.patch('/reviews/:id', auth, async (req, res) => {
 router.get('/crm', auth, async (req, res) => {
   try {
     const { data: orders, error } = await supabase.from('webstore_orders')
-      .select('customer_name,customer_phone,customer_email,total_amount,status,created_at')
+      .select('customer,total,status,created_at')
       .order('created_at', { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
     const customers = {};
     for (const o of orders || []) {
-      const key = o.customer_phone || o.customer_email || o.customer_name;
+      const cust = o.customer ? decryptCustomer(o.customer) : {};
+      const key = (cust.phone || '').replace(/\D/g, '') || cust.email || cust.name;
       if (!key) continue;
       if (!customers[key]) {
-        customers[key] = { name: o.customer_name, phone: o.customer_phone, email: o.customer_email, orders: 0, total_spent: 0, first_order: o.created_at, last_order: o.created_at };
+        customers[key] = { name: cust.name, phone: cust.phone, email: cust.email, city: cust.city, state: cust.state, orders: 0, total_spent: 0, first_order: o.created_at, last_order: o.created_at };
       }
       customers[key].orders++;
-      if (o.status !== 'cancelled') customers[key].total_spent += (o.total_amount || 0);
+      if (o.status !== 'cancelled') customers[key].total_spent += parseFloat(o.total || 0);
       if (o.created_at > customers[key].last_order) customers[key].last_order = o.created_at;
       if (o.created_at < customers[key].first_order) customers[key].first_order = o.created_at;
     }

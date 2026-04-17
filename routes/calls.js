@@ -8,8 +8,8 @@ const { auth } = require('../middleware/auth');
 //   call_sig_<userId>  — WebRTC signal queue for a user (offer/answer/ICE/ring/reject/hangup)
 //   call_hb_<userId>   — heartbeat/presence record
 
-const SIG_TTL  = 60 * 1000;  // signals expire after 60s
-const HB_TTL   = 120 * 1000; // user shown "online" for 120s after last heartbeat
+const SIG_TTL  = 180 * 1000; // signals expire after 3 min (background tab throttling)
+const HB_TTL   = 180 * 1000; // user shown "online" for 3 min after last heartbeat
 
 // ── POST /api/calls/signal — push a WebRTC signal into another user's queue ──
 router.post('/signal', auth, async (req, res) => {

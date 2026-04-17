@@ -5,6 +5,7 @@ const path = require('path');
 const nodemailer = require('nodemailer');
 const supabase = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
+const { createInvoice, recordPayment } = require('../config/zoho');
 
 const ENV_PATH = path.join(__dirname, '../.env');
 
@@ -92,10 +93,133 @@ products.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
     featured:p.featured,
     image_url:p.imageUrl!==undefined?p.imageUrl:undefined,
     description:p.description!==undefined?p.description:undefined,
-    hsn_code:p.hsnCode!==undefined?p.hsnCode:undefined
+    hsn_code:p.hsnCode!==undefined?p.hsnCode:undefined,
+    offer_label:p.offer_label!==undefined?p.offer_label:undefined,
+    offer_price:p.offer_price!==undefined?p.offer_price:undefined,
+    offer_ends_at:p.offer_ends_at!==undefined?p.offer_ends_at:undefined,
   }).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
+});
+
+// POST /api/products/offer-notify — save offer fields + blast email & WhatsApp to all customers
+products.post('/offer-notify', auth, requireRole('admin','manager'), async (req, res) => {
+  const { product_id, product_name, offer_label, offer_price, original_price, offer_ends_at } = req.body;
+  if (!product_id || !offer_label) return res.status(400).json({ error: 'product_id and offer_label required' });
+
+  // 1. Fetch all registered customers (email + phone)
+  const { data: customers, error: custErr } = await supabase
+    .from('customers')
+    .select('name, email, phone')
+    .not('email', 'is', null);
+  if (custErr) return res.status(500).json({ error: custErr.message });
+
+  // 2. Also fetch newsletter subscribers (store_analytics key)
+  const { data: nlRow } = await supabase
+    .from('store_analytics')
+    .select('data')
+    .eq('key', 'newsletter_subscribers')
+    .maybeSingle();
+  const newsletterEmails = (nlRow?.data || []).map(s => s.email).filter(Boolean);
+
+  // Merge all unique emails
+  const customerMap = {};
+  for (const c of customers) {
+    if (c.email) customerMap[c.email.toLowerCase()] = { name: c.name || 'Valued Customer', phone: c.phone };
+  }
+  for (const email of newsletterEmails) {
+    if (!customerMap[email]) customerMap[email] = { name: 'Valued Customer', phone: null };
+  }
+  const allRecipients = Object.entries(customerMap).map(([email, d]) => ({ email, ...d }));
+
+  // 3. Build email HTML
+  const savingsLine = offer_price && original_price
+    ? `<p style="font-size:14px;color:#666;">Regular price: <s>₹${original_price}</s> &nbsp; <strong style="color:#e53e3e;">Now: ₹${offer_price}</strong></p>`
+    : '';
+  const expiryLine = offer_ends_at
+    ? `<p style="font-size:13px;color:#888;">⏰ Offer valid until: ${new Date(offer_ends_at).toLocaleDateString('en-IN', {day:'numeric',month:'long',year:'numeric'})}</p>`
+    : '';
+  const emailHtml = `
+<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#f7f3ef;font-family:Georgia,serif;">
+  <div style="max-width:560px;margin:32px auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.08);">
+    <div style="background:linear-gradient(135deg,#7b4f28,#c8813a);padding:28px 32px;text-align:center;">
+      <h1 style="color:#fff;margin:0;font-size:22px;letter-spacing:1px;">🏷️ Special Offer from Sathvam</h1>
+    </div>
+    <div style="padding:32px;">
+      <p style="font-size:15px;color:#444;margin-top:0;">Dear {{NAME}},</p>
+      <p style="font-size:15px;color:#444;">We have an exclusive offer just for you!</p>
+      <div style="background:#fff8f0;border-left:4px solid #c8813a;padding:16px 20px;border-radius:0 8px 8px 0;margin:20px 0;">
+        <p style="margin:0 0 6px;font-size:18px;font-weight:bold;color:#7b4f28;">🛍️ ${product_name}</p>
+        <p style="margin:0 0 6px;font-size:20px;font-weight:bold;color:#c8813a;">🏷️ ${offer_label}</p>
+        ${savingsLine}
+        ${expiryLine}
+      </div>
+      <div style="text-align:center;margin:28px 0;">
+        <a href="https://sathvam.in" style="background:#c8813a;color:#fff;padding:13px 32px;border-radius:8px;text-decoration:none;font-size:15px;font-weight:bold;display:inline-block;">Shop Now →</a>
+      </div>
+      <p style="font-size:13px;color:#999;text-align:center;border-top:1px solid #f0e8df;padding-top:16px;margin-bottom:0;">
+        Sathvam Natural Products · sathvam.in<br>
+        <a href="https://sathvam.in" style="color:#c8813a;text-decoration:none;">Unsubscribe</a>
+      </p>
+    </div>
+  </div>
+</body>
+</html>`;
+
+  // 4. Send emails in parallel batches of 10
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: parseInt(process.env.SMTP_PORT || '587'),
+    secure: false,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+  });
+
+  let emailSent = 0;
+  const BATCH = 10;
+  for (let i = 0; i < allRecipients.length; i += BATCH) {
+    const batch = allRecipients.slice(i, i + BATCH);
+    await Promise.allSettled(batch.map(r =>
+      transporter.sendMail({
+        from: process.env.SMTP_FROM || `Sathvam <${process.env.SMTP_USER}>`,
+        to: r.email,
+        subject: `🏷️ ${offer_label} — ${product_name} | Sathvam Natural Products`,
+        html: emailHtml.replace('{{NAME}}', r.name),
+      }).then(() => emailSent++)
+        .catch(e => console.error(`Offer email failed for ${r.email}:`, e.message))
+    ));
+  }
+
+  // 5. Send WhatsApp to customers with phone numbers using template (if configured)
+  const WA_PHONE_ID = process.env.WA_PHONE_NUMBER_ID;
+  const WA_TOKEN    = process.env.WA_ACCESS_TOKEN;
+  const WA_TEMPLATE = process.env.WA_OFFER_TEMPLATE;
+  let waSent = 0;
+
+  if (WA_PHONE_ID && WA_TOKEN && WA_TEMPLATE) {
+    const withPhone = allRecipients.filter(r => r.phone && r.phone.replace(/\D/g,'').length >= 10);
+    for (const r of withPhone) {
+      const to = r.phone.replace(/\D/g,'');
+      try {
+        await fetch(`https://graph.facebook.com/v19.0/${WA_PHONE_ID}/messages`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${WA_TOKEN}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messaging_product: 'whatsapp',
+            to,
+            type: 'template',
+            template: { name: WA_TEMPLATE, language: { code: 'en' } },
+          }),
+        });
+        waSent++;
+      } catch (e) {
+        console.error(`WA offer notify failed for ${to}:`, e.message);
+      }
+    }
+  }
+
+  res.json({ sent: emailSent, wa_sent: waSent, total_recipients: allRecipients.length });
 });
 products.delete('/:id', auth, requireRole('admin'), async (req, res) => {
   await supabase.from('products').update({ active: false }).eq('id', req.params.id);
@@ -307,18 +431,18 @@ vendors.get('/performance', auth, async (req, res) => {
 const sales = express.Router();
 
 // GET /api/sales/next-invoice-no — returns next sequential invoice number for today
-// Format: SA{MMM}{DD}-{N}  e.g. SAAPR08-3
+// Format: SA{YYYY}{MMM}{DD}-{NN}  e.g. SA2026APR17-01
 sales.get('/next-invoice-no', auth, async (req, res) => {
   const today = new Date().toISOString().slice(0, 10);
   const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
   const d = new Date();
-  const prefix = `SA${months[d.getMonth()]}${String(d.getDate()).padStart(2,'0')}`;
+  const prefix = `SA${d.getFullYear()}${months[d.getMonth()]}${String(d.getDate()).padStart(2,'0')}`;
   const [s, w] = await Promise.all([
     supabase.from('sales').select('id', { count: 'exact', head: true }).eq('date', today),
     supabase.from('webstore_orders').select('id', { count: 'exact', head: true }).eq('date', today),
   ]);
   const seq = (s.count || 0) + (w.count || 0) + 1;
-  res.json({ formatted: `${prefix}-${seq}`, prefix, seq });
+  res.json({ formatted: `${prefix}-${String(seq).padStart(2,'0')}`, prefix, seq });
 });
 
 sales.get('/', auth, async (req, res) => {
@@ -342,6 +466,51 @@ sales.post('/', auth, async (req, res) => {
       qty:i.qty, rate:i.rate, total:i.total, unit:i.unit||'pcs'
     })));
   }
+  // Non-blocking: Zoho Books + finished goods deduction
+  setImmediate(async () => {
+    if (process.env.ZOHO_ORG_ID) {
+      try {
+        const zohoOrder = {
+          orderNo:  s.orderNo,
+          date:     s.date || new Date().toISOString().slice(0, 10),
+          customer: { name: s.customerName || 'Walk-in Customer', email: null, phone: s.customerPhone || '' },
+          items:    (s.items || []).map(i => ({ name: i.productName, qty: i.qty, price: i.rate })),
+          shipping: 0,
+          total:    parseFloat(s.finalAmount) || 0,
+        };
+        const invoice = await createInvoice(zohoOrder);
+        if (invoice?.invoice_id && parseFloat(s.amountPaid) > 0) {
+          await recordPayment(invoice, s.amountPaid, s.paymentMethod || 'cash', s.orderNo);
+        }
+      } catch (ze) {
+        console.error('Zoho POS invoice error:', ze.message);
+      }
+    }
+
+    // Auto-deduct from finished goods
+    try {
+      const fgItems = (s.items || []).filter(i => parseFloat(i.qty) > 0);
+      if (fgItems.length) {
+        await supabase.from('finished_goods').insert(
+          fgItems.map(i => ({
+            product_name: i.productName || '',
+            category:     'other',
+            unit:         i.unit || 'pcs',
+            qty:          parseFloat(i.qty),
+            type:         'out',
+            date:         s.date || new Date().toISOString().slice(0, 10),
+            notes:        `Auto: POS sale ${s.orderNo}`,
+            batch_ref:    s.orderNo || '',
+            created_by:   'system',
+            created_at:   new Date().toISOString(),
+            updated_at:   new Date().toISOString(),
+          }))
+        );
+      }
+    } catch (fgErr) {
+      console.error('Finished goods POS deduction error:', fgErr.message);
+    }
+  });
   res.status(201).json(sale);
 });
 sales.put('/:id', auth, async (req, res) => {
@@ -422,9 +591,8 @@ settings.post('/smtp-config/test', auth, requireRole('admin'), async (req, res) 
 
 // Wildcard key-value routes — must come AFTER specific named routes above
 settings.get('/:key', auth, async (req, res) => {
-  const { data, error } = await supabase.from('settings').select('value').eq('key', req.params.key).single();
-  if (error) return res.status(404).json({ error: 'Not found' });
-  res.json(data.value);
+  const { data } = await supabase.from('settings').select('value').eq('key', req.params.key).maybeSingle();
+  res.json(data?.value ?? null);
 });
 settings.put('/:key', auth, requireRole('admin','manager'), async (req, res) => {
   const { data, error } = await supabase.from('settings').upsert({ key:req.params.key, value:req.body, updated_at:new Date() }).select().single();

@@ -432,4 +432,21 @@ router.post('/cart-reminder', custAuth, async (req, res) => {
 const { router: twoFARouter } = make2FA(supabase, 'customers', custAuth, null);
 router.use('/2fa', twoFARouter);
 
+// GET /api/customer/admin/list — admin: list all registered customers
+const { auth } = require('../middleware/auth');
+router.get('/admin/list', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('customers')
+      .select('id, name, email, phone, city, state, pincode, created_at, totp_enabled')
+      .order('created_at', { ascending: false });
+    if (error) throw error;
+    const decrypted = (data || []).map(c => decryptCustomer(c));
+    res.json(decrypted);
+  } catch (err) {
+    console.error('admin/list customers:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;

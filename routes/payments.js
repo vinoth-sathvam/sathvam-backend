@@ -16,6 +16,20 @@ const transporter = nodemailer.createTransport({
   auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
 });
 
+// ── Sequential order number generator ────────────────────────────────────────
+const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+async function generateOrderNo() {
+  const today = new Date().toISOString().slice(0, 10);
+  const d = new Date();
+  const prefix = `SA${d.getFullYear()}${MONTHS[d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
+  const [s, w] = await Promise.all([
+    supabase.from('sales').select('id', { count: 'exact', head: true }).eq('date', today),
+    supabase.from('webstore_orders').select('id', { count: 'exact', head: true }).eq('date', today),
+  ]);
+  const seq = (s.count || 0) + (w.count || 0) + 1;
+  return `${prefix}-${String(seq).padStart(2, '0')}`;
+}
+
 // ── Order email alert ─────────────────────────────────────────────────────────
 async function sendOrderEmail(order, paymentId) {
   if (!process.env.SMTP_USER || !process.env.SMTP_PASS) return; // skip if not configured
@@ -83,6 +97,45 @@ async function sendWhatsAppAlert(order) {
   } catch (e) { console.error('WhatsApp alert failed:', e.message); }
 }
 
+// ── WhatsApp order confirmation to customer ───────────────────────────────────
+async function sendCustomerOrderWhatsApp(order, paymentId) {
+  const phoneId = process.env.WA_PHONE_NUMBER_ID;
+  const token   = process.env.WA_ACCESS_TOKEN;
+  if (!phoneId || !token) return;
+
+  const cust  = order.customer || {};
+  const phone = (cust.phone || '').replace(/\D/g, '');
+  if (!phone) return;
+
+  const items = (order.items || []).map(i => `  • ${i.name} × ${i.qty}`).join('\n');
+  const text  =
+    `🛒 *Order Confirmed & Payment Received!*\n\n` +
+    `Hi ${cust.name || 'there'}, thank you for shopping with *Sathvam Natural Products*! 🌿\n\n` +
+    `📋 *Order:* ${order.orderNo}\n` +
+    `💳 *Payment:* ₹${parseFloat(order.total || 0).toLocaleString('en-IN')} received\n\n` +
+    `*Items ordered:*\n${items}\n\n` +
+    `📍 *Delivering to:* ${[cust.address, cust.city, cust.state, cust.pincode].filter(Boolean).join(', ')}\n\n` +
+    `We'll send you another message when your order is dispatched.\n` +
+    `Questions? Reply here or call *+91 70921 77092*`;
+
+  try {
+    const res = await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
+      method:  'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messaging_product: 'whatsapp',
+        to:   phone,
+        type: 'text',
+        text: { body: text },
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) console.error('Customer WA confirmation error:', data?.error?.message);
+  } catch (e) {
+    console.error('Customer WA confirmation error:', e.message);
+  }
+}
+
 const router = express.Router();
 
 const razorpay = new Razorpay({
@@ -147,9 +200,10 @@ router.post('/verify', async (req, res) => {
     const encCustomer = encryptCustomer(rawCustomer);
     const custEmailHash = hmac(rawCustomer.email || '');
     const dbId = crypto.randomUUID(); // always use a proper UUID for the DB row
+    const generatedOrderNo = await generateOrderNo();
     const { error: wsErr } = await supabase.from('webstore_orders').upsert({
       id:                  dbId,
-      order_no:            o.orderNo,
+      order_no:            generatedOrderNo,
       date:                o.date || new Date().toISOString().slice(0, 10),
       customer:            encCustomer,
       customer_email_hash: custEmailHash,
@@ -163,7 +217,7 @@ router.post('/verify', async (req, res) => {
       notes:               `Razorpay: ${razorpay_payment_id}`,
     }, { onConflict: 'id' });
     if (wsErr) {
-      console.error('Webstore order save error:', wsErr.message, 'order_no:', o.orderNo, 'payment:', razorpay_payment_id);
+      console.error('Webstore order save error:', wsErr.message, 'order_no:', generatedOrderNo, 'payment:', razorpay_payment_id);
       return res.status(500).json({ error: 'Order save failed: ' + wsErr.message });
     }
 
@@ -171,7 +225,7 @@ router.post('/verify', async (req, res) => {
     const customer = o.customer || {};
     const addrNote = `${customer.address || ''}, ${customer.city || ''}, ${customer.state || ''} - ${customer.pincode || ''}`;
     const { data: sale } = await supabase.from('sales').insert({
-      order_no:       o.orderNo,
+      order_no:       generatedOrderNo,
       date:           o.date || new Date().toISOString().slice(0, 10),
       channel:        'website',
       status:         'pending',
@@ -197,14 +251,17 @@ router.post('/verify', async (req, res) => {
       })));
     }
 
-    // Non-blocking: WhatsApp alert + Zoho invoice + customer confirmation
+    // Non-blocking: WhatsApp alert + Zoho invoice + customer confirmation + finished goods
     setImmediate(async () => {
       // WhatsApp + email notifications to owner
       await sendWhatsAppAlert({ ...o, paymentId: razorpay_payment_id });
       await sendOrderEmail(o, razorpay_payment_id);
 
+      // WhatsApp confirmation to customer
+      await sendCustomerOrderWhatsApp(o, razorpay_payment_id);
+
       // Invoice/confirmation email to customer
-      await sendCustomerInvoice({ ...o, orderNo: o.orderNo }, razorpay_payment_id);
+      await sendCustomerInvoice({ ...o, orderNo: generatedOrderNo }, razorpay_payment_id);
 
       // Zoho Books invoice
       try {
@@ -215,9 +272,33 @@ router.post('/verify', async (req, res) => {
       } catch (ze) {
         console.error('Zoho invoice error:', ze.message);
       }
+
+      // Auto-deduct from finished goods
+      try {
+        const fgItems = (o.items || []).filter(i => parseFloat(i.qty) > 0);
+        if (fgItems.length) {
+          await supabase.from('finished_goods').insert(
+            fgItems.map(i => ({
+              product_name: i.name || '',
+              category:     'other',
+              unit:         'pcs',
+              qty:          parseFloat(i.qty),
+              type:         'out',
+              date:         o.date || new Date().toISOString().slice(0, 10),
+              notes:        `Auto: Webstore order ${o.orderNo}`,
+              batch_ref:    o.orderNo || '',
+              created_by:   'system',
+              created_at:   new Date().toISOString(),
+              updated_at:   new Date().toISOString(),
+            }))
+          );
+        }
+      } catch (fgErr) {
+        console.error('Finished goods webstore deduction error:', fgErr.message);
+      }
     });
 
-    res.json({ success: true, paymentId: razorpay_payment_id });
+    res.json({ success: true, paymentId: razorpay_payment_id, orderNo: generatedOrderNo });
   } catch (err) {
     console.error('Payment verify error:', err.message);
     res.status(500).json({ error: err.message });
@@ -340,6 +421,92 @@ router.post('/reject-refund/:orderId', auth, requireRole('admin', 'ceo'), async 
   } catch (err) {
     console.error('Reject refund error:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/payments/partial-refund
+// Cancel specific items and refund their amount via Razorpay
+router.post('/partial-refund', auth, async (req, res) => {
+  try {
+    const { orderId, cancelItems, reason } = req.body;
+    // cancelItems: [{ idx: 0, qty: 1 }, ...]  — index into items array, qty to cancel
+    if (!orderId || !Array.isArray(cancelItems) || cancelItems.length === 0)
+      return res.status(400).json({ error: 'orderId and cancelItems required' });
+
+    const { data: order, error: fetchErr } = await supabase
+      .from('webstore_orders')
+      .select('id, order_no, total, status, notes, items, refund_id')
+      .eq('id', orderId)
+      .single();
+
+    if (fetchErr || !order) return res.status(404).json({ error: 'Order not found' });
+    if (order.refund_id) return res.status(400).json({ error: 'Full refund already initiated on this order' });
+
+    // Get Razorpay payment ID from notes
+    const match = (order.notes || '').match(/Razorpay:\s*(pay_\S+)/);
+    if (!match) return res.status(400).json({ error: 'No Razorpay payment found on this order' });
+    const paymentId = match[1];
+
+    const items = order.items || [];
+
+    // Calculate refund amount and validate
+    let refundAmount = 0;
+    const updatedItems = items.map((item, idx) => ({ ...item }));
+
+    for (const ci of cancelItems) {
+      const item = items[ci.idx];
+      if (!item) return res.status(400).json({ error: `Item at index ${ci.idx} not found` });
+      if (item.cancelled) return res.status(400).json({ error: `Item "${item.name}" already cancelled` });
+
+      const itemQty   = parseFloat(item.qty) || 0;
+      const cancelQty = Math.min(parseFloat(ci.qty) || itemQty, itemQty);
+      const unitPrice = parseFloat(item.price || item.rate || 0);
+      const lineRefund = parseFloat((unitPrice * cancelQty).toFixed(2));
+
+      refundAmount += lineRefund;
+
+      // Mark item as cancelled in the array
+      updatedItems[ci.idx] = {
+        ...item,
+        cancelled:      cancelQty >= itemQty,
+        cancelled_qty:  cancelQty,
+        cancelled_at:   new Date().toISOString(),
+        refund_amount:  lineRefund,
+      };
+    }
+
+    if (refundAmount <= 0) return res.status(400).json({ error: 'Refund amount is zero' });
+
+    // Check we're not refunding more than the order total
+    const alreadyRefunded = items.reduce((s, it) => s + parseFloat(it.refund_amount || 0), 0);
+    if (alreadyRefunded + refundAmount > parseFloat(order.total) + 1)
+      return res.status(400).json({ error: `Refund ₹${refundAmount} exceeds remaining order value` });
+
+    // Call Razorpay partial refund
+    const refund = await razorpay.payments.refund(paymentId, {
+      amount: Math.round(refundAmount * 100), // paise
+      speed:  'normal',
+      notes:  { order_no: order.order_no, reason: reason || 'Partial cancellation', items: cancelItems.map(ci => items[ci.idx]?.name).join(', ') },
+    });
+
+    // Determine new order status
+    const allCancelled = updatedItems.every(it => it.cancelled || parseFloat(it.qty) === 0);
+    const newStatus = allCancelled ? 'refund_initiated' : 'partial_refund';
+    const byName = req.user?.name || req.user?.username || 'Admin';
+    const noteAppend = ` | PartialRefund: ${refund.id} ₹${refundAmount} (${cancelItems.map(ci => `${updatedItems[ci.idx]?.cancelled_qty}x ${items[ci.idx]?.name}`).join(', ')}) by ${byName}`;
+
+    await supabase.from('webstore_orders').update({
+      items:  updatedItems,
+      status: newStatus,
+      notes:  (order.notes || '') + noteAppend,
+    }).eq('id', orderId);
+
+    console.log(`Partial refund ${refund.id} ₹${refundAmount} for order ${order.order_no} by ${byName}`);
+    res.json({ success: true, refund_id: refund.id, refund_status: refund.status, refund_amount: refundAmount, order_status: newStatus });
+  } catch (err) {
+    const msg = err.error?.description || err.message || JSON.stringify(err);
+    console.error('Partial refund error:', JSON.stringify(err));
+    res.status(err.statusCode || 500).json({ error: msg });
   }
 });
 
