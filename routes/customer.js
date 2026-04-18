@@ -49,6 +49,36 @@ router.post('/signup', async (req, res) => {
     const plain = decryptCustomer(cust);
     const token = jwt.sign({ id: plain.id, email: normEmail, name: plain.name }, JWT_SECRET, { expiresIn: '30d' });
     res.json({ customer: plain, token });
+
+    // Fire-and-forget admin notification
+    setImmediate(async () => {
+      try {
+        const adminEmail = process.env.SMTP_USER;
+        if (!adminEmail) return;
+        const now = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
+        await mailer.sendMail({
+          from: process.env.SMTP_FROM || `Sathvam <${adminEmail}>`,
+          to: adminEmail,
+          subject: `🆕 New Customer Signup — ${plain.name}`,
+          html: `
+<div style="font-family:sans-serif;max-width:500px;margin:0 auto;background:#fff;border-radius:10px;overflow:hidden;border:1px solid #e5e7eb;">
+  <div style="background:linear-gradient(135deg,#1f2937,#374151);padding:20px 24px;">
+    <h2 style="color:#fff;margin:0;font-size:18px;">🆕 New Customer Signed Up</h2>
+    <div style="color:#9ca3af;font-size:12px;margin-top:4px;">${now}</div>
+  </div>
+  <div style="padding:24px;">
+    <table style="font-size:14px;width:100%;border-collapse:collapse;">
+      <tr><td style="padding:6px 0;color:#6b7280;width:80px;">Name</td><td style="font-weight:700;color:#111827;">${plain.name}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280;">Email</td><td style="color:#1d4ed8;">${normEmail}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280;">Phone</td><td style="color:#111827;">${plain.phone||'—'}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280;">Source</td><td style="color:#111827;">Email signup</td></tr>
+    </table>
+    <a href="https://admin.sathvam.in" style="display:inline-block;margin-top:18px;background:#1f2937;color:#fff;padding:10px 22px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:700;">View in Admin →</a>
+  </div>
+</div>`,
+        });
+      } catch (e) { console.error('New customer admin notify failed:', e.message); }
+    });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -147,6 +177,36 @@ async function oauthFindOrCreate(email, name, avatarUrl) {
     })
     .select('id,name,email,phone,address,city,state,pincode,totp_enabled,totp_secret,email_hash').single();
   if (error) throw new Error(error.message);
+
+  // Notify admin of new OAuth signup (fire-and-forget)
+  setImmediate(async () => {
+    try {
+      const adminEmail = process.env.SMTP_USER;
+      if (!adminEmail) return;
+      const now = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', dateStyle: 'medium', timeStyle: 'short' });
+      await mailer.sendMail({
+        from: process.env.SMTP_FROM || `Sathvam <${adminEmail}>`,
+        to: adminEmail,
+        subject: `🆕 New Customer Signup — ${name}`,
+        html: `
+<div style="font-family:sans-serif;max-width:500px;margin:0 auto;background:#fff;border-radius:10px;overflow:hidden;border:1px solid #e5e7eb;">
+  <div style="background:linear-gradient(135deg,#1f2937,#374151);padding:20px 24px;">
+    <h2 style="color:#fff;margin:0;font-size:18px;">🆕 New Customer Signed Up</h2>
+    <div style="color:#9ca3af;font-size:12px;margin-top:4px;">${now}</div>
+  </div>
+  <div style="padding:24px;">
+    <table style="font-size:14px;width:100%;border-collapse:collapse;">
+      <tr><td style="padding:6px 0;color:#6b7280;width:80px;">Name</td><td style="font-weight:700;color:#111827;">${name}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280;">Email</td><td style="color:#1d4ed8;">${normEmail}</td></tr>
+      <tr><td style="padding:6px 0;color:#6b7280;">Source</td><td style="color:#111827;">Google / Facebook OAuth</td></tr>
+    </table>
+    <a href="https://admin.sathvam.in" style="display:inline-block;margin-top:18px;background:#1f2937;color:#fff;padding:10px 22px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:700;">View in Admin →</a>
+  </div>
+</div>`,
+      });
+    } catch (e) { console.error('New OAuth customer admin notify failed:', e.message); }
+  });
+
   return created;
 }
 

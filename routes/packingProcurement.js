@@ -130,6 +130,18 @@ router.post('/:id/receive', auth, requireRole('admin','manager'), async (req, re
         unit_price: newAvgCost,   // keep unit_price in sync for compatibility
         updated_at: new Date().toISOString(),
       }).eq('id', ri.material_id);
+
+      // Alert if avg cost changed by more than 5%
+      if (curAvg > 0 && Math.abs(newAvgCost - curAvg) / curAvg > 0.05) {
+        const { data: mat2 } = await supabase.from('packing_materials').select('name').eq('id', ri.material_id).single();
+        console.log(`[PRICE ALERT] ${mat2?.name}: avg cost changed ${curAvg} → ${newAvgCost} (${Math.round((newAvgCost-curAvg)/curAvg*100)}%)`);
+        // Log to a price_alerts settings key for the frontend to display
+        const alertKey = 'packing_price_alerts';
+        const { data: existing } = await supabase.from('settings').select('value').eq('key', alertKey).single();
+        const alerts = (existing?.value || []).slice(0, 49);
+        alerts.unshift({ date: new Date().toISOString().slice(0,10), material: mat2?.name, old: curAvg, new: newAvgCost, pct: Math.round((newAvgCost-curAvg)/curAvg*100) });
+        await supabase.from('settings').upsert({ key: alertKey, value: alerts, updated_at: new Date().toISOString() });
+      }
     }
 
     // Update PO items with received quantities

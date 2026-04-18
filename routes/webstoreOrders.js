@@ -404,11 +404,101 @@ async function updateOrder(req, res) {
 
   const decrypted = decryptOrder(data);
 
-  // Fire-and-forget notifications when status changes (needs plaintext customer data)
+  // Fire-and-forget notifications + stock automations on status change
   if (status && decrypted) {
     setImmediate(async () => {
       await sendStatusEmail(decrypted, status, cancel_reason);
       await sendStatusWhatsApp(decrypted, status, cancel_reason);
+
+      const today   = new Date().toISOString().slice(0, 10);
+      const orderNo = decrypted.order_no || decrypted.orderNo || '';
+      const items   = decrypted.items || [];
+
+      // ── PACKED: deduct packing materials (label + cover/bottle) ───────────
+      if (status === 'packed') {
+        try {
+          const productIds = items.map(i => i.product_id).filter(Boolean);
+          if (productIds.length) {
+            const { data: prods } = await supabase
+              .from('products').select('id,name,packing_links').in('id', productIds);
+            const prodMap = {};
+            for (const p of (prods || [])) prodMap[p.id] = p;
+
+            for (const item of items) {
+              const prod  = prodMap[item.product_id];
+              const qty   = parseInt(item.qty) || 1;
+              const links = prod?.packing_links || {};
+              const matIds = [
+                ...(Array.isArray(links.materialIds) ? links.materialIds : [links.coverId, links.bottleId].filter(Boolean)),
+                links.labelId,
+              ].filter(Boolean);
+
+              for (const matId of matIds) {
+                const { data: mat } = await supabase
+                  .from('packing_materials').select('id,current_stock').eq('id', matId).single();
+                if (!mat) continue;
+                const newStock = Math.max(0, (parseFloat(mat.current_stock) || 0) - qty);
+                await supabase.from('packing_materials').update({
+                  current_stock: newStock, updated_at: new Date().toISOString(),
+                }).eq('id', matId);
+              }
+            }
+            console.log(`[AUTO] Packing materials deducted for order ${orderNo}`);
+          }
+        } catch (e) { console.error('[AUTO] Pack deduct error:', e.message); }
+      }
+
+      // ── SHIPPED: deduct finished goods ─────────────────────────────────────
+      if (status === 'shipped') {
+        try {
+          const rows = items.map(item => ({
+            product_name: item.productName || item.name || 'Unknown',
+            category:     'oil',
+            unit:         'pcs',
+            qty:          parseFloat(item.qty) || 1,
+            type:         'out',
+            date:         today,
+            notes:        `Auto-deducted on ship — Order ${orderNo}`,
+            batch_ref:    orderNo,
+            created_by:   'system',
+            created_at:   new Date().toISOString(),
+            updated_at:   new Date().toISOString(),
+          }));
+          await supabase.from('finished_goods').insert(rows);
+          console.log(`[AUTO] Finished goods deducted for order ${orderNo}`);
+        } catch (e) { console.error('[AUTO] FG deduct error:', e.message); }
+      }
+
+      // ── DELIVERED: auto-send invoice email + loyalty points ─────────────────
+      if (status === 'delivered') {
+        try { await sendCustomerInvoice(decrypted, decrypted.payment_id); } catch (e) {}
+
+        // Award loyalty points (1 pt per ₹100)
+        try {
+          const custEmail = decrypted.customer?.email;
+          if (custEmail) {
+            const { data: cust } = await supabase
+              .from('customers').select('id').eq('email', custEmail).single();
+            if (cust) {
+              const total  = parseFloat(decrypted.total) || 0;
+              const points = Math.floor(total / 100);
+              if (points > 0) {
+                const key    = `cust_loyalty_${cust.id}`;
+                const { data: setting } = await supabase
+                  .from('settings').select('value').eq('key', key).single();
+                const existing = setting?.value || { points: 0, history: [] };
+                existing.points = (existing.points || 0) + points;
+                existing.history = [
+                  { date: today, type: 'earn', pts: points, ref: orderNo, note: 'Delivery loyalty' },
+                  ...(existing.history || []),
+                ].slice(0, 50);
+                await supabase.from('settings').upsert({ key, value: existing, updated_at: new Date().toISOString() });
+                console.log(`[AUTO] Loyalty +${points} pts for ${custEmail} — ${orderNo}`);
+              }
+            }
+          }
+        } catch (e) { console.error('[AUTO] Loyalty error:', e.message); }
+      }
     });
   }
 

@@ -39,7 +39,7 @@ router.get('/products', async (req, res) => {
   if (cached) return res.json(cached);
   try {
     const [{ data: products, error }, { data: settings }] = await Promise.all([
-      supabase.from('products').select('id,name,sku,cat,unit,pack_size,pack_unit,gst,price,website_price,retail_price,featured,active,hsn_code,description,image_url').eq('active', true).order('name'),
+      supabase.from('products').select('id,name,sku,cat,unit,pack_size,pack_unit,gst,price,website_price,retail_price,featured,active,hsn_code,description,image_url,offer_label,offer_price,offer_ends_at').eq('active', true).order('name'),
       supabase.from('settings').select('value').eq('key', 'website_enabled_products').single(),
     ]);
     if (error) return res.status(500).json({ error: "Server error" });

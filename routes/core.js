@@ -22,6 +22,106 @@ function updateEnvVar(key, value) {
   process.env[key] = value;
 }
 
+// ── Packing auto-link helper ──────────────────────────────────────────────────
+const LABEL_PRICE_MAP = {
+  '5000ml':10, '1l':3.5, '500ml':2.5, '250ml':2, '200ml':1.5, '100ml':2,
+  '1kg':8, '500g':4, '250g':3, '200g':2, '150g':1.5, '160g':1.5,
+  '100g':1, '80g':1, '50g':0.5,
+};
+function normSz(s) {
+  const t = (s||'').toLowerCase().replace(/\s+/g,'').replace(/gm$/,'g').replace(/kgs?$/,'kg');
+  let m;
+  if ((m=t.match(/^(\d+(?:\.\d+)?)ml$/))) return { v:+m[1], u:'ml', k:`${+m[1]}ml` };
+  if ((m=t.match(/^(\d+(?:\.\d+)?)l$/)))  return { v:+m[1]*1000, u:'ml', k:`${+m[1]}l` };
+  if ((m=t.match(/^(\d+(?:\.\d+)?)g$/)))  return { v:+m[1], u:'g', k:`${+m[1]}g` };
+  if ((m=t.match(/^(\d+(?:\.\d+)?)kg$/))) return { v:+m[1]*1000, u:'g', k:`${+m[1]}kg` };
+  return null;
+}
+function prodSzKey(packSize, packUnit) {
+  const v = parseFloat(packSize)||0; if (!v) return null;
+  const u = (packUnit||'').toUpperCase();
+  if (u==='ML') return v===5000?'5000ml': v===1000?'1l': `${v}ml`;
+  if (u==='L')  return v===5?'5000ml': v===1?'1l': `${v*1000}ml`;
+  if (u==='GM'||u==='G') return v===1000?'1kg': `${v}g`;
+  if (u==='KG'||u==='KGS') return v===1?'1kg': `${v*1000}g`;
+  return null;
+}
+function prodSzNorm(packSize, packUnit) {
+  const k = prodSzKey(packSize, packUnit); return k ? normSz(k) : null;
+}
+function stripSize(name) {
+  return name.replace(/\s+\d+(?:\.\d+)?(?:ML|GM|G|KG|L|KGS?)$/i,'').trim();
+}
+
+async function autoLinkPacking(prod) {
+  try {
+    const { data: mats } = await supabase
+      .from('packing_materials').select('id,name,category,product_name,size').eq('active',true);
+    if (!mats?.length) return null;
+
+    const sz  = prodSzNorm(prod.pack_size||prod.packSize, prod.pack_unit||prod.packUnit);
+    const cat = prod.cat;
+    if (!sz || cat==='raw') return null;
+
+    const isOil = cat==='oil';
+    const is5L  = sz.u==='ml' && sz.v===5000;
+
+    // ── Find container ──────────────────────────────────────────────────────
+    const CPREF = { can_5l:4, bottle_pet:3, bottle_glass:2, cover:1 };
+    let bestContainer = null, bestPref = -1;
+    for (const m of mats) {
+      if (!['can_5l','bottle_pet','bottle_glass','cover'].includes(m.category)) continue;
+      // For oil products: only bottles/cans; for dry: only covers
+      if (isOil && m.category==='cover') continue;
+      if (!isOil && (m.category==='bottle_pet'||m.category==='bottle_glass'||m.category==='can_5l')) continue;
+      const msz = normSz(m.size) || normSz(m.name.replace(/[^0-9a-z.]/gi,' '));
+      if (!msz) continue;
+      if (msz.u!==sz.u || msz.v!==sz.v) continue;
+      const pref = CPREF[m.category]||0;
+      if (pref > bestPref) { bestContainer=m; bestPref=pref; }
+    }
+
+    // ── Find label ──────────────────────────────────────────────────────────
+    const base     = stripSize(prod.name);
+    const normBase = base.toLowerCase().replace(/\s+/g,'');
+    const szKey    = prodSzKey(prod.pack_size||prod.packSize, prod.pack_unit||prod.packUnit);
+
+    let labelId = null;
+    for (const m of mats) {
+      if (m.category!=='label') continue;
+      const mnorm = (m.product_name||'').toLowerCase().replace(/\s+/g,'');
+      if (mnorm !== normBase) continue;
+      const lsz = normSz(m.size);
+      if (lsz && sz && lsz.u===sz.u && lsz.v===sz.v) { labelId=m.id; break; }
+      if (!m.size && !sz) { labelId=m.id; break; }
+    }
+
+    // ── Auto-create label if missing ────────────────────────────────────────
+    if (!labelId && base) {
+      const labelName = szKey ? `${base} Label ${szKey}` : `${base} Label`;
+      const price = szKey ? (LABEL_PRICE_MAP[szKey]||0) : 0;
+      const now = new Date().toISOString();
+      const { data: newLabel } = await supabase.from('packing_materials').insert({
+        name: labelName, category:'label', product_name:base,
+        size: szKey||'', cover_size: szKey||'',
+        unit:'pcs', current_stock:0, min_stock:50, reorder_qty:200,
+        unit_price:price, supplier:'', notes:'Auto-created on product add',
+        active:true, updated_at:now,
+      }).select('id').single();
+      if (newLabel) labelId = newLabel.id;
+    }
+
+    if (!bestContainer && !labelId) return null;
+    return {
+      materialIds: bestContainer ? [bestContainer.id] : [],
+      labelId:     labelId || undefined,
+    };
+  } catch(e) {
+    console.error('autoLinkPacking error:', e.message);
+    return null;
+  }
+}
+
 const products = express.Router();
 products.get('/', auth, async (req, res) => {
   const { data, error } = await supabase.from('products').select('*').eq('active', true).order('name');
@@ -43,6 +143,12 @@ products.post('/', auth, requireRole('admin'), async (req, res) => {
     image_url:p.imageUrl||null, description:p.description||null, hsn_code:p.hsnCode||null
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
+
+  // Auto-link packing materials (label + container) in background
+  autoLinkPacking(data).then(links => {
+    if (links) supabase.from('products').update({ packing_links: links }).eq('id', data.id).then(()=>{});
+  });
+
   res.status(201).json(data);
 });
 // Batch price/field update — must be before /:id so Express doesn't match "batch" as an id
@@ -305,6 +411,10 @@ procurement.post('/', auth, requireRole('admin','manager'), async (req, res) => 
 });
 procurement.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const p = req.body;
+
+  // Fetch existing record to detect status change → received
+  const { data: existing } = await supabase.from('procurements').select('status,payable_id').eq('id', req.params.id).single();
+
   const { data, error } = await supabase.from('procurements').update({
     date:p.date, commodity_id:p.commodityId||null, commodity_name:p.commodityName, supplier:p.supplier, vendor_id:p.vendorId||null,
     ordered_qty:p.orderedQty, ordered_price_per_kg:p.orderedPricePerKg,
@@ -314,6 +424,42 @@ procurement.put('/:id', auth, requireRole('admin','manager'), async (req, res) =
     status:p.status, notes:p.notes||''
   }).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: error.message });
+
+  // Auto-create vendor payable when status first changes to 'received'
+  if (p.status === 'received' && existing?.status !== 'received' && !existing?.payable_id) {
+    setImmediate(async () => {
+      try {
+        const qty    = parseFloat(p.receivedQty || p.orderedQty) || 0;
+        const rate   = parseFloat(p.orderedPricePerKg) || 0;
+        const amount = Math.round(qty * rate * 100) / 100;
+        const gstPct = parseFloat(p.gst) || 0;
+        const gstAmt = Math.round(amount * gstPct / 100 * 100) / 100;
+        if (amount <= 0) return;
+
+        const today    = new Date().toISOString().slice(0, 10);
+        const dueDate  = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        const { data: payable } = await supabase.from('vendor_bills').insert({
+          vendor_name:  p.supplier || 'Unknown Vendor',
+          bill_no:      p.invoice_no || `PROC-${req.params.id}`,
+          bill_date:    today,
+          due_date:     dueDate,
+          amount,
+          gst_amount:   gstAmt,
+          category:     'Raw Materials',
+          notes:        `Auto: ${p.commodityName} ${qty}kg @ ₹${rate}/kg`,
+          status:       'unpaid',
+          paid_amount:  0,
+          created_by:   req.user?.email || 'system',
+        }).select('id').single();
+
+        if (payable) {
+          await supabase.from('procurements').update({ payable_id: payable.id }).eq('id', req.params.id);
+          console.log(`[AUTO] Vendor payable created for procurement ${req.params.id}: ₹${amount}`);
+        }
+      } catch (e) { console.error('[AUTO] Procurement payable error:', e.message); }
+    });
+  }
+
   res.json(data);
 });
 procurement.delete('/:id', auth, requireRole('admin'), async (req, res) => {

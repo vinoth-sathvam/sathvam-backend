@@ -501,6 +501,191 @@ router.get('/dashboard', auth, async (req, res) => {
   }
 });
 
+// POST /api/analytics/carts/ai-followup — manual AI follow-up for a single cart
+router.post('/carts/ai-followup', auth, async (req, res) => {
+  res.json({ ok: true }); // respond immediately
+  try {
+    const { session_id, email, phone, name, items, touch = 1 } = req.body;
+    if (!session_id) return;
+
+    const { generateCartMessage, buildCartEmailHtml, sendWhatsAppMsg } = require('../scripts/automation-service');
+    const nodemailer = require('nodemailer');
+    const mailer = nodemailer.createTransport({
+      host: process.env.SMTP_HOST || 'smtp.gmail.com',
+      port: parseInt(process.env.SMTP_PORT || '587'),
+      secure: false,
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+
+    const cart = { session_id, email, phone, customer_name: name, customer_phone: phone, items: items || [] };
+    const { wa: waMsg, subject } = await generateCartMessage(cart, touch);
+    const htmlBody = buildCartEmailHtml(cart, touch, waMsg);
+
+    let channels = [];
+
+    if (phone) {
+      const sent = await sendWhatsAppMsg(phone, waMsg);
+      if (sent) channels.push('whatsapp');
+    }
+    if (email && process.env.SMTP_USER) {
+      try {
+        await mailer.sendMail({
+          from: process.env.SMTP_FROM || 'Sathvam <noreply@sathvam.in>',
+          to: email,
+          subject,
+          html: htmlBody,
+        });
+        channels.push('email');
+      } catch (e) { console.error('[AI-FOLLOWUP] Email failed:', e.message); }
+    }
+
+    // Update follow-up state
+    const { data: stateRow } = await supabase.from('settings').select('value').eq('key', 'cart_followup_state').single();
+    const state = stateRow?.value || {};
+    state[session_id] = { count: touch, last_at: new Date().toISOString(), manual: true };
+    await supabase.from('settings').upsert({ key: 'cart_followup_state', value: state, updated_at: new Date().toISOString() });
+
+    console.log(`[AI-FOLLOWUP] Touch ${touch} sent via [${channels.join(', ')}] for cart ${session_id}`);
+  } catch (e) { console.error('[AI-FOLLOWUP] Error:', e.message); }
+});
+
+// ── Discount Approval Endpoints ───────────────────────────────────────────────
+
+// GET /api/analytics/carts/discount-approvals
+router.get('/carts/discount-approvals', auth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'cart_discount_approvals').maybeSingle();
+    res.json(data?.value || []);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/analytics/carts/discount-approvals/approve
+// Body: { id, session_id, discount_pct }
+router.post('/carts/discount-approvals/approve', auth, async (req, res) => {
+  try {
+    const { id, session_id, discount_pct = 10 } = req.body;
+    if (!id || !session_id) return res.status(400).json({ error: 'id and session_id required' });
+
+    // 1. Fetch approval queue
+    const { data: aqRow } = await supabase.from('settings').select('value').eq('key', 'cart_discount_approvals').maybeSingle();
+    const queue = aqRow?.value || [];
+    const approval = queue.find(a => a.id === id);
+    if (!approval) return res.status(404).json({ error: 'Approval not found' });
+    if (approval.status !== 'pending') return res.status(400).json({ error: 'Already actioned' });
+
+    // 2. Mark approved
+    const updatedQueue = queue.map(a => a.id === id ? { ...a, status: 'approved', discount_pct, actioned_at: new Date().toISOString(), actioned_by: req.user?.email || 'admin' } : a);
+    await supabase.from('settings').upsert({ key: 'cart_discount_approvals', value: updatedQueue, updated_at: new Date().toISOString() });
+
+    res.json({ ok: true }); // respond immediately
+
+    // 3. Send AI follow-up message in background
+    try {
+      const { generateCartMessage, buildCartEmailHtml, sendWhatsAppMsg } = require('../scripts/automation-service');
+      const nodemailer = require('nodemailer');
+      const mailer = nodemailer.createTransport({
+        host: process.env.SMTP_HOST || 'smtp.gmail.com',
+        port: parseInt(process.env.SMTP_PORT || '587'),
+        secure: false,
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+      });
+
+      const cart = approval.cart;
+      const { wa: waMsg, subject } = await generateCartMessage(cart, 2, discount_pct);
+      const htmlBody = buildCartEmailHtml(cart, 2, waMsg, discount_pct);
+
+      let channels = [];
+      if (cart.customer_phone || cart.phone) {
+        const sent = await sendWhatsAppMsg(cart.customer_phone || cart.phone, waMsg);
+        if (sent) channels.push('whatsapp');
+      }
+      if ((cart.email || cart.customer_email) && process.env.SMTP_USER) {
+        try {
+          await mailer.sendMail({
+            from: process.env.SMTP_FROM || 'Sathvam <noreply@sathvam.in>',
+            to: cart.email || cart.customer_email,
+            subject,
+            html: htmlBody,
+          });
+          channels.push('email');
+        } catch (e) { console.error('[APPROVE] Email failed:', e.message); }
+      }
+
+      // 4. Advance cart state to count=2 so T3 can proceed
+      const { data: stateRow } = await supabase.from('settings').select('value').eq('key', 'cart_followup_state').maybeSingle();
+      const state = stateRow?.value || {};
+      state[session_id] = { ...state[session_id], count: 2, last_at: new Date().toISOString(), approval_queued: false };
+      await supabase.from('settings').upsert({ key: 'cart_followup_state', value: state, updated_at: new Date().toISOString() });
+
+      console.log(`[APPROVE] Discount ${discount_pct}% approved for ${session_id}, sent via [${channels.join(', ')}]`);
+    } catch (e) { console.error('[APPROVE] Send error:', e.message); }
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/analytics/carts/discount-approvals/reject
+// Body: { id, session_id }
+router.post('/carts/discount-approvals/reject', auth, async (req, res) => {
+  try {
+    const { id, session_id } = req.body;
+    if (!id || !session_id) return res.status(400).json({ error: 'id and session_id required' });
+
+    // 1. Mark rejected in queue
+    const { data: aqRow } = await supabase.from('settings').select('value').eq('key', 'cart_discount_approvals').maybeSingle();
+    const queue = aqRow?.value || [];
+    if (!queue.find(a => a.id === id)) return res.status(404).json({ error: 'Approval not found' });
+
+    const updatedQueue = queue.map(a => a.id === id ? { ...a, status: 'rejected', actioned_at: new Date().toISOString(), actioned_by: req.user?.email || 'admin' } : a);
+    await supabase.from('settings').upsert({ key: 'cart_discount_approvals', value: updatedQueue, updated_at: new Date().toISOString() });
+
+    // 2. Advance cart state past T2 (count=2) — no discount message sent
+    const { data: stateRow } = await supabase.from('settings').select('value').eq('key', 'cart_followup_state').maybeSingle();
+    const state = stateRow?.value || {};
+    state[session_id] = { ...state[session_id], count: 2, last_at: new Date().toISOString(), approval_queued: false };
+    await supabase.from('settings').upsert({ key: 'cart_followup_state', value: state, updated_at: new Date().toISOString() });
+
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/analytics/carts/failed-payment-followup — manual retry for a single failed payment session
+router.post('/carts/failed-payment-followup', auth, async (req, res) => {
+  res.json({ ok: true });
+  try {
+    const { session_id, email, phone, name, items, cart_total, touch = 1 } = req.body;
+    if (!session_id) return;
+
+    const { sendWhatsAppMsg } = require('../scripts/automation-service');
+    const nodemailer = require('nodemailer');
+    const mailer = nodemailer.createTransport({
+      host: process.env.SMTP_HOST || 'smtp.gmail.com',
+      port: parseInt(process.env.SMTP_PORT || '587'),
+      secure: false,
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+
+    const first = (name || 'there').split(' ')[0];
+    const total = cart_total ? `₹${Math.round(cart_total)}` : 'your order';
+    const waMsg = `Hi ${first}! 👋 We noticed your payment for ${total} didn't complete. Please retry: https://sathvam.in/cart — or call us and we'll help you manually! 🙏`;
+    const subject = `Your Sathvam payment didn't go through — retry link inside`;
+    const html = `<p>Hi ${first},</p><p>Your payment for <strong>${total}</strong> was unsuccessful. <a href="https://sathvam.in/cart">Retry here</a> or call us to complete manually.</p><p>Team Sathvam 🌿</p>`;
+
+    let channels = [];
+    if (phone) { const s = await sendWhatsAppMsg(phone, waMsg); if (s) channels.push('whatsapp'); }
+    if (email && process.env.SMTP_USER) {
+      try { await mailer.sendMail({ from: process.env.SMTP_FROM || 'Sathvam <noreply@sathvam.in>', to: email, subject, html }); channels.push('email'); }
+      catch (e) { console.error('[FAILED-PAY-MANUAL] Email error:', e.message); }
+    }
+
+    // Mark in state
+    const { data: stateRow } = await supabase.from('settings').select('value').eq('key', 'failed_payment_state').maybeSingle();
+    const state = stateRow?.value || {};
+    state[session_id] = { count: touch, last_at: new Date().toISOString(), manual: true };
+    await supabase.from('settings').upsert({ key: 'failed_payment_state', value: state, updated_at: new Date().toISOString() });
+
+    console.log(`[FAILED-PAY-MANUAL] Touch ${touch} sent via [${channels.join(', ')}] for ${session_id}`);
+  } catch (e) { console.error('[FAILED-PAY-MANUAL] Error:', e.message); }
+});
+
 // GET /api/analytics/carts — admin cart tracking (Live / Abandoned / Failed / Recovered)
 router.get('/carts', auth, async (req, res) => {
   try {
