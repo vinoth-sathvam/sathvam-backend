@@ -891,6 +891,26 @@ cron.schedule('30 5 * * *', () => {
   runCreditFollowUps();
 });
 
+// EOD closing reminder: 5:15 PM IST daily (11:45 AM UTC)
+cron.schedule('45 11 * * *', async () => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: regData } = await supabase.from('settings').select('value').eq('key', 'pos_cash_register').maybeSingle();
+    const register = regData?.value || {};
+    const todayEntry = register[today] || {};
+    if (todayEntry.closingBalance !== undefined) return; // already closed
+
+    const { data: users } = await supabase.from('users').select('phone,name').in('role', ['admin', 'manager']).eq('active', true);
+    if (!users?.length) return;
+
+    const msg = `🔔 *Sathvam — EOD Reminder*\n\nHello! Factory closing time is approaching (5:30 PM).\n\n*Please complete End of Day cash closing* in the POS:\n1. Count cash in drawer\n2. Enter denomination-wise or total\n3. Submit handover (bank deposit / owner / carry forward)\n\nOpen Admin → Sales → 💰 EOD button\n\nThank you!`;
+    for (const u of users) {
+      if (u.phone) await sendWhatsAppMsg(u.phone.replace(/\D/g, ''), msg).catch(() => {});
+    }
+    console.log('[EOD-REMINDER] Sent 5:15 PM closing reminders to', users.length, 'users');
+  } catch (e) { console.error('[EOD-REMINDER] Error:', e.message); }
+});
+
 // Export for use by backend manual trigger
 module.exports.runCartFollowUps = runCartFollowUps;
 module.exports.runFailedPaymentFollowUps = runFailedPaymentFollowUps;
@@ -908,3 +928,4 @@ console.log('  • Daily 10 AM IST  — Overdue vendor payment reminder');
 console.log('  • Monthly 1st      — P&L snapshot email');
 console.log('  • Monthly last day — Payroll auto-generation');
 console.log('  • Every 2 hours    — AI abandoned cart follow-up (3-touch sequence)');
+console.log('  • Daily 5:15 PM IST — EOD cash closing reminder to admin/managers');
