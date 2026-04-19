@@ -1,6 +1,11 @@
 const express  = require('express');
 const router   = express.Router();
 const supabase = require('../config/supabase');
+const multer   = require('multer');
+
+const _upload    = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const SAFE_MIME  = { 'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png', 'image/webp': 'webp' };
+const IMG_BUCKET = 'product-images';
 
 // ── Auth middleware (admin cookie) ────────────────────────────────────────────
 const jwt = require('jsonwebtoken');
@@ -180,6 +185,74 @@ router.post('/posts/:id/regenerate', auth, async (req, res) => {
     .update({ caption, status: 'draft' }).eq('id', req.params.id).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
+});
+
+// ── GET /api/social/assets ────────────────────────────────────────────────────
+router.get('/assets', auth, async (req, res) => {
+  const { data, error } = await supabase.from('pomelli_assets')
+    .select('*').order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// ── POST /api/social/assets — upload a Pomelli image ──────────────────────────
+router.post('/assets', auth, _upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No image file provided' });
+    const ext = SAFE_MIME[req.file.mimetype];
+    if (!ext) return res.status(400).json({ error: 'Invalid file type. Allowed: jpg, png, webp' });
+
+    const { product_id, product_name, platform = 'both', asset_type = 'product_photo' } = req.body;
+    const storagePath = `pomelli/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
+
+    const { error: uploadErr } = await supabase.storage
+      .from(IMG_BUCKET)
+      .upload(storagePath, req.file.buffer, { contentType: req.file.mimetype, upsert: false });
+    if (uploadErr) return res.status(500).json({ error: 'Storage upload failed' });
+
+    const { data: { publicUrl } } = supabase.storage.from(IMG_BUCKET).getPublicUrl(storagePath);
+
+    const { data, error } = await supabase.from('pomelli_assets').insert({
+      product_id:   product_id   || null,
+      product_name: product_name || null,
+      platform,
+      asset_type,
+      image_url:    publicUrl,
+      storage_path: storagePath,
+      status:       'pending',
+      uploaded_by:  req.user.name || req.user.username,
+    }).select().single();
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data);
+  } catch (err) {
+    console.error('Pomelli asset upload error:', err);
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
+// ── PUT /api/social/assets/:id — approve / reject / update ────────────────────
+router.put('/assets/:id', auth, async (req, res) => {
+  const { status, platform, asset_type } = req.body;
+  const updates = {};
+  if (status     !== undefined) updates.status     = status;
+  if (platform   !== undefined) updates.platform   = platform;
+  if (asset_type !== undefined) updates.asset_type = asset_type;
+  const { data, error } = await supabase.from('pomelli_assets')
+    .update(updates).eq('id', req.params.id).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+// ── DELETE /api/social/assets/:id ────────────────────────────────────────────
+router.delete('/assets/:id', auth, async (req, res) => {
+  const { data: asset } = await supabase.from('pomelli_assets')
+    .select('storage_path').eq('id', req.params.id).single();
+  if (asset?.storage_path) {
+    await supabase.storage.from(IMG_BUCKET).remove([asset.storage_path]);
+  }
+  await supabase.from('pomelli_assets').delete().eq('id', req.params.id);
+  res.json({ ok: true });
 });
 
 // GET /api/social/image-proxy?url=... — proxies image to fix canvas CORS
