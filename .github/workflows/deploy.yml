@@ -1,0 +1,22 @@
+name: Deploy Backend to Production
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull latest code and restart backend container
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.AWS_HOST }}
+          username: ${{ secrets.AWS_USER }}
+          key: ${{ secrets.AWS_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/sathvam-backend
+            git pull origin main
+            cd /home/ubuntu
+            docker compose up -d --force-recreate --build backend
+            docker compose ps
