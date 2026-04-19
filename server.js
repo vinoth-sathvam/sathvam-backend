@@ -149,6 +149,7 @@ app.use('/api/thirukural',        require('./routes/thirukural').router); // Dai
 app.use('/api/broadcasts',        require('./routes/broadcasts'));          // All daily WA broadcasts
 app.use('/api/competitor-prices', require('./routes/competitorPrices'));
 app.use('/api/security',         require('./routes/security'));
+app.use('/api/restock-reminders', require('./routes/restockReminder'));
 
 // ── Weekly report manual trigger ──────────────────────────────────────────────
 const { startScheduler, buildWeeklyReport } = require('./config/scheduler');
