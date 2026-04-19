@@ -117,12 +117,16 @@ app.use('/api/coupons',           require('./routes/coupons'));
 app.use('/api/quality',           require('./routes/quality'));
 app.use('/api/tasks',             require('./routes/tasks'));
 app.use('/api/compliance',        require('./routes/compliance'));
+app.use('/api/payouts',           require('./routes/payouts'));
 app.use('/api/campaigns',         require('./routes/campaigns'));
 app.use('/api/messages',          require('./routes/messages'));
 app.use('/api/calls',             rateLimit({ windowMs: 60*1000, max: 200, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests' }, ...rateLimitOpts }), require('./routes/calls'));
 app.use('/api/blog',              require('./routes/blog'));
 app.use('/api/notifications',     require('./routes/notifications'));
-app.use('/api/whatsapp',          require('./routes/whatsapp'));      // WhatsApp Business API
+app.use('/api/whatsapp',          require('./routes/whatsapp'));      // WhatsApp Business API (Meta direct)
+app.use('/api/botsailor',         require('./routes/botsailor'));     // BotSailor WhatsApp middleware
+app.use('/api/thirukural',        require('./routes/thirukural').router); // Daily Thirukkural broadcast
+app.use('/api/broadcasts',        require('./routes/broadcasts'));          // All daily WA broadcasts
 app.use('/api/competitor-prices', require('./routes/competitorPrices'));
 app.use('/api/security',         require('./routes/security'));
 

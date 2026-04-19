@@ -12,14 +12,193 @@
  *   GET  /api/whatsapp/status          — Config status check (admin auth)
  */
 
-const express = require('express');
+const express   = require('express');
+const Anthropic  = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const { auth } = require('../middleware/auth');
 
-const router = express.Router();
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const router    = express.Router();
+const supabase  = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ── WA auto-reply: set WHATSAPP_AI_REPLIES=false in .env to disable ───────────
+const AI_REPLIES_ENABLED = process.env.WHATSAPP_AI_REPLIES !== 'false';
 
 const WA_BASE = 'https://graph.facebook.com/v19.0';
+
+// ── Helper: fetch products + stock for AI context ────────────────────────────
+async function getProductContext() {
+  try {
+    const [{ data: products }, { data: stockData }, { data: enabledSetting }] = await Promise.all([
+      supabase.from('products')
+        .select('id,name,cat,pack_size,pack_unit,unit,website_price,price,active,health_benefits,certifications')
+        .eq('active', true).order('name'),
+      supabase.from('stock_ledger').select('product_id,type,qty'),
+      supabase.from('settings').select('value').eq('key', 'website_enabled_products').single(),
+    ]);
+
+    const stock = {};
+    for (const row of stockData || []) {
+      stock[row.product_id] = (stock[row.product_id] || 0) + (row.type === 'in' ? +row.qty : -+row.qty);
+    }
+    for (const id of Object.keys(stock)) if (stock[id] < 0) stock[id] = 0;
+
+    const enabledArr = Array.isArray(enabledSetting?.value) ? enabledSetting.value
+      : Array.isArray(enabledSetting?.value?.value) ? enabledSetting.value.value : [];
+    const enabledSet = new Set(enabledArr);
+
+    return (products || [])
+      .filter(p => p.cat !== 'raw' && (enabledSet.size === 0 || enabledSet.has(p.id)) && (p.website_price || p.price) > 0)
+      .map(p => {
+        const price    = p.website_price || p.price;
+        const packStr  = p.pack_size ? `${p.pack_size}${p.pack_unit || p.unit}` : p.unit;
+        const qty      = stock[p.id] ?? 0;
+        const stockStr = qty > 10 ? 'In Stock' : qty > 0 ? `Only ${qty} left` : 'Out of Stock';
+        const benefits = Array.isArray(p.health_benefits) && p.health_benefits.length
+          ? ` | ${p.health_benefits.slice(0, 2).join(', ')}` : '';
+        return `• ${p.name} (${packStr}) ₹${price} — ${stockStr}${benefits}`;
+      })
+      .join('\n');
+  } catch (e) {
+    console.error('WA getProductContext error:', e.message);
+    return '(product data unavailable)';
+  }
+}
+
+// ── Helper: lookup recent orders for a WhatsApp phone number ─────────────────
+async function getOrdersByPhone(waPhone) {
+  // WA numbers arrive as 91XXXXXXXXXX; match last 10 digits
+  const digits = waPhone.replace(/\D/g, '').slice(-10);
+  try {
+    const { data } = await supabase
+      .from('webstore_orders')
+      .select('order_no,status,total,created_at,customer,tracking_no,courier')
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    return (data || []).filter(o => {
+      const ph = (o.customer?.phone || '').replace(/\D/g, '').slice(-10);
+      return ph === digits;
+    }).slice(0, 5);
+  } catch (e) {
+    console.error('WA getOrdersByPhone error:', e.message);
+    return [];
+  }
+}
+
+// ── Helper: lookup one order by order_no ─────────────────────────────────────
+async function lookupOrderNo(rawNo, waPhone) {
+  try {
+    const { data } = await supabase
+      .from('webstore_orders')
+      .select('order_no,status,total,created_at,customer,tracking_no,courier,items')
+      .ilike('order_no', rawNo.trim())
+      .maybeSingle();
+    if (!data) return null;
+    // Verify phone ownership (optional safety check)
+    const orderDigits = (data.customer?.phone || '').replace(/\D/g, '').slice(-10);
+    const inputDigits = waPhone.replace(/\D/g, '').slice(-10);
+    if (orderDigits && inputDigits && orderDigits !== inputDigits) return null;
+    return data;
+  } catch (e) { return null; }
+}
+
+const STATUS_LABEL = {
+  new: 'Received ✅', confirmed: 'Confirmed ✅', packed: 'Packed 📦',
+  shipped: 'Shipped 🚚', delivered: 'Delivered ✅', cancelled: 'Cancelled ❌',
+};
+
+function formatOrder(o) {
+  const status  = STATUS_LABEL[o.status] || o.status;
+  const date    = o.created_at ? new Date(o.created_at).toLocaleDateString('en-IN') : '';
+  const track   = o.tracking_no ? `\n🔍 Tracking: ${o.courier || ''} ${o.tracking_no}` : '';
+  return `📦 *${o.order_no}*\nStatus: ${status}\nDate: ${date}\nTotal: ₹${o.total}${track}`;
+}
+
+// ── Helper: chat history from settings table ──────────────────────────────────
+const HISTORY_KEY = phone => `wa_chat_${phone}`;
+const MAX_HISTORY = 10; // pairs kept
+
+async function loadHistory(phone) {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', HISTORY_KEY(phone)).single();
+    return data?.value?.messages || [];
+  } catch { return []; }
+}
+
+async function saveHistory(phone, messages) {
+  try {
+    await supabase.from('settings').upsert({
+      key:   HISTORY_KEY(phone),
+      value: { messages: messages.slice(-(MAX_HISTORY * 2)), updated_at: new Date().toISOString() },
+    });
+  } catch (e) { console.error('WA saveHistory error:', e.message); }
+}
+
+// ── Helper: send a WhatsApp text reply ────────────────────────────────────────
+async function sendReply(to, text) {
+  try {
+    const result = await waRequest('/messages', 'POST', {
+      messaging_product: 'whatsapp',
+      to,
+      type: 'text',
+      text: { body: text },
+    });
+    await storeMessage({
+      wa_message_id: result.messages?.[0]?.id,
+      phone:     to,
+      direction: 'outbound',
+      type:      'text',
+      content:   text,
+      status:    'sent',
+      timestamp: new Date().toISOString(),
+      sent_by:   'bot',
+    });
+  } catch (e) {
+    console.error('WA sendReply error:', e.message);
+  }
+}
+
+// ── Keyword router — returns a reply string or null ───────────────────────────
+async function keywordReply(text, phone) {
+  const t = text.trim();
+  const upper = t.toUpperCase();
+
+  // MENU / HI / HELLO / START
+  if (/^(hi|hello|hey|start|menu|help|\u0b39\u0b3e\u0b0f|\u0b35\u0b23\u0b15\u0bcd\u0b15\u0bae\u0bcd)$/i.test(t)) {
+    return `👋 *Welcome to Sathvam!*\n\nNatural cold-pressed oils, directly from our mill 🌿\n\nReply with:\n📦 *ORDERS* — your recent orders\n🔍 *TRACK <order no>* — e.g. TRACK SAT-20260410-0042\n🛍 *PRODUCTS* — what we sell\n💬 *anything else* — ask me anything!`;
+  }
+
+  // PRODUCTS
+  if (/^(products?|shop|buy|oils?|list|catalogue|catalog)$/i.test(t)) {
+    const ctx = await getProductContext();
+    return `🌿 *Our Products*\n\n${ctx}\n\n🛒 Order at: https://sathvam.in`;
+  }
+
+  // ORDERS — list recent orders for this phone
+  if (/^(orders?|my orders?|order history)$/i.test(t)) {
+    const orders = await getOrdersByPhone(phone);
+    if (!orders.length) return `No orders found for this number.\n\nShop at 👉 https://sathvam.in`;
+    return `📦 *Your Recent Orders*\n\n${orders.map(formatOrder).join('\n\n')}`;
+  }
+
+  // TRACK <order_no>
+  const trackMatch = t.match(/^track\s+([A-Z0-9\-]+)$/i);
+  if (trackMatch) {
+    const order = await lookupOrderNo(trackMatch[1], phone);
+    if (!order) return `❌ Order *${trackMatch[1]}* not found or doesn't match this number.\n\nReply *ORDERS* to see your orders.`;
+    return formatOrder(order);
+  }
+
+  // Order number typed directly (e.g. SAT-20260410-0042)
+  const orderNoMatch = t.match(/\b(SAT-\d{8}-\d{4})\b/i);
+  if (orderNoMatch) {
+    const order = await lookupOrderNo(orderNoMatch[1], phone);
+    if (order) return formatOrder(order);
+  }
+
+  return null; // fall through to AI
+}
 
 // ── Helper: make a WhatsApp API request ──────────────────────────────────────
 async function waRequest(path, method = 'GET', body = null) {
@@ -119,6 +298,52 @@ router.post('/webhook', express.json(), async (req, res) => {
             status:        'received',
             timestamp:     new Date(parseInt(msg.timestamp) * 1000).toISOString(),
           });
+
+          // ── Auto-reply (text messages only) ──────────────────────────────
+          if (!AI_REPLIES_ENABLED || msg.type !== 'text' || !content.trim()) continue;
+
+          // 1. Keyword shortcuts — fast, no AI needed
+          const kwReply = await keywordReply(content, phone);
+          if (kwReply) {
+            await sendReply(phone, kwReply);
+            continue;
+          }
+
+          // 2. AI reply via Claude
+          try {
+            const history     = await loadHistory(phone);
+            const productCtx  = await getProductContext();
+
+            const aiResponse = await anthropic.messages.create({
+              model:      'claude-sonnet-4-6',
+              max_tokens: 350,
+              system: `You are Sathvam's WhatsApp assistant. Sathvam sells cold-pressed oils and natural products.
+Keep replies SHORT (3-4 lines max) — this is WhatsApp, not email.
+Use simple language. Support English and Tamil.
+Never make up prices or availability — use only what's listed below.
+If asked about order tracking, tell them to reply with: TRACK <order number>
+Store: https://sathvam.in | WhatsApp orders: message us here.
+
+CURRENT PRODUCTS:
+${productCtx}`,
+              messages: [
+                ...history,
+                { role: 'user', content },
+              ],
+            });
+
+            const reply = aiResponse.content[0]?.text || '';
+            if (!reply) continue;
+
+            await sendReply(phone, reply);
+            await saveHistory(phone, [
+              ...history,
+              { role: 'user',      content },
+              { role: 'assistant', content: reply },
+            ]);
+          } catch (aiErr) {
+            console.error('WA AI reply error:', aiErr.message);
+          }
         }
 
         // Process delivery/read status updates for outbound messages

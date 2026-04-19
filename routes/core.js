@@ -612,8 +612,40 @@ sales.post('/', auth, async (req, res) => {
       qty:i.qty, rate:i.rate, total:i.total, unit:i.unit||'pcs'
     })));
   }
-  // Non-blocking: Zoho Books + finished goods deduction
+  // Non-blocking: Zoho Books + finished goods deduction + admin WA alert
   setImmediate(async () => {
+    // ── Admin WhatsApp alert for new POS/local sale ───────────────────────────
+    try {
+      const adminNumbers = ['918144803555', '917092177092',
+        ...(process.env.WA_NOTIFY_TO ? [process.env.WA_NOTIFY_TO.replace(/\D/g,'')] : []),
+      ].filter((v,i,a) => v && a.indexOf(v) === i);
+
+      const itemLines = (s.items || []).map(i => `  • ${i.productName} × ${i.qty}  ₹${i.total}`).join('\n');
+      const alertText =
+        `🏪 *New POS Sale — ${s.orderNo}*\n\n` +
+        `👤 *${s.customerName || 'Walk-in'}*\n` +
+        `📞 ${s.customerPhone || '—'}\n` +
+        `💳 ${s.paymentMethod?.toUpperCase() || 'CASH'}\n\n` +
+        `📋 *Items:*\n${itemLines}\n\n` +
+        `💰 *Total: ₹${parseFloat(s.finalAmount || s.totalAmount || 0).toLocaleString('en-IN')}*` +
+        `${s.discount ? `  |  🎁 Discount: ₹${s.discount}` : ''}\n\n` +
+        `📊 admin.sathvam.in → Sales`;
+
+      const sendViaBS = async (phone, message) => {
+        const token   = process.env.BOTSAILOR_API_TOKEN;
+        const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
+        if (!token || !phoneId) return;
+        const params = new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message });
+        await fetch('https://botsailor.com/api/v1/whatsapp/send', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString() });
+      };
+
+      for (const phone of adminNumbers) {
+        try { await sendViaBS(phone, alertText); } catch {}
+      }
+    } catch (waErr) {
+      console.error('POS sale WA alert error:', waErr.message);
+    }
+
     if (process.env.ZOHO_ORG_ID) {
       try {
         const zohoOrder = {

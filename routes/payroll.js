@@ -51,13 +51,18 @@ router.get('/employees', auth, async (req, res) => {
 
 // POST /api/payroll/employees
 router.post('/employees', auth, requireRole('admin','manager'), async (req, res) => {
-  const { name, phone, role, daily_rate } = req.body;
-  if (!name || !daily_rate) return res.status(400).json({ error: 'name and daily_rate are required' });
+  const { name, phone, role, daily_rate, pay_type, monthly_salary } = req.body;
+  if (!name) return res.status(400).json({ error: 'name is required' });
+  const pt = pay_type === 'monthly' ? 'monthly' : 'daily';
+  if (pt === 'daily'   && !daily_rate)    return res.status(400).json({ error: 'daily_rate is required for daily pay type' });
+  if (pt === 'monthly' && !monthly_salary) return res.status(400).json({ error: 'monthly_salary is required for monthly pay type' });
   const { data, error } = await supabase.from('employees').insert({
     name: name.trim(),
     phone: phone || '',
     role: role || '',
-    daily_rate: parseFloat(daily_rate) || 0,
+    pay_type: pt,
+    daily_rate:      pt === 'daily'   ? (parseFloat(daily_rate)    || 0) : 0,
+    monthly_salary:  pt === 'monthly' ? (parseFloat(monthly_salary) || 0) : 0,
     active: true,
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
@@ -66,13 +71,21 @@ router.post('/employees', auth, requireRole('admin','manager'), async (req, res)
 
 // PUT /api/payroll/employees/:id
 router.put('/employees/:id', auth, requireRole('admin','manager'), async (req, res) => {
-  const { name, phone, role, daily_rate, active } = req.body;
+  const { name, phone, role, daily_rate, monthly_salary, pay_type, active,
+          email, bank_name, bank_account, bank_ifsc, upi_id } = req.body;
   const updates = {};
-  if (name       != null) updates.name       = name.trim();
-  if (phone      != null) updates.phone      = phone;
-  if (role       != null) updates.role       = role;
-  if (daily_rate != null) updates.daily_rate = parseFloat(daily_rate) || 0;
-  if (active     != null) updates.active     = active;
+  if (name            != null) updates.name            = name.trim();
+  if (phone           != null) updates.phone           = phone;
+  if (role            != null) updates.role            = role;
+  if (pay_type        != null) updates.pay_type        = pay_type;
+  if (daily_rate      != null) updates.daily_rate      = parseFloat(daily_rate)    || 0;
+  if (monthly_salary  != null) updates.monthly_salary  = parseFloat(monthly_salary) || 0;
+  if (active          != null) updates.active          = active;
+  if (email           != null) updates.email           = email;
+  if (bank_name       != null) updates.bank_name       = bank_name;
+  if (bank_account    != null) updates.bank_account    = bank_account;
+  if (bank_ifsc       != null) updates.bank_ifsc       = bank_ifsc;
+  if (upi_id          != null) updates.upi_id          = upi_id;
   const { data, error } = await supabase.from('employees').update(updates).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
@@ -155,7 +168,7 @@ router.get('/report', auth, async (req, res) => {
   const daysInMonth = new Date(year, month, 0).getDate();
 
   // Fetch all employees (including inactive — they may have records this month)
-  const { data: emps, error: empErr } = await supabase.from('employees').select('id,name,role,daily_rate,active').order('name');
+  const { data: emps, error: empErr } = await supabase.from('employees').select('id,name,role,daily_rate,monthly_salary,pay_type,active').order('name');
   if (empErr) return res.status(500).json({ error: empErr.message });
 
   // Fetch all attendance records for the month
@@ -175,20 +188,40 @@ router.get('/report', auth, async (req, res) => {
   const empIdsWithRecords = new Set(Object.keys(attByEmp).map(Number));
   const reportEmps = (emps || []).filter(e => e.active || empIdsWithRecords.has(e.id));
 
+  // Standard working days (Mon–Sat = 26, adjust as needed; use daysInMonth as fallback)
+  const WORKING_DAYS = 26;
+
   const rows = reportEmps.map(e => {
     const rec       = attByEmp[e.id] || { present: 0, absent: 0, half_day: 0 };
     const recorded  = rec.present + rec.absent + rec.half_day;
-    const salary    = Math.round(((rec.present + rec.half_day * 0.5) * e.daily_rate) * 100) / 100;
+    const payType   = e.pay_type || 'daily';
+    let salary, effectiveDailyRate;
+
+    if (payType === 'monthly') {
+      const monthlySal = parseFloat(e.monthly_salary) || 0;
+      // Deduct proportionally for absent days (half_day = 0.5 day deduction)
+      const perDay     = monthlySal / WORKING_DAYS;
+      const deduction  = Math.round(((rec.absent + rec.half_day * 0.5) * perDay) * 100) / 100;
+      salary           = Math.max(0, Math.round((monthlySal - deduction) * 100) / 100);
+      effectiveDailyRate = perDay;
+    } else {
+      salary           = Math.round(((rec.present + rec.half_day * 0.5) * (parseFloat(e.daily_rate) || 0)) * 100) / 100;
+      effectiveDailyRate = parseFloat(e.daily_rate) || 0;
+    }
+
     return {
-      employee_id:  e.id,
-      name:         e.name,
-      role:         e.role || '',
-      daily_rate:   e.daily_rate,
-      days_present: rec.present,
-      days_half:    rec.half_day,
-      days_absent:  rec.absent,
-      days_recorded: recorded,
-      days_in_month: daysInMonth,
+      employee_id:        e.id,
+      name:               e.name,
+      role:               e.role || '',
+      pay_type:           payType,
+      daily_rate:         parseFloat(e.daily_rate) || 0,
+      monthly_salary:     parseFloat(e.monthly_salary) || 0,
+      effective_daily:    Math.round(effectiveDailyRate * 100) / 100,
+      days_present:       rec.present,
+      days_half:          rec.half_day,
+      days_absent:        rec.absent,
+      days_recorded:      recorded,
+      days_in_month:      daysInMonth,
       salary,
     };
   });
@@ -276,6 +309,125 @@ router.post('/zoho-sync', auth, requireRole('admin','manager'), async (req, res)
     }
     res.status(500).json({ error: msg });
   }
+});
+
+// ── Work Log ──────────────────────────────────────────────────────────────────
+
+// GET /api/payroll/work-log?date=YYYY-MM-DD
+router.get('/work-log', auth, async (req, res) => {
+  const date = req.query.date || new Date().toISOString().slice(0, 10);
+  const [{ data: emps }, { data: logs }] = await Promise.all([
+    supabase.from('employees').select('id,name,role,daily_rate,monthly_salary,pay_type').eq('active', true).order('name'),
+    supabase.from('employee_work_log').select('*').eq('date', date),
+  ]);
+  const logMap = {};
+  for (const l of logs || []) logMap[l.employee_id] = l;
+  const result = (emps || []).map(e => ({
+    ...e,
+    tasks_completed: logMap[e.id]?.tasks_completed ?? null,
+    target_tasks:    logMap[e.id]?.target_tasks    ?? e.default_target ?? 0,
+    task_type:       logMap[e.id]?.task_type       ?? '',
+    quality:         logMap[e.id]?.quality         ?? 'good',
+    notes:           logMap[e.id]?.notes           ?? '',
+    already_saved:   !!logMap[e.id],
+  }));
+  res.json({ date, employees: result });
+});
+
+// POST /api/payroll/work-log  — bulk upsert
+router.post('/work-log', auth, requireRole('admin', 'manager'), async (req, res) => {
+  const rows = req.body;
+  if (!Array.isArray(rows) || !rows.length) return res.status(400).json({ error: 'Expected array' });
+  const valid = rows.filter(r => r.employee_id && r.date && r.tasks_completed != null);
+  if (!valid.length) return res.status(400).json({ error: 'No valid records' });
+  const { error } = await supabase.from('employee_work_log').upsert(
+    valid.map(r => ({
+      employee_id:     r.employee_id,
+      date:            r.date,
+      tasks_completed: parseInt(r.tasks_completed) || 0,
+      target_tasks:    parseInt(r.target_tasks)    || 0,
+      task_type:       r.task_type  || 'general',
+      quality:         r.quality    || 'good',
+      notes:           r.notes      || '',
+      updated_at:      new Date().toISOString(),
+    })),
+    { onConflict: 'employee_id,date' }
+  );
+  if (error) return res.status(400).json({ error: error.message });
+
+  // Also update default_target on employee if set
+  for (const r of valid) {
+    if (r.save_target && r.target_tasks) {
+      await supabase.from('employees').update({ default_target: parseInt(r.target_tasks) }).eq('id', r.employee_id);
+    }
+  }
+
+  res.json({ saved: valid.length });
+});
+
+// GET /api/payroll/work-log/report?year=YYYY&month=M
+router.get('/work-log/report', auth, async (req, res) => {
+  const year  = parseInt(req.query.year)  || new Date().getFullYear();
+  const month = parseInt(req.query.month) || new Date().getMonth() + 1;
+  const start = `${year}-${String(month).padStart(2,'0')}-01`;
+  const end   = new Date(year, month, 0).toISOString().slice(0, 10);
+
+  const [{ data: emps }, { data: logs }, { data: att }] = await Promise.all([
+    supabase.from('employees').select('id,name,role,daily_rate,monthly_salary,pay_type,default_target').eq('active', true).order('name'),
+    supabase.from('employee_work_log').select('*').gte('date', start).lte('date', end),
+    supabase.from('attendance').select('employee_id,status').gte('date', start).lte('date', end),
+  ]);
+
+  // Days present per employee from attendance
+  const presentByEmp = {};
+  for (const a of att || []) {
+    if (!presentByEmp[a.employee_id]) presentByEmp[a.employee_id] = 0;
+    if (a.status === 'present')  presentByEmp[a.employee_id] += 1;
+    if (a.status === 'half_day') presentByEmp[a.employee_id] += 0.5;
+  }
+
+  // Aggregate work log per employee
+  const logByEmp = {};
+  for (const l of logs || []) {
+    if (!logByEmp[l.employee_id]) logByEmp[l.employee_id] = { total_tasks: 0, total_target: 0, days_logged: 0, quality_counts: {} };
+    logByEmp[l.employee_id].total_tasks  += parseInt(l.tasks_completed) || 0;
+    logByEmp[l.employee_id].total_target += parseInt(l.target_tasks)    || 0;
+    logByEmp[l.employee_id].days_logged  += 1;
+    const q = l.quality || 'good';
+    logByEmp[l.employee_id].quality_counts[q] = (logByEmp[l.employee_id].quality_counts[q] || 0) + 1;
+  }
+
+  const daysInMonth = new Date(year, month, 0).getDate();
+  const WORKING_DAYS = 26;
+
+  const rows = (emps || []).map(e => {
+    const log         = logByEmp[e.id] || { total_tasks: 0, total_target: 0, days_logged: 0, quality_counts: {} };
+    const daysPresent = presentByEmp[e.id] || 0;
+    const isMonthly   = (e.pay_type || 'daily') === 'monthly';
+    const salary      = isMonthly
+      ? parseFloat(e.monthly_salary || 0)
+      : parseFloat(e.daily_rate || 0) * daysPresent;
+    const efficiency  = log.total_target > 0 ? Math.round((log.total_tasks / log.total_target) * 100) : null;
+    const costPerTask = log.total_tasks > 0 ? Math.round((salary / log.total_tasks) * 100) / 100 : null;
+    const topQuality  = Object.entries(log.quality_counts).sort((a,b)=>b[1]-a[1])[0]?.[0] || '—';
+    return {
+      employee_id:    e.id,
+      name:           e.name,
+      role:           e.role,
+      pay_type:       e.pay_type || 'daily',
+      salary:         Math.round(salary),
+      days_present:   daysPresent,
+      days_logged:    log.days_logged,
+      total_tasks:    log.total_tasks,
+      total_target:   log.total_target,
+      efficiency,
+      cost_per_task:  costPerTask,
+      top_quality:    topQuality,
+      default_target: e.default_target || 0,
+    };
+  });
+
+  res.json({ year, month, days_in_month: daysInMonth, employees: rows });
 });
 
 module.exports = router;

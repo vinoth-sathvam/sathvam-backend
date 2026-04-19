@@ -1,7 +1,23 @@
 const express = require('express');
+const multer  = require('multer');
 const router  = express.Router();
 const { auth, requireRole } = require('../middleware/auth');
 const supabase = require('../config/supabase');
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10 MB
+
+// Allowed MIME types for bill scans (images + PDF)
+const BILL_MIME = {
+  'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png',
+  'image/webp': 'webp', 'application/pdf': 'pdf',
+};
+
+async function ensureBillsBucket() {
+  const { data: buckets } = await supabase.storage.listBuckets();
+  if (!buckets?.find(b => b.name === 'po-bills')) {
+    await supabase.storage.createBucket('po-bills', { public: true, fileSizeLimit: 10485760 });
+  }
+}
 
 const round2 = v => Math.round((v||0)*100)/100;
 
@@ -30,9 +46,14 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
     const gstAmt   = round2(subtotal * gstPct / 100);
     const total    = round2(subtotal + gstAmt);
 
-    // Auto-generate PO number
+    // Auto-generate PO number: POSA{YYYYMMMDD}-{seq} e.g. POSA2026APR18-01
+    const now = new Date();
+    const yr  = now.getFullYear();
+    const mon = now.toLocaleString('en-US',{month:'short'}).toUpperCase();
+    const day = String(now.getDate()).padStart(2,'0');
+    const dateTag = `${yr}${mon}${day}`;
     const { count } = await supabase.from('packing_procurement').select('*', { count: 'exact', head: true });
-    const poNumber  = `PKG-PO-${String((count||0)+1).padStart(4,'0')}`;
+    const poNumber  = `POSA${dateTag}-${String((count||0)+1).padStart(2,'0')}`;
 
     const { data, error } = await supabase.from('packing_procurement').insert({
       po_number: poNumber,
@@ -65,7 +86,7 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
 // ── PUT update PO (before receiving) ─────────────────────────────────────────
 router.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   try {
-    const { vendor_id, vendor_name, vendor_gst, date, expected_delivery, items, gst_pct, notes, bill_no, status } = req.body;
+    const { vendor_id, vendor_name, vendor_gst, date, expected_delivery, items, gst_pct, notes, bill_no, status, vendor_bill_no, bill_scan_url } = req.body;
     const updates = { updated_at: new Date().toISOString() };
 
     if (vendor_id   !== undefined) updates.vendor_id = vendor_id;
@@ -76,6 +97,8 @@ router.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
     if (notes       !== undefined) updates.notes = notes;
     if (bill_no     !== undefined) updates.bill_no = bill_no;
     if (status      !== undefined) updates.status = status;
+    if (vendor_bill_no !== undefined) updates.vendor_bill_no = vendor_bill_no;
+    if (bill_scan_url  !== undefined) updates.bill_scan_url  = bill_scan_url;
 
     if (items !== undefined) {
       const subtotal = round2(items.reduce((s,i) => s + (parseFloat(i.qty)||0)*(parseFloat(i.unit_price)||0), 0));
@@ -192,6 +215,77 @@ router.post('/:id/receive', auth, requireRole('admin','manager'), async (req, re
     if (upErr) return res.status(400).json({ error: upErr.message });
 
     res.json({ po: updated, payable_id: payableId });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /:id/attach-bill — attach vendor hardcopy bill (bill no + optional scan) ──
+router.post('/:id/attach-bill', auth, requireRole('admin','manager'), upload.single('bill_scan'), async (req, res) => {
+  try {
+    await ensureBillsBucket();
+    const { vendor_bill_no } = req.body;
+    const updates = { updated_at: new Date().toISOString() };
+
+    if (vendor_bill_no !== undefined) updates.vendor_bill_no = vendor_bill_no.trim();
+
+    if (req.file) {
+      const ext = BILL_MIME[req.file.mimetype];
+      if (!ext) return res.status(400).json({ error: 'Invalid file type. Allowed: jpg, png, webp, pdf' });
+      const fileName = `po-${req.params.id}-${Date.now()}.${ext}`;
+      const { error: upErr } = await supabase.storage.from('po-bills').upload(fileName, req.file.buffer, {
+        contentType: req.file.mimetype, upsert: true,
+      });
+      if (upErr) return res.status(500).json({ error: 'File upload failed: ' + upErr.message });
+      const { data: urlData } = supabase.storage.from('po-bills').getPublicUrl(fileName);
+      updates.bill_scan_url = urlData.publicUrl;
+    }
+
+    const { data, error } = await supabase.from('packing_procurement').update(updates).eq('id', req.params.id).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /admin/migrate-po-numbers — one-time migration to new PO number format ──
+router.post('/admin/migrate-po-numbers', auth, requireRole('admin'), async (req, res) => {
+  try {
+    const { data: all, error } = await supabase.from('packing_procurement').select('id,po_number,date').order('date', { ascending: true }).order('created_at', { ascending: true });
+    if (error) return res.status(500).json({ error: error.message });
+
+    // Group by date, assign new sequential numbers
+    const byDate = {};
+    for (const po of all) {
+      const d = (po.date || new Date().toISOString().slice(0,10));
+      if (!byDate[d]) byDate[d] = [];
+      byDate[d].push(po);
+    }
+
+    const renames = []; // { id, old, new }
+    for (const [d, pos] of Object.entries(byDate)) {
+      const dt = new Date(d);
+      const yr  = dt.getFullYear();
+      const mon = dt.toLocaleString('en-US', { month: 'short' }).toUpperCase();
+      const day = String(dt.getDate()).padStart(2, '0');
+      const tag = `${yr}${mon}${day}`;
+      pos.forEach((po, idx) => {
+        const newNum = `POSA${tag}-${String(idx + 1).padStart(2, '0')}`;
+        if (po.po_number !== newNum) renames.push({ id: po.id, old: po.po_number, new: newNum });
+      });
+    }
+
+    let updated = 0;
+    for (const r of renames) {
+      await supabase.from('packing_procurement').update({ po_number: r.new, updated_at: new Date().toISOString() }).eq('id', r.id);
+      // Also update any vendor bills that reference the old PO number
+      const { data: bills } = await supabase.from('vendor_bills').select('id,bill_no,notes').or(`bill_no.ilike.%${r.old}%,notes.ilike.%${r.old}%`);
+      for (const bill of (bills||[])) {
+        const newBillNo = bill.bill_no ? bill.bill_no.replace(r.old, r.new) : bill.bill_no;
+        const newNotes  = bill.notes  ? bill.notes.replace(r.old, r.new)  : bill.notes;
+        await supabase.from('vendor_bills').update({ bill_no: newBillNo, notes: newNotes, updated_at: new Date().toISOString() }).eq('id', bill.id);
+      }
+      updated++;
+    }
+
+    res.json({ ok: true, total: all.length, migrated: updated, renames });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 

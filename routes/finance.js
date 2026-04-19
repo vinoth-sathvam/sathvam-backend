@@ -544,4 +544,77 @@ router.get('/zoho/chart-of-accounts', auth, async (req, res) => {
   }
 });
 
+// ── GET /api/finance/inventory-value — total closing stock value across all categories ──
+router.get('/inventory-value', auth, async (req, res) => {
+  try {
+    // 1. Packing materials: current_stock × avg_cost (or unit_price as fallback)
+    const { data: packMats } = await supabase
+      .from('packing_materials').select('name, current_stock, avg_cost, unit_price').eq('active', true);
+    const packItems = (packMats || []).map(m => ({
+      name: m.name,
+      qty:  parseFloat(m.current_stock) || 0,
+      rate: parseFloat(m.avg_cost) || parseFloat(m.unit_price) || 0,
+      value: (parseFloat(m.current_stock)||0) * (parseFloat(m.avg_cost)||parseFloat(m.unit_price)||0),
+      category: 'Packing Materials',
+    })).filter(m => m.qty > 0);
+    const packValue = packItems.reduce((s, m) => s + m.value, 0);
+
+    // 2. Raw materials: current_stock × last procurement rate per commodity
+    const { data: rawMats } = await supabase
+      .from('raw_materials').select('id, name, category, current_stock').eq('active', true);
+
+    const { data: procs } = await supabase.from('procurements')
+      .select('commodity_name, ordered_price_per_kg, rate')
+      .in('status', ['received', 'stocked', 'cleaned'])
+      .order('created_at', { ascending: false });
+
+    const rateMap = {};
+    for (const p of (procs || [])) {
+      const name = (p.commodity_name || '').toLowerCase().trim();
+      const rate = parseFloat(p.ordered_price_per_kg || p.rate) || 0;
+      if (name && rate > 0 && !rateMap[name]) rateMap[name] = rate;
+    }
+
+    const rawItems = (rawMats || []).map(m => {
+      const qty  = parseFloat(m.current_stock) || 0;
+      const key  = (m.name || '').toLowerCase().trim();
+      const rate = rateMap[key]
+        || Object.entries(rateMap).find(([k]) => k.includes(key.split(' ')[0]) || key.includes(k.split(' ')[0]))?.[1]
+        || 0;
+      return { name: m.name, category: 'Raw Materials', qty, rate, value: qty * rate };
+    }).filter(m => m.qty > 0);
+    const rawValue = rawItems.reduce((s, m) => s + m.value, 0);
+
+    // 3. Finished goods: running balance × ~40% of selling price as cost estimate
+    const { data: fgMovements } = await supabase.from('finished_goods').select('product_name, qty, type');
+    const { data: products }    = await supabase.from('products').select('name, price, website_price, retail_price');
+
+    const fgBalance = {};
+    for (const r of (fgMovements || [])) {
+      if (!fgBalance[r.product_name]) fgBalance[r.product_name] = 0;
+      fgBalance[r.product_name] += r.type === 'out' ? -parseFloat(r.qty) : parseFloat(r.qty);
+    }
+    const prodPriceMap = {};
+    for (const p of (products || [])) {
+      prodPriceMap[p.name] = parseFloat(p.price || p.website_price || p.retail_price) || 0;
+    }
+
+    const fgItems = Object.entries(fgBalance).map(([name, balance]) => {
+      const qty      = Math.max(0, balance);
+      const costRate = (prodPriceMap[name] || 0) * 0.4; // ~40% cost ratio estimate
+      return { name, category: 'Finished Goods', qty, rate: Math.round(costRate), value: qty * costRate };
+    }).filter(m => m.qty > 0 && m.value > 0);
+    const fgValue = fgItems.reduce((s, m) => s + m.value, 0);
+
+    res.json({
+      total: Math.round(packValue + rawValue + fgValue),
+      packing_materials: { value: Math.round(packValue), items: packItems },
+      raw_materials:     { value: Math.round(rawValue),  items: rawItems },
+      finished_goods:    { value: Math.round(fgValue),   items: fgItems },
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

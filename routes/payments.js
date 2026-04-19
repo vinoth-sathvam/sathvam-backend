@@ -66,71 +66,87 @@ async function sendOrderEmail(order, paymentId) {
   } catch (e) { console.error('Order email failed:', e.message); }
 }
 
-// ── WhatsApp order alert ──────────────────────────────────────────────────────
+// ── BotSailor send helper ─────────────────────────────────────────────────────
+const SATHVAM_LOGO_URL = 'https://sathvam.in/logo.jpg';
+
+async function sendViaBotSailor(phone, message, imageUrl = SATHVAM_LOGO_URL) {
+  const token   = process.env.BOTSAILOR_API_TOKEN;
+  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
+  if (!token || !phoneId) return false;
+  const res = imageUrl
+    ? await fetch('https://botsailor.com/api/v1/whatsapp/send', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ apiToken: token, phone_number_id: phoneId, phone_number: phone, type: 'image', url: imageUrl, message }),
+      })
+    : await fetch('https://botsailor.com/api/v1/whatsapp/send', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body:    new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message }).toString(),
+      });
+  const data = await res.json();
+  return data.status === '1' || data.status === 1;
+}
+
+// ── WhatsApp order alert (to admin) ──────────────────────────────────────────
 async function sendWhatsAppAlert(order) {
-  const phoneId  = process.env.WA_PHONE_NUMBER_ID;
-  const token    = process.env.WA_ACCESS_TOKEN;
-  const notifyTo = process.env.WA_NOTIFY_TO; // e.g. "917092177092"
-  if (!phoneId || !token || !notifyTo) return; // skip if not configured
+  // Notify all configured admin numbers
+  const adminNumbers = [
+    process.env.WA_NOTIFY_TO,         // primary (env var)
+    '918144803555',                    // Vinoth
+    '917092177092',                    // Sathvam WA business
+  ].filter(Boolean).map(n => n.replace(/\D/g, '')).filter((v, i, a) => v && a.indexOf(v) === i);
+
+  if (!adminNumbers.length) return;
 
   const cust  = order.customer || {};
   const items = (order.items || []).map(i => `• ${i.name} × ${i.qty}`).join('\n');
   const text  =
-    `🛒 *New Order — ${order.orderNo}*\n\n` +
-    `👤 ${cust.name || 'Guest'}  📞 ${cust.phone || '—'}\n` +
+    `🛒 *New Webstore Order — ${order.orderNo || order.order_no}*\n\n` +
+    `👤 *${cust.name || 'Guest'}*\n` +
+    `📞 ${cust.phone || '—'}\n` +
     `📍 ${[cust.city, cust.state, cust.pincode].filter(Boolean).join(', ')}\n\n` +
-    `${items}\n\n` +
-    `💰 Total: ₹${order.total}  |  Shipping: ₹${order.shipping || 0}\n` +
-    `🔑 Razorpay: ${order.paymentId || ''}`;
+    `📋 *Items:*\n${items}\n\n` +
+    `💰 *Total: ₹${parseFloat(order.total || 0).toLocaleString('en-IN')}*` +
+    `${order.shipping ? `  |  🚚 Shipping: ₹${order.shipping}` : ''}\n` +
+    `✅ Payment: ${order.paymentId || order.payment_id || 'Online'}\n\n` +
+    `📦 Action: admin.sathvam.in → Webstore Orders`;
 
-  try {
-    await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
-      method: 'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        to: notifyTo,
-        type: 'text',
-        text: { body: text },
-      }),
-    });
-  } catch (e) { console.error('WhatsApp alert failed:', e.message); }
+  for (const phone of adminNumbers) {
+    try { await sendViaBotSailor(phone, text); } catch (e) { console.error('Admin WA alert failed:', e.message); }
+  }
 }
 
 // ── WhatsApp order confirmation to customer ───────────────────────────────────
-async function sendCustomerOrderWhatsApp(order, paymentId) {
-  const phoneId = process.env.WA_PHONE_NUMBER_ID;
-  const token   = process.env.WA_ACCESS_TOKEN;
-  if (!phoneId || !token) return;
-
+async function sendCustomerOrderWhatsApp(order) {
   const cust  = order.customer || {};
   const phone = (cust.phone || '').replace(/\D/g, '');
   if (!phone) return;
 
   const items = (order.items || []).map(i => `  • ${i.name} × ${i.qty}`).join('\n');
   const text  =
-    `🛒 *Order Confirmed & Payment Received!*\n\n` +
-    `Hi ${cust.name || 'there'}, thank you for shopping with *Sathvam Natural Products*! 🌿\n\n` +
-    `📋 *Order:* ${order.orderNo}\n` +
-    `💳 *Payment:* ₹${parseFloat(order.total || 0).toLocaleString('en-IN')} received\n\n` +
-    `*Items ordered:*\n${items}\n\n` +
-    `📍 *Delivering to:* ${[cust.address, cust.city, cust.state, cust.pincode].filter(Boolean).join(', ')}\n\n` +
-    `We'll send you another message when your order is dispatched.\n` +
-    `Questions? Reply here or call *+91 70921 77092*`;
+    `🌿 *சத்துவம் இயற்கை உணவுகள்*\n` +
+    `_Sathvam Natural Products_\n` +
+    `━━━━━━━━━━━━━━━━━━━━━\n\n` +
+    `✅ *ஆர்டர் உறுதிப்படுத்தப்பட்டது!*\n` +
+    `_Order Confirmed & Payment Received!_\n\n` +
+    `வணக்கம் ${cust.name || 'அன்பான வாடிக்கையாளர்'}! 🙏\n` +
+    `_Dear ${cust.name || 'Valued Customer'}, thank you for choosing Sathvam!_\n\n` +
+    `📋 *ஆர்டர் எண்:* ${order.orderNo}\n` +
+    `💳 *கட்டணம்:* ₹${parseFloat(order.total || 0).toLocaleString('en-IN')} பெறப்பட்டது\n` +
+    `_Payment of ₹${parseFloat(order.total || 0).toLocaleString('en-IN')} received_\n\n` +
+    `*📦 ஆர்டர் விவரங்கள் | Order Details:*\n${items}\n\n` +
+    `📍 *டெலிவரி முகவரி:*\n${[cust.address, cust.city, cust.state, cust.pincode].filter(Boolean).join(', ')}\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━━\n` +
+    `🚚 உங்கள் ஆர்டர் அனுப்பப்படும்போது தகவல் தெரிவிக்கப்படும்.\n` +
+    `_We'll notify you once your order is dispatched._\n\n` +
+    `❓ கேள்விகளா? | Questions?\n` +
+    `📞 *+91 70921 77092*\n` +
+    `🌐 sathvam.in`;
 
   try {
-    const res = await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
-      method:  'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        to:   phone,
-        type: 'text',
-        text: { body: text },
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) console.error('Customer WA confirmation error:', data?.error?.message);
+    const ok = await sendViaBotSailor(phone, text);
+    if (!ok) console.error('Customer WA confirmation: BotSailor returned non-success for', phone);
   } catch (e) {
     console.error('Customer WA confirmation error:', e.message);
   }
@@ -258,7 +274,7 @@ router.post('/verify', async (req, res) => {
       await sendOrderEmail(o, razorpay_payment_id);
 
       // WhatsApp confirmation to customer
-      await sendCustomerOrderWhatsApp(o, razorpay_payment_id);
+      await sendCustomerOrderWhatsApp(o);
 
       // Invoice/confirmation email to customer
       await sendCustomerInvoice({ ...o, orderNo: generatedOrderNo }, razorpay_payment_id);

@@ -1,10 +1,194 @@
 const express      = require('express');
 const nodemailer   = require('nodemailer');
+const htmlPdf      = require('html-pdf-node');
+const { execSync } = require('child_process');
+const fs           = require('fs');
+const os           = require('os');
+const path         = require('path');
 const supabase     = require('../config/supabase');
 const { auth }     = require('../middleware/auth');
 const rateLimit    = require('express-rate-limit');
 const { decryptCustomer, hmac, encryptCustomer } = require('../config/crypto');
 const router       = express.Router();
+
+// Embed logo as base64 so wkhtmltoimage doesn't need network access
+const LOGO_PATH   = path.join(__dirname, '../../sathvam-frontend/sathvam-vercel/public/logo.jpg');
+const LOGO_B64    = fs.existsSync(LOGO_PATH) ? `data:image/jpeg;base64,${fs.readFileSync(LOGO_PATH).toString('base64')}` : '';
+const BRAND_COLOR = '#4a7c59';  // Sathvam forest green
+
+const STATUS_STYLES = {
+  confirmed:        { color: '#15803d', bg: '#dcfce7', label: 'Order Confirmed',   labelTa: 'ஆர்டர் உறுதிப்பட்டது',   emoji: '✅' },
+  packed:           { color: '#0369a1', bg: '#dbeafe', label: 'Order Packed',      labelTa: 'பேக் செய்யப்பட்டது',     emoji: '📦' },
+  dispatched:       { color: '#b45309', bg: '#fef3c7', label: 'Order Dispatched',  labelTa: 'அனுப்பப்பட்டது',         emoji: '🚀' },
+  delivered:        { color: '#065f46', bg: '#d1fae5', label: 'Order Delivered',   labelTa: 'வழங்கப்பட்டது',          emoji: '🎉' },
+  cancelled:        { color: '#9f1239', bg: '#ffe4e6', label: 'Order Cancelled',   labelTa: 'ரத்து செய்யப்பட்டது',   emoji: '❌' },
+  rejected:         { color: '#7f1d1d', bg: '#fecaca', label: 'Order Rejected',    labelTa: 'நிராகரிக்கப்பட்டது',    emoji: '❌' },
+  refund_initiated: { color: '#5b21b6', bg: '#ede9fe', label: 'Refund Initiated',  labelTa: 'பணம் திரும்பும்',         emoji: '💸' },
+  refunded:         { color: '#3730a3', bg: '#e0e7ff', label: 'Refund Completed',  labelTa: 'பணம் திரும்பியது',        emoji: '✅' },
+};
+
+function buildStatusCardHtml(order, newStatus, opts = {}) {
+  const st      = STATUS_STYLES[newStatus] || STATUS_STYLES.confirmed;
+  const cust    = order.customer || {};
+  const orderNo = order.order_no || order.orderNo || '';
+  const fullName = cust.name || 'Customer';
+  const total   = parseFloat(order.total || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 });
+  const courier = order.courier || '';
+  const awb     = order.awb_number || '';
+  const date    = order.date ? new Date(order.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '';
+  const payStatus = (order.payment_status || 'paid').toLowerCase() === 'paid' ? '✅ Paid' : '⏳ Pending';
+  const addr    = [cust.address, cust.city, cust.state, cust.pincode].filter(Boolean).join(', ') || '—';
+
+  // Expected delivery dates
+  const dFrom = new Date(order.date || Date.now()); dFrom.setDate(dFrom.getDate() + 3);
+  const dTo   = new Date(order.date || Date.now()); dTo.setDate(dTo.getDate() + 5);
+  const deliveryRange = `${dFrom.toLocaleDateString('en-IN',{day:'2-digit',month:'short'})} – ${dTo.toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'})}`;
+
+  // Items section for confirmed card
+  const itemsHtml = newStatus === 'confirmed'
+    ? (order.items || []).map(it => {
+        const nm  = it.productName || it.name || 'Product';
+        const qty = it.qty || 1;
+        const pr  = parseFloat(it.rate || it.price || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 });
+        return `<tr><td class="lbl">${nm}</td><td class="val">× ${qty} &nbsp; ₹${pr}</td></tr>`;
+      }).join('')
+    : '';
+
+  let extraRows = '';
+  if (newStatus === 'confirmed') {
+    extraRows += `<tr><td colspan="2" style="padding:6px 0;border-top:1px solid #e5e7eb;"></td></tr>`;
+    extraRows += `<tr><td class="lbl">Payment</td><td class="val">${payStatus}</td></tr>`;
+    extraRows += `<tr><td class="lbl">Address</td><td class="val" style="font-size:12px;font-weight:500;">${addr}</td></tr>`;
+    extraRows += `<tr><td class="lbl">Est. Delivery</td><td class="val" style="color:${BRAND_COLOR};">${deliveryRange}</td></tr>`;
+  }
+  if (newStatus === 'dispatched') {
+    if (courier) extraRows += `<tr><td class="lbl">Courier</td><td class="val">${courier}</td></tr>`;
+    if (awb)     extraRows += `<tr><td class="lbl">Tracking No</td><td class="val"><strong>${awb}</strong></td></tr>`;
+  }
+  if (opts.cancelReason) {
+    extraRows += `<tr><td class="lbl">Reason</td><td class="val">${opts.cancelReason}</td></tr>`;
+  }
+
+  const greetingText = {
+    confirmed: 'Thank you for your order! We are preparing your pure, cold-pressed products with care. 🌿',
+    packed:    'Your order has been carefully packed and is ready for the courier.',
+    dispatched:'Great news! Your order is on its way to you. Pure nature is coming to your doorstep! 🚀',
+    delivered: 'Your Sathvam order has been delivered. We hope every drop brings health and happiness! 🙏',
+    cancelled: 'Your order has been cancelled. Refund (if paid online) will be processed in 5–7 business days.',
+    rejected:  'We regret we could not process your order. Refund (if paid online) will arrive in 5–7 business days.',
+  }[newStatus] || 'Your order has been updated.';
+
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family: 'Segoe UI', Arial, sans-serif; background: #f5f5f0; width: 760px; }
+  .card { background: #fff; border-radius: 20px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,.12); margin: 20px; }
+  .header { background: ${BRAND_COLOR}; padding: 22px 28px; display: flex; align-items: center; gap: 16px; }
+  .logo { width: 60px; height: 60px; border-radius: 10px; object-fit: cover; border: 2px solid rgba(255,255,255,.35); }
+  .brand { color: #fff; }
+  .brand-name { font-size: 20px; font-weight: 800; letter-spacing: .5px; }
+  .brand-sub  { font-size: 11px; opacity: .75; margin-top: 3px; letter-spacing: 1.2px; text-transform: uppercase; }
+  .status-banner { background: ${st.bg}; padding: 16px 28px; display: flex; align-items: center; gap: 14px; border-bottom: 2px solid ${st.color}22; }
+  .status-emoji { font-size: 34px; }
+  .status-label-en { font-size: 21px; font-weight: 800; color: ${st.color}; }
+  .status-label-ta { font-size: 14px; color: ${st.color}99; margin-top: 2px; }
+  .body { padding: 20px 28px 24px; }
+  .greeting { font-size: 14px; color: #374151; margin-bottom: 16px; line-height: 1.6; }
+  .greeting strong { color: #1f2937; font-size: 15px; }
+  .items-header { font-size: 11px; font-weight: 700; color: #9ca3af; text-transform: uppercase; letter-spacing: .5px; padding: 8px 0 4px; border-top: 1px solid #f3f4f6; }
+  table { width: 100%; border-collapse: collapse; }
+  .lbl { font-size: 12px; color: #9ca3af; font-weight: 600; text-transform: uppercase; letter-spacing: .4px; padding: 6px 0; width: 38%; vertical-align: top; }
+  .val { font-size: 13px; color: #1f2937; font-weight: 600; padding: 6px 0; }
+  .total-row td { padding-top: 10px; border-top: 2px solid #e5e7eb; font-size: 15px; font-weight: 800; color: ${BRAND_COLOR}; }
+  .footer { background: #f9faf8; padding: 14px 28px; display: flex; align-items: center; justify-content: space-between; border-top: 1px solid #e5e7eb; }
+  .footer-left { font-size: 11px; color: #6b7280; }
+  .footer-contact { font-size: 12px; color: ${BRAND_COLOR}; font-weight: 700; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="header">
+    <img class="logo" src="${LOGO_B64}" />
+    <div class="brand">
+      <div class="brand-name">Sathvam Natural Products</div>
+      <div class="brand-sub">சத்வம் இயற்கை பொருட்கள் · Pure &amp; Natural</div>
+    </div>
+  </div>
+  <div class="status-banner">
+    <div class="status-emoji">${st.emoji}</div>
+    <div>
+      <div class="status-label-en">${st.label}</div>
+      <div class="status-label-ta">${st.labelTa}</div>
+    </div>
+  </div>
+  <div class="body">
+    <div class="greeting">
+      Dear <strong>${fullName}</strong>,<br/>${greetingText}
+    </div>
+    <table>
+      <tr><td class="lbl">Order ID</td><td class="val" style="color:${BRAND_COLOR};font-size:15px;">#${orderNo}</td></tr>
+      ${date ? `<tr><td class="lbl">Order Date</td><td class="val">${date}</td></tr>` : ''}
+      ${itemsHtml ? `<tr><td colspan="2"><div class="items-header">Items Ordered</div></td></tr>${itemsHtml}` : ''}
+      ${total !== '0.00' ? `<tr class="total-row"><td>Total Amount</td><td>₹${total}</td></tr>` : ''}
+      ${extraRows}
+    </table>
+  </div>
+  <div class="footer">
+    <div class="footer-left">🌐 sathvam.in &nbsp;|&nbsp; Pure • Natural • Cold-Pressed</div>
+    <div class="footer-contact">📞 +91 70921 77092</div>
+  </div>
+</div>
+</body></html>`;
+}
+
+async function renderCardJpeg(html) {
+  const id      = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const tmpHtml = path.join(os.tmpdir(), `scard-${id}.html`);
+  const tmpPng  = path.join(os.tmpdir(), `scard-${id}.png`);
+  const tmpJpg  = path.join(os.tmpdir(), `scard-${id}.jpg`);
+  try {
+    fs.writeFileSync(tmpHtml, html, 'utf8');
+    execSync(`wkhtmltoimage --width 800 --quality 92 "${tmpHtml}" "${tmpPng}"`, { timeout: 20000, stdio: 'pipe' });
+    execSync(`convert "${tmpPng}" -quality 88 "${tmpJpg}"`, { timeout: 10000, stdio: 'pipe' });
+    return fs.readFileSync(tmpJpg);
+  } finally {
+    try { fs.unlinkSync(tmpHtml); } catch {}
+    try { fs.unlinkSync(tmpPng); } catch {}
+    try { fs.unlinkSync(tmpJpg); } catch {}
+  }
+}
+
+async function uploadCardImage(buf, prefix) {
+  const fileName = `${prefix}-${Date.now()}.jpg`;
+  const { error } = await supabase.storage
+    .from('cards')
+    .upload(fileName, buf, { contentType: 'image/jpeg', upsert: true });
+  if (error) throw new Error(`Card image upload failed: ${error.message}`);
+  const { data } = supabase.storage.from('cards').getPublicUrl(fileName);
+  return data.publicUrl;
+}
+
+async function sendViaBotSailor(phone, message, imageUrl = null) {
+  const token   = process.env.BOTSAILOR_API_TOKEN;
+  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
+  if (!token || !phoneId) return false;
+  const body = imageUrl
+    ? JSON.stringify({ apiToken: token, phone_number_id: phoneId, phone_number: phone, type: 'image', url: imageUrl, message })
+    : null;
+  const formBody = !imageUrl
+    ? new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message }).toString()
+    : null;
+  const res = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
+    method:  'POST',
+    headers: { 'Content-Type': imageUrl ? 'application/json' : 'application/x-www-form-urlencoded' },
+    body:    imageUrl ? body : formBody,
+  });
+  const data = await res.json();
+  return data.status === '1' || data.status === 1;
+}
 
 // Decrypt the customer JSONB field of a single order
 function decryptOrder(order) {
@@ -212,6 +396,116 @@ function buildInvoiceHtml(o, autoPrint = false) {
 </body></html>`;
 }
 
+// POST /api/webstore-orders/:id/send-whatsapp-invoice — generate PDF invoice & send via BotSailor
+router.post('/:id/send-whatsapp-invoice', auth, async (req, res) => {
+  try {
+    const { data: rawO, error } = await supabase
+      .from('webstore_orders').select('*').eq('id', req.params.id).single();
+    if (error || !rawO) return res.status(404).json({ error: 'Order not found' });
+
+    const o      = decryptOrder(rawO);
+    const cust   = o.customer || {};
+    const digits = (cust.phone || '').replace(/\D/g, '');
+    if (!digits) return res.status(400).json({ error: 'Customer has no phone number' });
+    const phone = digits.length === 10 ? `91${digits}` : digits;
+
+    const token   = process.env.BOTSAILOR_API_TOKEN;
+    const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
+    if (!token || !phoneId) return res.status(500).json({ error: 'BotSailor not configured' });
+
+    // ── 1. Generate PDF from existing invoice HTML ──────────────────────────
+    const html    = buildInvoiceHtml(o, false);
+    const pdfBuf  = await htmlPdf.generatePdf(
+      { content: html },
+      { format: 'A4', printBackground: true, margin: { top: '15mm', bottom: '15mm', left: '12mm', right: '12mm' } }
+    );
+
+    // ── 2. Upload PDF to Supabase Storage ────────────────────────────────────
+    const fileName = `invoice-${o.order_no}-${Date.now()}.pdf`;
+    const { error: upErr } = await supabase.storage
+      .from('invoices')
+      .upload(fileName, pdfBuf, { contentType: 'application/pdf', upsert: true });
+    if (upErr) throw new Error(`PDF upload failed: ${upErr.message}`);
+
+    const { data: urlData } = supabase.storage.from('invoices').getPublicUrl(fileName);
+    const pdfUrl = urlData.publicUrl;
+
+    // ── 3. Send text message + PDF link via BotSailor ───────────────────────
+    const subtotal = parseFloat(o.subtotal || 0);
+    const gst      = parseFloat(o.gst_amount || o.gst || 0);
+    const shipping = parseFloat(o.shipping || 0);
+    const total    = parseFloat(o.total || (subtotal + gst + shipping));
+    const payMode  = (cust.payment || o.payment_mode || 'online').replace(/upi/i,'UPI').replace(/cod/i,'Cash on Delivery');
+
+    const message =
+      `🧾 *Tax Invoice — ${o.order_no}*\n\n` +
+      `Hi ${cust.name || 'there'}, your invoice from *Sathvam Natural Products* is ready 🌿\n\n` +
+      `💰 Total: ₹${total.toFixed(2)}  |  ✅ ${payMode}\n` +
+      `📅 Date: ${o.date || ''}\n\n` +
+      `📄 *Download Invoice PDF:*\n${pdfUrl}\n\n` +
+      `For any queries: *+91 70921 77092*`;
+
+    const params = new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message });
+    const bsRes  = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:    params.toString(),
+    });
+    const bsData = await bsRes.json();
+    if (bsData.status !== '1' && bsData.status !== 1) {
+      const msg   = bsData.message || 'BotSailor send failed';
+      const is24h = msg.toLowerCase().includes('24 hour') || msg.toLowerCase().includes('template');
+      return res.status(400).json({
+        error: is24h
+          ? `WhatsApp 24h window expired — customer hasn't messaged your number recently. Use the "💬 Send WhatsApp" button to send manually instead.`
+          : msg,
+      });
+    }
+
+    // ── 4. Log the sent message ──────────────────────────────────────────────
+    await supabase.from('whatsapp_messages').insert({
+      phone,
+      contact_name: `${cust.name || ''} | ${o.order_no}`,
+      direction:    'outbound',
+      type:         'document',
+      content:      message,
+      status:       'sent',
+      sent_by:      `invoice:${o.order_no}`,
+      timestamp:    new Date().toISOString(),
+    });
+
+    res.json({ success: true, phone, pdfUrl });
+  } catch (e) {
+    console.error('Send WhatsApp invoice error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/webstore-orders/:id/whatsapp-logs — fetch WA message log for order's customer phone
+router.get('/:id/whatsapp-logs', auth, async (req, res) => {
+  try {
+    const { data: rawO, error } = await supabase
+      .from('webstore_orders').select('*').eq('id', req.params.id).single();
+    if (error || !rawO) return res.status(404).json({ error: 'Order not found' });
+
+    const o      = decryptOrder(rawO);
+    const digits = (o.customer?.phone || '').replace(/\D/g, '');
+    const phone  = digits.length === 10 ? `91${digits}` : digits;
+    if (!phone) return res.json({ logs: [] });
+
+    const { data: logs } = await supabase
+      .from('whatsapp_messages')
+      .select('id,direction,content,status,sent_by,timestamp,contact_name')
+      .eq('phone', phone)
+      .order('timestamp', { ascending: false })
+      .limit(50);
+
+    res.json({ logs: logs || [], phone });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/webstore-orders/:id/send-invoice — send invoice to customer via email
 router.post('/:id/send-invoice', auth, async (req, res) => {
   try {
@@ -333,51 +627,277 @@ async function sendStatusEmail(order, newStatus, cancelReason) {
   }
 }
 
+// Generate PDF invoice and return its public URL (used in status messages)
+async function generateInvoicePdfUrl(order) {
+  try {
+    const html    = buildInvoiceHtml(order, false);
+    const pdfBuf  = await htmlPdf.generatePdf(
+      { content: html },
+      { format: 'A4', printBackground: true, margin: { top: '15mm', bottom: '15mm', left: '12mm', right: '12mm' } }
+    );
+    const fileName = `invoice-${order.order_no || order.orderNo}-${Date.now()}.pdf`;
+    const { error: upErr } = await supabase.storage
+      .from('invoices')
+      .upload(fileName, pdfBuf, { contentType: 'application/pdf', upsert: true });
+    if (upErr) { console.error('Invoice PDF upload:', upErr.message); return null; }
+    const { data: urlData } = supabase.storage.from('invoices').getPublicUrl(fileName);
+    return urlData.publicUrl || null;
+  } catch (e) {
+    console.error('generateInvoicePdfUrl:', e.message);
+    return null;
+  }
+}
+
 async function sendStatusWhatsApp(order, newStatus, cancelReason) {
-  const phoneId = process.env.WA_PHONE_NUMBER_ID;
-  const token   = process.env.WA_ACCESS_TOKEN;
-  if (!phoneId || !token) return;
+  const token   = process.env.BOTSAILOR_API_TOKEN;
+  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
+  if (!token || !phoneId) return;
 
-  const cust  = order.customer || {};
-  const phone = (cust.phone || '').replace(/\D/g, '');
-  if (!phone) return;
+  const cust   = order.customer || {};
+  const digits = (cust.phone || '').replace(/\D/g, '');
+  if (!digits) return;
+  const phone   = digits.length === 10 ? `91${digits}` : digits;
 
+  const name    = (cust.name || 'Customer').split(' ')[0]; // first name only
   const orderNo = order.order_no || order.orderNo || '';
-  const courier = order.courier  || '';
+  const courier = order.courier || '';
   const awb     = order.awb_number || '';
+  const total   = parseFloat(order.total || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const cancelLine = cancelReason ? `\n📋 *Reason / காரணம்:* ${cancelReason}` : '';
 
-  const cancelText = cancelReason
-    ? `❌ *Order Cancelled*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* has been cancelled.\n📋 *Reason:* ${cancelReason}\n\nIf paid online, refund will be processed in 5–7 business days.\nQuestions? WhatsApp +91 70921 77092.`
-    : `❌ *Order Cancelled*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* has been cancelled. Questions? Email sales@sathvam.in or WhatsApp +91 70921 77092.`;
+  // Generate PDF for statuses where invoice matters
+  let invoiceLine = '';
+  if (['confirmed', 'dispatched', 'delivered'].includes(newStatus)) {
+    const pdfUrl = await generateInvoicePdfUrl(order);
+    if (pdfUrl) {
+      invoiceLine = `\n\n🧾 *Invoice / விலைப்பட்டியல்:*\n${pdfUrl}`;
+    }
+  }
+
+  const footer = `\n📞 +91 70921 77092  |  📧 sales@sathvam.in\n🌐 sathvam.in\n\n_Regards,_\n*Sathvam Natural Products* 🌿`;
+
+  // Build item lines for confirmed message
+  const itemLines = (order.items || []).map(it => {
+    const nm  = it.productName || it.name || 'Product';
+    const qty = it.qty || 1;
+    const pr  = parseFloat(it.rate || it.price || 0).toLocaleString('en-IN', { minimumFractionDigits: 2 });
+    return `  • ${nm} × ${qty}  —  ₹${pr}`;
+  }).join('\n');
+
+  const orderDate = order.date
+    ? new Date(order.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })
+    : new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+
+  // Expected delivery: 3–5 business days from order date
+  const deliveryFrom = new Date(order.date || Date.now());
+  deliveryFrom.setDate(deliveryFrom.getDate() + 3);
+  const deliveryTo   = new Date(order.date || Date.now());
+  deliveryTo.setDate(deliveryTo.getDate() + 5);
+  const deliveryRange = `${deliveryFrom.toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })} – ${deliveryTo.toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' })}`;
+
+  const payStatus = (order.payment_status || 'paid').toLowerCase() === 'paid' ? '✅ Paid' : '⏳ Pending';
+  const addr = [cust.address, cust.city, cust.state, cust.pincode].filter(Boolean).join(', ') || '—';
 
   const msgMap = {
-    confirmed:        `✅ *Order Confirmed!*\n\nHi ${cust.name || 'there'}, your Sathvam order *${orderNo}* is confirmed and being packed.\n\nFor help: +91 70921 77092`,
-    packed:           `📦 *Order Packed!*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* is packed and ready for dispatch soon.\n\nFor help: +91 70921 77092`,
-    dispatched:       `🚚 *Order Dispatched!*\n\nHi ${cust.name || 'there'}, your order *${orderNo}* is on its way!${courier ? `\nCourier: ${courier}` : ''}${awb ? `\nAWB: ${awb}` : ''}\n\nFor help: +91 70921 77092`,
-    delivered:        `🎉 *Order Delivered!*\n\nHi ${cust.name || 'there'}, your Sathvam order *${orderNo}* has been delivered. Enjoy the goodness! 🌿\n\nFor help: +91 70921 77092`,
-    cancelled:        cancelText,
-    rejected:         `❌ *Order Rejected*\n\nHi ${cust.name || 'there'}, we're sorry your order *${orderNo}* could not be processed.${cancelReason ? `\n📋 *Reason:* ${cancelReason}` : ''}\n\nIf paid online, refund will be processed in 5–7 business days.\nQuestions? WhatsApp +91 70921 77092.`,
-    refund_initiated: `💸 *Refund Initiated*\n\nHi ${cust.name || 'there'}, your refund for order *${orderNo}* has been initiated.\n\nThe amount will reach your account within 5–7 business days.\nQuestions? WhatsApp +91 70921 77092.`,
-    refunded:         `✅ *Refund Completed*\n\nHi ${cust.name || 'there'}, your refund for order *${orderNo}* has been completed successfully. The amount should reflect in your account.\nQuestions? WhatsApp +91 70921 77092.`,
-    partial_refund:   `💸 *Partial Refund Initiated*\n\nHi ${cust.name || 'there'}, a partial refund for order *${orderNo}* has been initiated. The refund will reach your account within 5–7 business days.\nQuestions? WhatsApp +91 70921 77092.`,
+    confirmed: [
+      `✅ *Order Confirmation — Sathvam*`,
+      ``,
+      `Dear *${cust.name || name}*,`,
+      `Thank you for your order with *Sathvam Natural Products*! 🌿`,
+      ``,
+      `📋 *Order ID:* #${orderNo}`,
+      `📅 *Order Date:* ${orderDate}`,
+      ``,
+      `🛒 *Items:*`,
+      itemLines || '  —',
+      ``,
+      `💰 *Total Amount:* ₹${total}`,
+      `💳 *Payment Status:* ${payStatus}`,
+      ``,
+      `📍 *Delivery Address:*`,
+      `  ${addr}`,
+      ``,
+      `🚚 *Expected Delivery:* ${deliveryRange}`,
+      `${invoiceLine}`,
+      ``,
+      `For any queries, contact us at:`,
+      `${footer}`,
+    ].filter(l => l !== undefined).join('\n'),
+
+    packed: [
+      `📦 *ஆர்டர் பேக் செய்யப்பட்டது!* 📦`,
+      ``,
+      `🙏 வணக்கம் ${name}!`,
+      ``,
+      `✨ உங்கள் ஆர்டர் *${orderNo}* கவனமாக பேக் செய்யப்பட்டு`,
+      `கூரியர் வழியாக அனுப்பத் தயாராக உள்ளது. 🌾`,
+      ``,
+      `⏳ சீக்கிரம் டிராக்கிங் விவரங்கள் தெரிவிக்கப்படும்.`,
+      ``,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+      ``,
+      `📦 *Order Packed!*`,
+      ``,
+      `Dear ${name}, your order *${orderNo}* has been carefully packed`,
+      `with love and is ready to be handed to the courier. 🌿`,
+      ``,
+      `⏳ Tracking details will follow shortly.`,
+      `${footer}`,
+    ].join('\n'),
+
+    dispatched: [
+      `🚀 *ஆர்டர் அனுப்பப்பட்டது!* 🚀`,
+      ``,
+      `🙏 வணக்கம் ${name}!`,
+      ``,
+      `🎊 உங்கள் ஆர்டர் *${orderNo}* இப்போது வழியில் உள்ளது!`,
+      `இயற்கையின் தூய்மை உங்கள் வீட்டை நோக்கி பயணிக்கிறது. 🌿`,
+      ``,
+      ...(courier ? [`🚚 *கூரியர்:* ${courier}`] : []),
+      ...(awb     ? [`📦 *டிராக்கிங் எண்:* ${awb}`, ``, `கூரியர் இணையதளத்தில் உங்கள் ஆர்டரை டிராக் செய்யலாம்.`] : []),
+      ``,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+      ``,
+      `🚀 *Order Dispatched!*`,
+      ``,
+      `Dear ${name}, your order *${orderNo}* is on its way to you!`,
+      `Pure nature is travelling to your doorstep. 🌾`,
+      ``,
+      ...(courier ? [`🚚 *Courier:* ${courier}`] : []),
+      ...(awb     ? [`📦 *Tracking No:* ${awb}`, ``, `Track your shipment on the courier's website using the above tracking number.`] : []),
+      `${invoiceLine}`,
+      `${footer}`,
+    ].join('\n'),
+
+    delivered: [
+      `🎉 *ஆர்டர் வழங்கப்பட்டது!* 🎉`,
+      ``,
+      `🙏 வணக்கம் ${name}!`,
+      ``,
+      `🌟 உங்கள் ஆர்டர் *${orderNo}* வெற்றிகரமாக வழங்கப்பட்டது.`,
+      `சத்வம் இயற்கை பொருட்களை நம்பி வாங்கியதற்கு நன்றி! 🙏`,
+      ``,
+      `💛 உங்கள் ஆரோக்கியமான வாழ்க்கைக்காக நாங்கள் எப்போதும் இங்கே இருக்கிறோம்.`,
+      `உங்கள் கருத்தை தெரிவிக்கவும் — அது எங்களுக்கு மிகவும் உதவும். ⭐`,
+      ``,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+      ``,
+      `🎉 *Order Delivered!*`,
+      ``,
+      `Dear ${name}, your order *${orderNo}* has been delivered successfully.`,
+      ``,
+      `Thank you for trusting Sathvam Natural Products. 🌿`,
+      `We hope every drop brings health and happiness to your family.`,
+      ``,
+      `⭐ Your review means the world to us — it helps other families`,
+      `   discover the goodness of pure cold-pressed oils.`,
+      `${invoiceLine}`,
+      `${footer}`,
+    ].join('\n'),
+
+    cancelled: [
+      `🙏 *ஆர்டர் ரத்து செய்யப்பட்டது — ${orderNo}*`,
+      ``,
+      `வணக்கம் ${name},`,
+      ``,
+      `உங்கள் ஆர்டர் ரத்து செய்யப்பட்டது.${cancelLine}`,
+      ``,
+      `💳 ஆன்லைனில் பணம் செலுத்தியிருந்தால், 5–7 வேலை நாட்களில் திரும்ப வரும்.`,
+      ``,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+      ``,
+      `❌ *Order Cancelled — ${orderNo}*`,
+      ``,
+      `Dear ${name}, your order has been cancelled.${cancelLine}`,
+      ``,
+      `💳 If you paid online, your refund will be processed within 5–7 business days.`,
+      `We apologise for any inconvenience and hope to serve you again. 🙏`,
+      `${footer}`,
+    ].join('\n'),
+
+    rejected: [
+      `🙏 *ஆர்டர் நிராகரிக்கப்பட்டது — ${orderNo}*`,
+      ``,
+      `வணக்கம் ${name},`,
+      ``,
+      `மிகவும் வருந்துகிறோம். உங்கள் ஆர்டரை நிறைவேற்ற இயலவில்லை.${cancelLine}`,
+      ``,
+      `💳 ஆன்லைனில் பணம் செலுத்தியிருந்தால், 5–7 வேலை நாட்களில் திரும்ப வரும்.`,
+      ``,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+      ``,
+      `❌ *Order Rejected — ${orderNo}*`,
+      ``,
+      `Dear ${name}, unfortunately we were unable to fulfil your order.${cancelLine}`,
+      ``,
+      `💳 If you paid online, your refund will be processed within 5–7 business days.`,
+      `We sincerely apologise and look forward to serving you again. 🙏`,
+      `${footer}`,
+    ].join('\n'),
+
+    refund_initiated: [
+      `💸 *பணத் திரும்பப் பெறுதல் தொடங்கியது — ${orderNo}*`,
+      ``,
+      `வணக்கம் ${name},`,
+      ``,
+      `₹${total} தொகை திரும்ப அனுப்பப்படும் செயல் தொடங்கியது.`,
+      `5–7 வேலை நாட்களில் உங்கள் கணக்கில் வரும்.`,
+      ``,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+      ``,
+      `💸 *Refund Initiated — ${orderNo}*`,
+      ``,
+      `Dear ${name}, your refund of ₹${total} has been initiated`,
+      `and will reach your account within 5–7 business days.`,
+      `${footer}`,
+    ].join('\n'),
+
+    refunded: [
+      `✅ *பணம் திரும்பி விட்டது — ${orderNo}*`,
+      ``,
+      `வணக்கம் ${name},`,
+      ``,
+      `₹${total} தொகை உங்கள் கணக்கில் வரவு வைக்கப்பட்டது. 🙏`,
+      ``,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+      ``,
+      `✅ *Refund Completed — ${orderNo}*`,
+      ``,
+      `Dear ${name}, your refund of ₹${total} is complete.`,
+      `The amount should now reflect in your account. 🙏`,
+      `${footer}`,
+    ].join('\n'),
   };
 
-  const text = msgMap[newStatus];
-  if (!text) return;
+  const caption = msgMap[newStatus];
+  if (!caption) return;
 
   try {
-    const res = await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
-      method:  'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        to:   phone,
-        type: 'text',
-        text: { body: text },
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) console.error('WA status notify error:', data?.error?.message);
+    // ── 1. Generate status card image ────────────────────────────────────────
+    let cardUrl = null;
+    try {
+      const html   = buildStatusCardHtml(order, newStatus, { cancelReason });
+      const pngBuf = await renderCardJpeg(html);
+      cardUrl      = await uploadCardImage(pngBuf, `status-${newStatus}-${orderNo}`);
+    } catch (imgErr) {
+      console.error('Status card image error:', imgErr.message);
+    }
+
+    // ── 2. Send image + caption (or plain text fallback) ─────────────────────
+    await sendViaBotSailor(phone, caption, cardUrl || undefined);
+
+    // ── 3. For confirmed/dispatched/delivered — send invoice PDF as follow-up ─
+    if (['confirmed', 'dispatched', 'delivered'].includes(newStatus)) {
+      try {
+        const pdfUrl = await generateInvoicePdfUrl(order);
+        if (pdfUrl) {
+          const invoiceCaption = `🧾 *Invoice — ${orderNo}*\n\nவிலைப்பட்டியல் / Your tax invoice is attached below.\n\n📥 Download: ${pdfUrl}\n\n🌐 sathvam.in · 📞 +91 70921 77092`;
+          await sendViaBotSailor(phone, invoiceCaption);
+        }
+      } catch (invErr) {
+        console.error('Invoice follow-up error:', invErr.message);
+      }
+    }
   } catch (e) {
     console.error('WA status notify error:', e.message);
   }
