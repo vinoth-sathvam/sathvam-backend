@@ -92,9 +92,9 @@ async function sendViaBotSailor(phone, message, imageUrl = SATHVAM_LOGO_URL) {
 async function sendWhatsAppAlert(order) {
   // Notify all configured admin numbers
   const adminNumbers = [
-    process.env.WA_NOTIFY_TO,         // primary (env var)
-    '918144803555',                    // Vinoth
-    '917092177092',                    // Sathvam WA business
+    process.env.WA_NOTIFY_TO,
+    process.env.WA_ADMIN_PHONE1,
+    process.env.WA_ADMIN_PHONE2,
   ].filter(Boolean).map(n => n.replace(/\D/g, '')).filter((v, i, a) => v && a.indexOf(v) === i);
 
   if (!adminNumbers.length) return;
@@ -146,7 +146,7 @@ async function sendCustomerOrderWhatsApp(order) {
 
   try {
     const ok = await sendViaBotSailor(phone, text);
-    if (!ok) console.error('Customer WA confirmation: BotSailor returned non-success for', phone);
+    if (!ok) console.error('Customer WA confirmation: BotSailor returned non-success for', phone.slice(0,4)+'****'+phone.slice(-3));
   } catch (e) {
     console.error('Customer WA confirmation error:', e.message);
   }
@@ -274,7 +274,7 @@ router.post('/verify', async (req, res) => {
       await sendOrderEmail(o, razorpay_payment_id);
 
       // WhatsApp confirmation to customer
-      await sendCustomerOrderWhatsApp(o);
+      await sendCustomerOrderWhatsApp({ ...o, orderNo: generatedOrderNo });
 
       // Invoice/confirmation email to customer
       await sendCustomerInvoice({ ...o, orderNo: generatedOrderNo }, razorpay_payment_id);

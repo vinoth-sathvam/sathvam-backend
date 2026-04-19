@@ -616,9 +616,11 @@ sales.post('/', auth, async (req, res) => {
   setImmediate(async () => {
     // ── Admin WhatsApp alert for new POS/local sale ───────────────────────────
     try {
-      const adminNumbers = ['918144803555', '917092177092',
-        ...(process.env.WA_NOTIFY_TO ? [process.env.WA_NOTIFY_TO.replace(/\D/g,'')] : []),
-      ].filter((v,i,a) => v && a.indexOf(v) === i);
+      const adminNumbers = [
+        process.env.WA_NOTIFY_TO,
+        process.env.WA_ADMIN_PHONE1,
+        process.env.WA_ADMIN_PHONE2,
+      ].filter(Boolean).map(n => n.replace(/\D/g,'')).filter((v,i,a) => v && a.indexOf(v) === i);
 
       const itemLines = (s.items || []).map(i => `  • ${i.productName} × ${i.qty}  ₹${i.total}`).join('\n');
       const alertText =

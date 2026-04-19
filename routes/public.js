@@ -1,7 +1,29 @@
 const express    = require('express');
+const http       = require('http');
 const supabase   = require('../config/supabase');
 const nodemailer = require('nodemailer');
 const router     = express.Router();
+
+// IP geolocation (shared with analytics.js — free ip-api.com, no key needed)
+const _geoCache = new Map();
+function geoIP(ip) {
+  if (!ip || ip === '::1' || ip.startsWith('127.') || ip.startsWith('192.168.') || ip.startsWith('10.')) return Promise.resolve(null);
+  if (_geoCache.has(ip)) return Promise.resolve(_geoCache.get(ip));
+  return new Promise(resolve => {
+    http.get(`http://ip-api.com/json/${ip}?fields=status,country,countryCode,city`, res => {
+      let d = '';
+      res.on('data', c => d += c);
+      res.on('end', () => {
+        try {
+          const j = JSON.parse(d);
+          const geo = j.status === 'success' ? { country: j.country, countryCode: j.countryCode, city: j.city } : null;
+          _geoCache.set(ip, geo);
+          resolve(geo);
+        } catch { resolve(null); }
+      });
+    }).on('error', () => resolve(null));
+  });
+}
 
 // Shared slug helper — keeps product URLs consistent with frontend toSlug()
 const toSlug = (name) => (name || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
@@ -654,9 +676,27 @@ router.post('/heartbeat', async (req, res) => {
     for (const [sid, s] of Object.entries(sessions)) {
       if (nowMs - new Date(s.ts).getTime() > 2 * 60 * 1000) delete sessions[sid];
     }
-    sessions[session_id] = { ts: now, page: page || '/' };
+    // Preserve existing geo if already set (avoid redundant lookups)
+    const existing = sessions[session_id] || {};
+    sessions[session_id] = { ts: now, page: page || '/', city: existing.city || null, country: existing.country || null, countryCode: existing.countryCode || null };
     await supabase.from('store_analytics').upsert({ key: 'live_sessions', data: sessions, updated_at: now }, { onConflict: 'key' });
     res.json({ ok: true, count: Object.keys(sessions).length });
+
+    // Geo lookup — fire after response, only if not already known for this session
+    if (!existing.city) {
+      const ip = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
+      geoIP(ip).then(async geo => {
+        if (!geo) return;
+        const { data: fresh } = await supabase.from('store_analytics').select('data').eq('key', 'live_sessions').maybeSingle();
+        const s2 = fresh?.data || {};
+        if (s2[session_id]) {
+          s2[session_id].city        = geo.city;
+          s2[session_id].country     = geo.country;
+          s2[session_id].countryCode = geo.countryCode;
+          await supabase.from('store_analytics').upsert({ key: 'live_sessions', data: s2, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+        }
+      }).catch(() => {});
+    }
   } catch { res.json({ ok: false }); }
 });
 
@@ -665,13 +705,22 @@ router.get('/live-count', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
   try {
     const { data } = await supabase.from('store_analytics').select('data').eq('key', 'live_sessions').maybeSingle();
-    if (!data?.data) return res.json({ count: 0, pages: {} });
+    if (!data?.data) return res.json({ count: 0, pages: {}, locations: [] });
     const nowMs = Date.now();
     const active = Object.entries(data.data).filter(([, s]) => nowMs - new Date(s.ts).getTime() < 2 * 60 * 1000);
     const pages = {};
     active.forEach(([, s]) => { const p = s.page || '/'; pages[p] = (pages[p] || 0) + 1; });
-    res.json({ count: active.length, pages });
-  } catch { res.json({ count: 0, pages: {} }); }
+    // Build location list (one entry per unique city+country combo)
+    const locMap = {};
+    active.forEach(([, s]) => {
+      if (!s.country) return;
+      const key = `${s.city || ''}|${s.country}`;
+      if (!locMap[key]) locMap[key] = { city: s.city || null, country: s.country, countryCode: s.countryCode || '', count: 0 };
+      locMap[key].count++;
+    });
+    const locations = Object.values(locMap).sort((a, b) => b.count - a.count);
+    res.json({ count: active.length, pages, locations });
+  } catch { res.json({ count: 0, pages: {}, locations: [] }); }
 });
 
 // GET /api/public/sitemap.xml — dynamic sitemap with all products + blog posts

@@ -455,11 +455,46 @@ router.post('/:id/send-whatsapp-invoice', auth, async (req, res) => {
     if (bsData.status !== '1' && bsData.status !== 1) {
       const msg   = bsData.message || 'BotSailor send failed';
       const is24h = msg.toLowerCase().includes('24 hour') || msg.toLowerCase().includes('template');
-      return res.status(400).json({
-        error: is24h
-          ? `WhatsApp 24h window expired — customer hasn't messaged your number recently. Use the "💬 Send WhatsApp" button to send manually instead.`
-          : msg,
-      });
+
+      if (is24h) {
+        // ── 3b. Fallback: send via BotSailor template (bypasses 24h window) ──
+        const tplId = process.env.BOTSAILOR_INVOICE_TEMPLATE_ID;
+        if (!tplId) {
+          return res.status(400).json({
+            error: `WhatsApp 24h window expired. Set BOTSAILOR_INVOICE_TEMPLATE_ID in env to enable auto-fallback to template sending.`,
+          });
+        }
+        const tplParams = new URLSearchParams({
+          apiToken:          token,
+          phoneNumberID:     phoneId,
+          botTemplateID:     tplId,
+          sendToPhoneNumber: phone,
+          'templateVariable-order_no':   o.order_no || '',
+          'templateVariable-name':       cust.name  || 'Customer',
+          'templateVariable-total':      `₹${total.toFixed(2)}`,
+          'templateVariable-pdf_url':    pdfUrl,
+        });
+        const tplRes  = await fetch(`https://botsailor.com/api/v1/whatsapp/send/template?${tplParams.toString()}`, { method: 'POST' });
+        const tplData = await tplRes.json();
+        if (tplData.status !== '1' && tplData.status !== 1) {
+          return res.status(400).json({ error: tplData.message || 'Template send failed' });
+        }
+
+        await supabase.from('whatsapp_messages').insert({
+          phone,
+          contact_name: `${cust.name || ''} | ${o.order_no}`,
+          direction:    'outbound',
+          type:         'template',
+          content:      message,
+          status:       'sent',
+          sent_by:      `invoice:${o.order_no}`,
+          timestamp:    new Date().toISOString(),
+        });
+
+        return res.json({ success: true, phone, pdfUrl, via: 'template' });
+      }
+
+      return res.status(400).json({ error: msg });
     }
 
     // ── 4. Log the sent message ──────────────────────────────────────────────

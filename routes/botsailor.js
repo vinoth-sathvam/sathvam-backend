@@ -168,9 +168,62 @@ async function saveHistory(phone, messages) {
   } catch (e) { console.error('BS saveHistory error:', e.message); }
 }
 
+// ── WhatsApp 5% coupon generator ──────────────────────────────────────────────
+async function getOrCreateWACoupon(phone) {
+  const tag = `wa_coupon:${phone}`;
+  // Check if already issued for this phone
+  const { data: existing } = await supabase
+    .from('coupons')
+    .select('code')
+    .eq('description', tag)
+    .eq('active', true)
+    .maybeSingle();
+  if (existing) return { code: existing.code, isNew: false };
+
+  // Generate unique code: WA5-XXXXXX
+  const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
+  const code = `WA5-${rand}`;
+  const expires = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(); // 30 days
+  await supabase.from('coupons').insert({
+    code,
+    type:        'percent',
+    value:       5,
+    min_order:   0,
+    max_uses:    1,
+    uses_count:  0,
+    expires_at:  expires,
+    description: tag,
+    active:      true,
+  });
+  return { code, isNew: true };
+}
+
 // ── Keyword router ────────────────────────────────────────────────────────────
 async function keywordReply(text, phone) {
   const t = text.trim();
+
+  // "Hi Sathvam" — WhatsApp offer coupon
+  if (/^hi\s+sathvam$/i.test(t)) {
+    try {
+      const { code, isNew } = await getOrCreateWACoupon(phone);
+      if (isNew) {
+        return `🎉 *நன்றி! Thank you for connecting with Sathvam!*\n\n` +
+          `Here's your exclusive *5% OFF* coupon 🎁\n\n` +
+          `🏷️ Code: *${code}*\n\n` +
+          `✅ Valid for 30 days · One-time use\n` +
+          `💰 Apply at checkout on *sathvam.in*\n\n` +
+          `🛒 Shop now: https://sathvam.in`;
+      } else {
+        return `😊 *Your 5% OFF coupon is already ready!*\n\n` +
+          `🏷️ Code: *${code}*\n\n` +
+          `Apply at checkout on *sathvam.in* 🛒\n` +
+          `https://sathvam.in`;
+      }
+    } catch (e) {
+      console.error('WA coupon error:', e.message);
+      return `🎉 Thanks for reaching out! Shop at https://sathvam.in 🌿\nReply *PRODUCTS* to see our range.`;
+    }
+  }
 
   // Greeting / menu
   if (/^(hi|hello|hey|start|menu|help|வணக்கம்|ஹலோ)$/i.test(t)) {
@@ -418,6 +471,12 @@ router.post('/broadcast-social', async (req, res) => {
 // POST /api/botsailor/webhook  — BotSailor sends incoming WhatsApp messages here
 // ─────────────────────────────────────────────────────────────────────────────
 router.post('/webhook', async (req, res) => {
+  // Verify BotSailor secret if configured
+  const webhookSecret = process.env.BOTSAILOR_WEBHOOK_SECRET;
+  if (webhookSecret && req.headers['x-botsailor-secret'] !== webhookSecret) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
   // Respond 200 immediately so BotSailor doesn't retry
   res.status(200).json({ status: '1', message: 'ok' });
 
@@ -479,9 +538,7 @@ router.post('/webhook', async (req, res) => {
       timestamp:     new Date().toISOString(),
     });
 
-    if (!AI_REPLIES_ENABLED) return;
-
-    // 1. Keyword shortcut
+    // 1. Keyword shortcuts — always run regardless of AI_REPLIES_ENABLED
     const kwReply = await keywordReply(last_message, phone);
     if (kwReply) {
       await sendReply(phone, kwReply);
@@ -497,7 +554,9 @@ router.post('/webhook', async (req, res) => {
       return;
     }
 
-    // 2. AI reply
+    // 2. AI reply — only if enabled
+    if (!AI_REPLIES_ENABLED) return;
+
     const history    = await loadHistory(phone);
     const productCtx = await getProductContext();
 
@@ -540,6 +599,72 @@ ${productCtx}`,
 
   } catch (e) {
     console.error('BotSailor webhook error:', e.message);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/botsailor/webhook/outgoing  — BotSailor notifies us when an outbound
+// message is sent/delivered/read/failed. Updates status in whatsapp_messages.
+// Configure in BotSailor: Outgoing Webhook URL → https://api.sathvam.in/api/botsailor/webhook/outgoing
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/webhook/outgoing', async (req, res) => {
+  res.status(200).json({ status: '1', message: 'ok' });
+
+  try {
+    const secret = process.env.BOTSAILOR_WEBHOOK_SECRET;
+    if (secret && req.headers['x-botsailor-secret'] !== secret) return;
+
+    const {
+      subscriber_phone: rawPhone,
+      subscriber_id,
+      subscriber_name,
+      last_message,
+      message_type,
+      message_status, // sent | delivered | read | failed
+    } = req.body;
+
+    const phone = (rawPhone || '').replace(/\D/g, '');
+    if (!phone) return;
+
+    const status = (message_status || 'sent').toLowerCase();
+
+    // Update the most recent matching outbound message status
+    if (last_message) {
+      await supabase
+        .from('whatsapp_messages')
+        .update({ status })
+        .eq('phone', phone)
+        .eq('direction', 'outbound')
+        .eq('content', last_message)
+        .order('timestamp', { ascending: false })
+        .limit(1);
+    }
+
+    // Also store as a log entry if it's a new outbound message we don't have yet
+    if (status === 'sent' && last_message) {
+      const { count } = await supabase
+        .from('whatsapp_messages')
+        .select('id', { count: 'exact', head: true })
+        .eq('phone', phone)
+        .eq('direction', 'outbound')
+        .eq('content', last_message);
+
+      if (!count) {
+        await storeMessage({
+          phone,
+          subscriber_id: subscriber_id || null,
+          contact_name:  subscriber_name || null,
+          direction:     'outbound',
+          type:          message_type || 'text',
+          content:       last_message,
+          status:        'sent',
+          sent_by:       'botsailor',
+          timestamp:     new Date().toISOString(),
+        });
+      }
+    }
+  } catch (e) {
+    console.error('BotSailor outgoing webhook error:', e.message);
   }
 });
 
