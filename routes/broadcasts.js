@@ -27,6 +27,9 @@ const supabase       = require('../config/supabase');
 const { auth }       = require('../middleware/auth');
 const { decrypt }    = require('../config/crypto');
 
+// In-memory broadcast progress store (broadcastId → { sent, failed, skipped, total, done, error })
+const broadcastProgress = new Map();
+
 // Embed logo as base64 so wkhtmltoimage doesn't need network access
 const LOGO_PATH = path.join(__dirname, '../../sathvam-frontend/sathvam-vercel/public/logo.jpg');
 const LOGO_URL  = fs.existsSync(LOGO_PATH) ? `data:image/jpeg;base64,${fs.readFileSync(LOGO_PATH).toString('base64')}` : '';
@@ -548,13 +551,17 @@ async function sendViaBotSailor(phone, message, imageUrl = null) {
   return d.status === '1' || d.status === 1;
 }
 
-async function broadcastToAllCustomers(message, imageUrl = null, broadcastMeta = {}) {
+async function broadcastToAllCustomers(message, imageUrl = null, broadcastMeta = {}, broadcastId = null) {
   const { data: customers } = await supabase
     .from('customers').select('id, name, phone').not('phone', 'is', null);
 
-  const broadcastId = `bc_${Date.now()}`;
-  const sentAt      = new Date().toISOString();
-  const logs        = [];
+  if (!broadcastId) broadcastId = `bc_${Date.now()}`;
+  const sentAt = new Date().toISOString();
+  const logs   = [];
+  const total  = (customers || []).length;
+
+  // Initialise progress
+  broadcastProgress.set(broadcastId, { sent: 0, failed: 0, skipped: 0, total, done: false });
 
   let sent = 0, failed = 0, skipped = 0;
   for (const cust of customers || []) {
@@ -564,6 +571,7 @@ async function broadcastToAllCustomers(message, imageUrl = null, broadcastMeta =
         try { raw = decrypt(raw); } catch {
           skipped++;
           logs.push({ broadcast_id: broadcastId, customer_id: cust.id, customer_name: cust.name || null, phone: null, status: 'skipped', reason: 'decrypt_error', sent_at: sentAt, ...broadcastMeta });
+          broadcastProgress.set(broadcastId, { sent, failed, skipped, total, done: false });
           continue;
         }
       }
@@ -571,16 +579,19 @@ async function broadcastToAllCustomers(message, imageUrl = null, broadcastMeta =
       if (digits.length < 10) {
         skipped++;
         logs.push({ broadcast_id: broadcastId, customer_id: cust.id, customer_name: cust.name || null, phone: digits || null, status: 'skipped', reason: 'invalid_phone', sent_at: sentAt, ...broadcastMeta });
+        broadcastProgress.set(broadcastId, { sent, failed, skipped, total, done: false });
         continue;
       }
       const phone = digits.length === 10 ? `91${digits}` : digits;
       const ok = await sendViaBotSailor(phone, message, imageUrl);
       if (ok) { sent++; logs.push({ broadcast_id: broadcastId, customer_id: cust.id, customer_name: cust.name || null, phone, status: 'sent', sent_at: sentAt, ...broadcastMeta }); }
       else     { failed++; logs.push({ broadcast_id: broadcastId, customer_id: cust.id, customer_name: cust.name || null, phone, status: 'failed', reason: 'botsailor_error', sent_at: sentAt, ...broadcastMeta }); }
+      broadcastProgress.set(broadcastId, { sent, failed, skipped, total, done: false });
       await new Promise(r => setTimeout(r, 333)); // 3/sec throttle
     } catch(e) {
       failed++;
       logs.push({ broadcast_id: broadcastId, customer_id: cust.id, customer_name: cust.name || null, phone: null, status: 'failed', reason: String(e.message || 'unknown'), sent_at: sentAt, ...broadcastMeta });
+      broadcastProgress.set(broadcastId, { sent, failed, skipped, total, done: false });
     }
   }
 
@@ -589,7 +600,12 @@ async function broadcastToAllCustomers(message, imageUrl = null, broadcastMeta =
     await supabase.from('broadcast_logs').insert(logs.slice(i, i + 100)).catch(() => {});
   }
 
-  return { sent, failed, skipped, total: (customers || []).length, broadcast_id: broadcastId };
+  // Mark done
+  broadcastProgress.set(broadcastId, { sent, failed, skipped, total, done: true });
+  // Auto-clean after 1 hour
+  setTimeout(() => broadcastProgress.delete(broadcastId), 3600000);
+
+  return { sent, failed, skipped, total, broadcast_id: broadcastId };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -692,6 +708,82 @@ router.get('/today', auth, async (req, res) => {
   }
 });
 
+// GET /api/broadcasts/progress/:broadcastId — real-time progress for a running broadcast
+router.get('/progress/:broadcastId', auth, (req, res) => {
+  const p = broadcastProgress.get(req.params.broadcastId);
+  if (!p) return res.status(404).json({ error: 'Not found' });
+  res.json(p);
+});
+
+// POST /api/broadcasts/welcome/preview — send card preview to admin WA
+router.post('/welcome/preview', auth, async (req, res) => {
+  try {
+    const adminPhone = (process.env.WA_NOTIFY_TO || '').replace(/\D/g, '');
+    if (!adminPhone) return res.status(500).json({ error: 'WA_NOTIFY_TO not set' });
+
+    const cardHtml = buildWelcomeCardHtml();
+    let cardUrl = null;
+    try {
+      const buf = await renderCardJpeg(cardHtml);
+      cardUrl   = await uploadCardImage(buf, 'welcome-relaunch');
+    } catch (e) {
+      console.error('Welcome card render error:', e.message);
+    }
+
+    await sendViaBotSailor(adminPhone, `👀 *PREVIEW — Welcome Re-launch Blast*\n\nReview and click "Broadcast Now" to send to all customers.\n\n---\n${WELCOME_MESSAGE}`, cardUrl);
+    res.json({ ok: true, card_url: cardUrl });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/broadcasts/welcome/broadcast — send to ALL customers (async, returns broadcastId immediately)
+router.post('/welcome/broadcast', auth, async (req, res) => {
+  const broadcastId = `bc_${Date.now()}`;
+  broadcastProgress.set(broadcastId, { sent: 0, failed: 0, skipped: 0, total: 0, done: false, preparing: true });
+  res.json({ ok: true, broadcast_id: broadcastId, status: 'started' });
+
+  // Run broadcast in background
+  (async () => {
+    try {
+      const cardHtml = buildWelcomeCardHtml();
+      let cardUrl = null;
+      try {
+        const buf = await renderCardJpeg(cardHtml);
+        cardUrl   = await uploadCardImage(buf, 'welcome-relaunch');
+      } catch (e) {
+        console.error('Welcome card render error:', e.message);
+      }
+      const p = broadcastProgress.get(broadcastId) || {};
+      broadcastProgress.set(broadcastId, { ...p, preparing: false });
+
+      const result = await broadcastToAllCustomers(WELCOME_MESSAGE, cardUrl, {
+        message_type: 'welcome',
+        triggered_by: req.user?.name || 'admin',
+      }, broadcastId);
+
+      await supabase.from('settings').upsert({
+        key:   'welcome_blast',
+        value: { sent_at: new Date().toISOString(), card_url: cardUrl, ...result, triggered_by: req.user?.name },
+      });
+    } catch (e) {
+      console.error('Welcome broadcast error:', e.message);
+      const p = broadcastProgress.get(broadcastId) || {};
+      broadcastProgress.set(broadcastId, { ...p, done: true, error: e.message });
+    }
+  })();
+});
+
+// GET /api/broadcasts/welcome/status — has the welcome blast been sent?
+router.get('/welcome/status', auth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'welcome_blast').single();
+    res.json(data?.value || null);
+  } catch (e) {
+    res.json(null);
+  }
+});
+
 // POST /api/broadcasts/:type/send-preview — send preview to admin WA
 router.post('/:type/send-preview', auth, async (req, res) => {
   const { type } = req.params;
@@ -739,40 +831,50 @@ router.post('/:type/send-preview', auth, async (req, res) => {
   }
 });
 
-// POST /api/broadcasts/:type/broadcast — direct broadcast from UI
+// POST /api/broadcasts/:type/broadcast — direct broadcast from UI (async, returns broadcastId immediately)
 router.post('/:type/broadcast', auth, async (req, res) => {
   const { type } = req.params;
   if (!['morning', 'afternoon', 'night'].includes(type))
     return res.status(400).json({ error: 'Invalid type' });
 
-  try {
-    let content;
-    if (type === 'morning')   content = buildMorningMessage();
-    if (type === 'afternoon') content = await buildAfternoonMessage();
-    if (type === 'night')     content = buildNightMessage();
+  const broadcastId = `bc_${Date.now()}`;
+  broadcastProgress.set(broadcastId, { sent: 0, failed: 0, skipped: 0, total: 0, done: false, preparing: true });
+  res.json({ success: true, type, broadcast_id: broadcastId, status: 'started' });
 
-    // Generate card image if this broadcast type has one
-    let cardUrl = null;
-    if (content.cardHtml) {
-      try {
-        const buf = await renderCardJpeg(content.cardHtml);
-        cardUrl   = await uploadCardImage(buf, content.cardPrefix || type);
-      } catch (imgErr) {
-        console.error('Broadcast card image error:', imgErr.message);
+  // Run broadcast in background
+  (async () => {
+    try {
+      let content;
+      if (type === 'morning')   content = buildMorningMessage();
+      if (type === 'afternoon') content = await buildAfternoonMessage();
+      if (type === 'night')     content = buildNightMessage();
+
+      // Generate card image if this broadcast type has one
+      let cardUrl = null;
+      if (content.cardHtml) {
+        try {
+          const buf = await renderCardJpeg(content.cardHtml);
+          cardUrl   = await uploadCardImage(buf, content.cardPrefix || type);
+        } catch (imgErr) {
+          console.error('Broadcast card image error:', imgErr.message);
+        }
       }
+
+      const p = broadcastProgress.get(broadcastId) || {};
+      broadcastProgress.set(broadcastId, { ...p, preparing: false });
+
+      const result = await broadcastToAllCustomers(content.preview, cardUrl, { message_type: type, triggered_by: req.user?.name || 'admin' }, broadcastId);
+
+      await supabase.from('settings').upsert({
+        key:   settingsKey(type),
+        value: { ...content, cardHtml: undefined, status: 'broadcast', broadcast_at: new Date().toISOString(), card_url: cardUrl, ...result },
+      });
+    } catch (e) {
+      console.error(`Broadcast ${type} error:`, e.message);
+      const p = broadcastProgress.get(broadcastId) || {};
+      broadcastProgress.set(broadcastId, { ...p, done: true, error: e.message });
     }
-
-    const result = await broadcastToAllCustomers(content.preview, cardUrl, { message_type: type, triggered_by: req.user?.name || 'admin' });
-
-    await supabase.from('settings').upsert({
-      key:   settingsKey(type),
-      value: { ...content, cardHtml: undefined, status: 'broadcast', broadcast_at: new Date().toISOString(), card_url: cardUrl, ...result },
-    });
-
-    res.json({ success: true, type, card_url: cardUrl, ...result });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  })();
 });
 
 // POST /api/broadcasts/:type/approve-from-wa — called by botsailor webhook
@@ -893,66 +995,5 @@ _Your Way to a Healthier Life — *Sathvam*_
 
 🌐 *sathvam.in*
 📞 +91 70921 77092`;
-
-// POST /api/broadcasts/welcome/preview — send card preview to admin WA
-router.post('/welcome/preview', auth, async (req, res) => {
-  try {
-    const adminPhone = (process.env.WA_NOTIFY_TO || '').replace(/\D/g, '');
-    if (!adminPhone) return res.status(500).json({ error: 'WA_NOTIFY_TO not set' });
-
-    const cardHtml = buildWelcomeCardHtml();
-    let cardUrl = null;
-    try {
-      const buf = await renderCardJpeg(cardHtml);
-      cardUrl   = await uploadCardImage(buf, 'welcome-relaunch');
-    } catch (e) {
-      console.error('Welcome card render error:', e.message);
-    }
-
-    await sendViaBotSailor(adminPhone, `👀 *PREVIEW — Welcome Re-launch Blast*\n\nReview and click "Broadcast Now" to send to all customers.\n\n---\n${WELCOME_MESSAGE}`, cardUrl);
-    res.json({ ok: true, card_url: cardUrl });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// POST /api/broadcasts/welcome/broadcast — send to ALL customers
-router.post('/welcome/broadcast', auth, async (req, res) => {
-  try {
-    const cardHtml = buildWelcomeCardHtml();
-    let cardUrl = null;
-    try {
-      const buf = await renderCardJpeg(cardHtml);
-      cardUrl   = await uploadCardImage(buf, 'welcome-relaunch');
-    } catch (e) {
-      console.error('Welcome card render error:', e.message);
-    }
-
-    const result = await broadcastToAllCustomers(WELCOME_MESSAGE, cardUrl, {
-      message_type: 'welcome',
-      triggered_by: req.user?.name || 'admin',
-    });
-
-    // Record that we sent the welcome blast so the UI can show it was done
-    await supabase.from('settings').upsert({
-      key:   'welcome_blast',
-      value: { sent_at: new Date().toISOString(), card_url: cardUrl, ...result, triggered_by: req.user?.name },
-    });
-
-    res.json({ ok: true, card_url: cardUrl, ...result });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// GET /api/broadcasts/welcome/status — has the welcome blast been sent?
-router.get('/welcome/status', auth, async (req, res) => {
-  try {
-    const { data } = await supabase.from('settings').select('value').eq('key', 'welcome_blast').single();
-    res.json(data?.value || null);
-  } catch (e) {
-    res.json(null);
-  }
-});
 
 module.exports = router;
