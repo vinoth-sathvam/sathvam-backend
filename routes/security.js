@@ -894,12 +894,139 @@ router.get('/metrics', ...adminOrCeo, async (req, res) => {
   try {
     const ctrl = new AbortController();
     setTimeout(() => ctrl.abort(), 8000);
-    const r = await fetch('http://127.0.0.1:9191/metrics', { signal: ctrl.signal });
+    const monitorHost = process.env.MONITOR_API_HOST || '172.17.0.1';
+    const r = await fetch(`http://${monitorHost}:9191/metrics`, { signal: ctrl.signal });
     if (!r.ok) return res.status(502).json({ error: `Monitor API returned ${r.status}` });
     const data = await r.json();
     res.json(data);
   } catch (e) {
     res.status(503).json({ error: 'Monitor API unreachable', detail: e.message });
+  }
+});
+
+// ── GET /api/security/ai-agents — status of all AI agents ────────────────────
+router.get('/ai-agents', ...adminOrCeo, async (req, res) => {
+  const apiKeySet = !!process.env.ANTHROPIC_API_KEY;
+  const waAiEnabled = process.env.WHATSAPP_AI_REPLIES !== 'false';
+
+  // Recent chat session stats
+  let chatSessions = 0, lastChatAt = null;
+  try {
+    const [countRes, lastRes] = await Promise.all([
+      supabase.from('chat_sessions').select('id', { count: 'exact', head: true }),
+      supabase.from('chat_sessions').select('updated_at').order('updated_at', { ascending: false }).limit(1),
+    ]);
+    chatSessions = countRes.count || 0;
+    lastChatAt   = lastRes.data?.[0]?.updated_at || null;
+  } catch { /**/ }
+
+  // Scheduled blog timers status
+  let blogEnTimer = null, blogTaTimer = null;
+  try {
+    const { stdout } = await execAsync("systemctl is-active sathvam-blog-en.timer sathvam-blog-ta.timer 2>/dev/null || true");
+    const lines = stdout.trim().split('\n');
+    blogEnTimer = lines[0] === 'active';
+    blogTaTimer = lines[1] === 'active';
+  } catch { /**/ }
+
+  const agents = [
+    {
+      id: 'customer-chat',
+      name: 'Customer Chat',
+      description: 'Live AI chat on sathvam.in — answers product & order questions',
+      model: 'claude-sonnet-4-6',
+      enabled: apiKeySet,
+      stat: `${chatSessions} total sessions`,
+      lastUsed: lastChatAt,
+    },
+    {
+      id: 'admin-assistant',
+      name: 'Admin AI Assistant',
+      description: 'Morning briefings, stock alerts, Q&A for admin panel',
+      model: 'claude-sonnet-4-6',
+      enabled: apiKeySet,
+      stat: null,
+      lastUsed: null,
+    },
+    {
+      id: 'monitor-agent',
+      name: 'IT Monitor Agent',
+      description: 'Daily security scan — checks SSL, auth, OWASP, APIs',
+      model: 'claude-opus-4-6',
+      enabled: apiKeySet,
+      stat: null,
+      lastUsed: null,
+    },
+    {
+      id: 'whatsapp-ai',
+      name: 'WhatsApp Auto-Reply',
+      description: 'Replies to customer WhatsApp messages via BotSailor',
+      model: 'claude-sonnet-4-6',
+      enabled: apiKeySet && waAiEnabled,
+      stat: waAiEnabled ? 'Active' : 'Disabled (WHATSAPP_AI_REPLIES=false)',
+      lastUsed: null,
+    },
+    {
+      id: 'social-content',
+      name: 'Social Media Writer',
+      description: 'Generates Instagram/Facebook/Twitter captions for products',
+      model: 'claude-haiku-4-5',
+      enabled: apiKeySet,
+      stat: 'On-demand',
+      lastUsed: null,
+    },
+    {
+      id: 'blog-writer',
+      name: 'Blog Writer',
+      description: 'Weekly auto-generates English + Tamil blog posts',
+      model: 'claude-sonnet-4-6',
+      enabled: apiKeySet,
+      stat: blogEnTimer ? 'Timer active' : 'Timer inactive',
+      lastUsed: null,
+    },
+    {
+      id: 'tts',
+      name: 'Text-to-Speech',
+      description: 'Converts product descriptions to audio (Tamil/English)',
+      model: 'claude-tts',
+      enabled: apiKeySet,
+      stat: 'On-demand',
+      lastUsed: null,
+    },
+    {
+      id: 'docker-agent',
+      name: 'Docker Agent',
+      description: 'Monitors containers every 5 min — health, restarts, CPU/mem, AI root-cause analysis',
+      model: 'claude-haiku-4-5',
+      enabled: apiKeySet,
+      stat: 'Every 5 min',
+      lastUsed: null,
+    },
+  ];
+
+  res.json({
+    apiKeyConfigured: apiKeySet,
+    totalAgents: agents.length,
+    enabledCount: agents.filter(a => a.enabled).length,
+    agents,
+  });
+});
+
+// ── GET /api/security/docker-agent — latest Docker agent report ───────────────
+router.get('/docker-agent', ...adminOrCeo, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('settings')
+      .select('value, updated_at')
+      .eq('key', 'docker_report_latest')
+      .single();
+
+    if (error || !data) {
+      return res.json({ error: 'No Docker agent report yet. Agent runs every 5 minutes.' });
+    }
+    res.json({ ...data.value, fetchedAt: data.updated_at });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 
