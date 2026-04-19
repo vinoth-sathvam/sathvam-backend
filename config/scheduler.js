@@ -288,7 +288,75 @@ function startScheduler() {
     } catch(e) { console.error('Monitor agent scheduler error:', e.message); }
   });
 
-  console.log('Scheduler started — weekly report Mon 8 AM, daily reminders 9 AM / 1:30 PM / 7 PM IST, monitor agent 9 AM IST');
+  // ── Low Stock Alert: 8:00 AM IST (2:30 AM UTC) daily ─────────────────────
+  cron.schedule('30 2 * * *', async () => {
+    try {
+      // Get finished goods stock levels
+      const { data: products } = await supabase
+        .from('products').select('id,name,sku').eq('active', true);
+      if (!products?.length) return;
+
+      const { data: stockData } = await supabase
+        .from('stock_ledger').select('product_id,type,qty');
+      const stock = {};
+      (stockData || []).forEach(r => {
+        if (!stock[r.product_id]) stock[r.product_id] = 0;
+        stock[r.product_id] += r.type === 'IN' ? Number(r.qty) : -Number(r.qty);
+      });
+
+      const LOW_THRESHOLD = 20; // units
+      const CRITICAL_THRESHOLD = 5;
+
+      const critical = products.filter(p => (stock[p.id] || 0) <= CRITICAL_THRESHOLD);
+      const low      = products.filter(p => (stock[p.id] || 0) > CRITICAL_THRESHOLD && (stock[p.id] || 0) <= LOW_THRESHOLD);
+
+      if (critical.length === 0 && low.length === 0) return;
+
+      const contacts = await getManagerContacts();
+      if (!contacts.length) return;
+
+      // Email alert
+      const rows = [
+        ...critical.map(p => `<tr><td style="padding:8px 12px;color:#1f2937;font-weight:700;">${p.name}</td><td style="padding:8px 12px;color:#dc2626;font-weight:800;">${stock[p.id] || 0} units</td><td style="padding:8px 12px;"><span style="background:#fee2e2;color:#dc2626;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700;">CRITICAL</span></td></tr>`),
+        ...low.map(p     => `<tr><td style="padding:8px 12px;color:#1f2937;">${p.name}</td><td style="padding:8px 12px;color:#d97706;font-weight:700;">${stock[p.id] || 0} units</td><td style="padding:8px 12px;"><span style="background:#fef3c7;color:#d97706;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700;">LOW</span></td></tr>`),
+      ].join('');
+
+      const html = `
+<div style="font-family:sans-serif;max-width:560px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e5e7eb;">
+  <div style="background:linear-gradient(135deg,${critical.length>0?'#7f1d1d,#991b1b':'#78350f,#92400e'});padding:18px 24px;">
+    <h2 style="color:#fff;margin:0;font-size:17px;">${critical.length>0?'🔴 Critical':'⚠️ Low'} Stock Alert — ${new Date().toLocaleDateString('en-IN',{timeZone:'Asia/Kolkata'})}</h2>
+    <div style="color:${critical.length>0?'#fca5a5':'#fcd34d'};font-size:12px;margin-top:4px;">${critical.length} critical · ${low.length} low stock products</div>
+  </div>
+  <div style="padding:20px 24px;">
+    <table style="width:100%;border-collapse:collapse;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
+      <thead><tr style="background:#f9fafb;"><th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280;">Product</th><th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280;">Stock</th><th style="padding:8px 12px;text-align:left;font-size:12px;color:#6b7280;">Status</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <a href="https://admin.sathvam.in" style="display:inline-block;margin-top:16px;background:#1f2937;color:#fff;padding:10px 22px;border-radius:8px;text-decoration:none;font-size:13px;font-weight:700;">View Raw Stock →</a>
+  </div>
+</div>`;
+
+      const toList = contacts.filter(c => c.email).map(c => c.email);
+      if (toList.length > 0) {
+        await mailer.sendMail({
+          from:    process.env.SMTP_FROM || 'Sathvam <noreply@sathvam.in>',
+          to:      toList.join(','),
+          subject: `${critical.length > 0 ? '🔴 CRITICAL' : '⚠️ Low'} Stock Alert — ${critical.length + low.length} product(s) need restocking`,
+          html,
+        });
+      }
+
+      // WhatsApp alert for critical items
+      if (critical.length > 0) {
+        const msg = `🔴 *CRITICAL Stock Alert*\n\nThe following products are almost out of stock:\n\n${critical.map(p=>`• ${p.name}: *${stock[p.id]||0} units*`).join('\n')}\n\nPlease place procurement orders immediately.\n\nhttps://admin.sathvam.in`;
+        for (const c of contacts.filter(x => x.phone)) await sendWhatsApp(c.phone, msg);
+      }
+
+      console.log(`Low-stock alert sent — ${critical.length} critical, ${low.length} low`);
+    } catch (e) { console.error('Low stock alert failed:', e.message); }
+  });
+
+  console.log('Scheduler started — weekly report Mon 8 AM, daily reminders 9 AM / 1:30 PM / 7 PM IST, monitor agent 9 AM IST, low-stock 8 AM IST');
 }
 
 module.exports = { startScheduler, buildWeeklyReport, checkDailyTasks, sendReminders };

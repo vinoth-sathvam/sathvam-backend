@@ -1043,19 +1043,69 @@ router.post('/corporate-inquiry', async (req, res) => {
   } catch { res.json({ ok: true }); }
 });
 
-// POST /api/public/back-in-stock — email notification request
-router.post('/back-in-stock', async (req, res) => {
+// POST /api/public/notify-me — subscribe to back-in-stock email for a product
+router.post('/notify-me', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
   try {
-    const { email, productName } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email required' });
-    await mailer.sendMail({
-      from: process.env.SMTP_FROM, to: process.env.SMTP_USER,
-      subject: `📦 Back-in-Stock Alert — ${productName}`,
-      html: `<p><strong>${email}</strong> wants to be notified when <strong>${productName}</strong> is back in stock.</p>`,
+    const { email, name, product_id, productName } = req.body;
+    if (!email || !product_id) return res.status(400).json({ error: 'Email and product_id required' });
+    const normEmail = email.toLowerCase().trim();
+
+    // Validate product exists
+    const { data: product } = await supabase.from('products').select('id,name').eq('id', product_id).maybeSingle();
+    if (!product) return res.status(404).json({ error: 'Product not found' });
+
+    // Save to stock_notify table (upsert — silent if already subscribed)
+    const { error: dbErr } = await supabase.from('stock_notify').upsert(
+      { product_id, email: normEmail, name: name || null },
+      { onConflict: 'product_id,email', ignoreDuplicates: true }
+    );
+    if (dbErr && !dbErr.message.includes('does not exist')) {
+      console.error('stock_notify upsert error:', dbErr.message);
+    }
+
+    // Send confirmation email to subscriber
+    setImmediate(async () => {
+      try {
+        await mailer.sendMail({
+          from: process.env.SMTP_FROM || `Sathvam <${process.env.SMTP_USER}>`,
+          to: normEmail,
+          subject: `We'll notify you when ${product.name} is back in stock`,
+          html: `
+<div style="font-family:sans-serif;max-width:500px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e5e7eb;">
+  <div style="background:linear-gradient(135deg,#14532d,#166534);padding:20px 24px;">
+    <h2 style="color:#fff;margin:0;font-size:17px;">Sathvam Cold Pressed Oils</h2>
+  </div>
+  <div style="padding:24px;">
+    <h3 style="margin:0 0 12px;color:#1f2937;">You're on the list! ✅</h3>
+    <p style="margin:0 0 16px;color:#6b7280;font-size:14px;line-height:1.6;">
+      Hi${name ? ' ' + name.split(' ')[0] : ''}! We've noted your interest in <strong style="color:#1f2937;">${product.name}</strong>.
+      We'll send you an email the moment it's back in stock.
+    </p>
+    <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:14px 18px;font-size:13px;color:#166534;">
+      <strong>Product:</strong> ${product.name}<br>
+      <strong>Your email:</strong> ${normEmail}
+    </div>
+    <p style="margin:16px 0 0;font-size:12px;color:#9ca3af;">
+      In the meantime, explore our other products at <a href="https://sathvam.in" style="color:#16a34a;">sathvam.in</a>
+    </p>
+  </div>
+</div>`,
+        });
+      } catch (e) { console.error('notify-me confirmation email failed:', e.message); }
     });
-    res.json({ ok: true });
-  } catch { res.json({ ok: true }); }
+
+    res.json({ ok: true, message: `We'll email you at ${normEmail} when ${product.name} is back in stock.` });
+  } catch (e) {
+    console.error('notify-me error:', e.message);
+    res.json({ ok: true }); // Always succeed silently to UX
+  }
+});
+
+// Keep backward-compat alias
+router.post('/back-in-stock', (req, res) => {
+  req.url = '/notify-me';
+  router.handle(req, res, () => {});
 });
 
 // GET /api/public/store-config — lightweight config for the webstore (no auth needed)

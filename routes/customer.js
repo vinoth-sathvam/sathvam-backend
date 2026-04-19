@@ -18,8 +18,20 @@ const mailer = nodemailer.createTransport({
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) { console.error('FATAL: JWT_SECRET not set'); process.exit(1); }
 
+// Cookie options for customer JWT (httpOnly — XSS-safe)
+const CUST_COOKIE_OPTS = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === 'production',
+  sameSite: 'strict',
+  maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+};
+function setCustCookie(res, token) {
+  res.cookie('sathvam_cust', token, CUST_COOKIE_OPTS);
+}
+
+// Auth middleware — reads httpOnly cookie first, falls back to Bearer header (mobile apps)
 const custAuth = (req, res, next) => {
-  const token = (req.headers.authorization || '').replace('Bearer ', '');
+  const token = req.cookies?.sathvam_cust || (req.headers.authorization || '').replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
   try { req.customer = jwt.verify(token, JWT_SECRET); next(); }
   catch { res.status(401).json({ error: 'Session expired. Please login again.' }); }
@@ -48,6 +60,7 @@ router.post('/signup', async (req, res) => {
     if (error) return res.status(400).json({ error: error.message });
     const plain = decryptCustomer(cust);
     const token = jwt.sign({ id: plain.id, email: normEmail, name: plain.name }, JWT_SECRET, { expiresIn: '30d' });
+    setCustCookie(res, token);
     res.json({ customer: plain, token });
 
     // Fire-and-forget admin notification
@@ -119,6 +132,7 @@ router.post('/login', async (req, res) => {
 
     const plain = decryptCustomer(cust);
     const token = jwt.sign({ id: plain.id, email: normEmail, name: plain.name }, JWT_SECRET, { expiresIn: '30d' });
+    setCustCookie(res, token);
     res.json({ customer: { id: plain.id, name: plain.name, email: normEmail, phone: plain.phone, address: plain.address, city: plain.city, state: plain.state, pincode: plain.pincode }, token });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -221,6 +235,7 @@ function oauthRespond(res, cust) {
   // Use normalised email from HMAC path (plain.email is already decrypted)
   const normEmail = (plain.email || '').toLowerCase().trim();
   const token = jwt.sign({ id: plain.id, email: normEmail, name: plain.name }, JWT_SECRET, { expiresIn: '30d' });
+  setCustCookie(res, token);
   res.json({ customer: { id: plain.id, name: plain.name, email: normEmail, phone: plain.phone, address: plain.address, city: plain.city, state: plain.state, pincode: plain.pincode }, token });
 }
 
@@ -488,8 +503,18 @@ router.post('/cart-reminder', custAuth, async (req, res) => {
   }
 });
 
-// 2FA routes — /api/customer/2fa/*
-const { router: twoFARouter } = make2FA(supabase, 'customers', custAuth, null);
+// POST /api/customer/logout — clear httpOnly cookie
+router.post('/logout', (req, res) => {
+  res.clearCookie('sathvam_cust', { httpOnly: true, secure: process.env.NODE_ENV === 'production', sameSite: 'strict' });
+  res.json({ ok: true });
+});
+
+// 2FA routes — /api/customer/2fa/* (cookie + token returned for mobile backward compat)
+const { router: twoFARouter } = make2FA(supabase, 'customers', custAuth, {
+  name: 'sathvam_cust',
+  opts: CUST_COOKIE_OPTS,
+  returnToken: true,
+});
 router.use('/2fa', twoFARouter);
 
 // GET /api/customer/admin/list — admin: list all registered customers

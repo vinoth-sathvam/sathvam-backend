@@ -5,16 +5,18 @@ require('dotenv').config();
   if (!process.env[k]) { console.error(`FATAL: ${k} env var is not set`); process.exit(1); }
 });
 
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
-const morgan = require('morgan');
-const rateLimit = require('express-rate-limit');
-const cookieParser = require('cookie-parser');
+const express     = require('express');
+const cors        = require('cors');
+const helmet      = require('helmet');
+const morgan      = require('morgan');
+const rateLimit   = require('express-rate-limit');
+const cookieParser= require('cookie-parser');
+const compression = require('compression');
 
 const app = express();
 app.set('trust proxy', 1);
 app.use(helmet());
+app.use(compression());
 
 // CORS — Capacitor Android apps use capacitor://localhost and http://localhost
 const allowedOrigins = [
@@ -57,6 +59,22 @@ const paymentsLimiter = rateLimit({
   ...rateLimitOpts,
 });
 
+// Signup limiter — 5 signups/hour per IP (prevents mass account creation)
+const signupLimiter = rateLimit({
+  windowMs: 60*60*1000, max: 5,
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many signup attempts. Please try again in an hour.' },
+  ...rateLimitOpts,
+});
+
+// Referral validate limiter — 10 attempts/hour (prevents brute-force code guessing)
+const referralLimiter = rateLimit({
+  windowMs: 60*60*1000, max: 10,
+  standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many referral attempts. Please try again later.' },
+  ...rateLimitOpts,
+});
+
 app.use(cookieParser());
 app.use(express.json({ limit: '2mb' }));
 app.use(morgan('combined'));
@@ -81,7 +99,9 @@ app.use('/api/users',         users);
 app.use('/api/purchases',     purchases);
 app.use('/api/flour-batches', flourBatches);
 app.use('/api/webstore-orders', webstoreOrders);
-app.use('/api/customer',       require('./routes/customer'));
+app.use('/api/customer/signup',             signupLimiter);
+app.use('/api/customer/referral/validate', referralLimiter);
+app.use('/api/customer',                   require('./routes/customer'));
 app.use('/api/payments',      paymentsLimiter, require('./routes/payments'));
 app.use('/api/webhooks',      require('./routes/payments')); // alias — Razorpay webhook (no rate limit, verified by signature)
 app.use('/api/b2b/auth',      authLimiter, b2bAuth);

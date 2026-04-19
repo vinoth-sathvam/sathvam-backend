@@ -346,7 +346,59 @@ products.post('/stock', auth, async (req, res) => {
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.status(201).json(data);
+
+  // If stock came IN, notify any subscribers for this product (fire-and-forget)
+  if (s.type === 'IN' && s.productId) {
+    setImmediate(() => sendBackInStockNotifications(s.productId, s.productName).catch(() => {}));
+  }
 });
+
+// Fire back-in-stock emails when a product gets restocked
+async function sendBackInStockNotifications(productId, productName) {
+  try {
+    const { data: subs } = await supabase
+      .from('stock_notify')
+      .select('id,email,name')
+      .eq('product_id', productId)
+      .is('notified_at', null);
+    if (!subs || subs.length === 0) return;
+
+    const nodemailer = require('nodemailer');
+    const mailer = nodemailer.createTransport({
+      host: process.env.SMTP_HOST || 'smtp.gmail.com',
+      port: parseInt(process.env.SMTP_PORT || '587'),
+      secure: false,
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+
+    for (const sub of subs) {
+      try {
+        await mailer.sendMail({
+          from: process.env.SMTP_FROM || `Sathvam <${process.env.SMTP_USER}>`,
+          to: sub.email,
+          subject: `✅ ${productName} is back in stock!`,
+          html: `
+<div style="font-family:sans-serif;max-width:500px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;border:1px solid #e5e7eb;">
+  <div style="background:linear-gradient(135deg,#14532d,#166534);padding:20px 24px;">
+    <h2 style="color:#fff;margin:0;font-size:17px;">Good news${sub.name ? ', ' + sub.name.split(' ')[0] : ''}! 🎉</h2>
+  </div>
+  <div style="padding:24px;">
+    <p style="margin:0 0 16px;color:#6b7280;font-size:14px;line-height:1.6;">
+      <strong style="color:#1f2937;">${productName}</strong> is back in stock!
+      Order now before it sells out again.
+    </p>
+    <a href="https://sathvam.in" style="display:inline-block;background:linear-gradient(135deg,#16a34a,#15803d);color:#fff;padding:14px 28px;border-radius:10px;text-decoration:none;font-weight:800;font-size:15px;">Shop Now →</a>
+    <p style="margin:16px 0 0;font-size:11px;color:#9ca3af;">You signed up for this alert at sathvam.in</p>
+  </div>
+</div>`,
+        });
+        // Mark as notified
+        await supabase.from('stock_notify').update({ notified_at: new Date().toISOString() }).eq('id', sub.id);
+        console.log(`Back-in-stock email sent: ${sub.email} for ${productName}`);
+      } catch (e) { console.error(`Back-in-stock email failed for ${sub.email}:`, e.message); }
+    }
+  } catch (e) { console.error('sendBackInStockNotifications error:', e.message); }
+}
 
 // Bulk sync — replaces entire stock_ledger with the array from localStorage
 products.post('/stock/bulk', auth, async (req, res) => {

@@ -127,8 +127,8 @@ module.exports = function make2FARouter(supabase, table, authMiddleware, cookieO
         return res.status(400).json({ error: 'Invalid code — try again' });
 
       // Issue full session
-      if (cookieOpts) {
-        // Admin — httpOnly cookie
+      if (cookieOpts && !cookieOpts.returnToken) {
+        // Admin — httpOnly cookie only
         const token = jwt.sign(
           { id: row.id, username: row.username, name: row.name, role: row.role },
           JWT_SECRET(), { expiresIn: '7d' }
@@ -136,11 +136,12 @@ module.exports = function make2FARouter(supabase, table, authMiddleware, cookieO
         res.cookie(cookieOpts.name, token, cookieOpts.opts);
         res.json({ user: { id: row.id, name: row.name, username: row.username, role: row.role } });
       } else {
-        // Customer — JWT in body
+        // Customer — httpOnly cookie + token in body (mobile backward compat)
         const token = jwt.sign(
           { id: row.id, email: row.email, name: row.name },
           JWT_SECRET(), { expiresIn: '30d' }
         );
+        if (cookieOpts) res.cookie(cookieOpts.name, token, cookieOpts.opts);
         res.json({ customer: { id: row.id, name: row.name, email: row.email, phone: row.phone, address: row.address, city: row.city, state: row.state, pincode: row.pincode }, token });
       }
     } catch (e) {
