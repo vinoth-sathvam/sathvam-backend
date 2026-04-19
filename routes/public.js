@@ -506,11 +506,14 @@ router.get('/recent-activity', async (req, res) => {
       .order('created_at', { ascending: false })
       .limit(30);
 
+    // Validate name looks like a real person (letters/spaces only, has a vowel, 2–20 chars)
+    const isRealName = (n) => n && /^[A-Za-z\s.'-]{2,20}$/.test(n) && /[aeiouAEIOU]/.test(n);
     const activities = (data || []).flatMap(o => {
-      const name = (o.customer?.name || '').split(' ')[0] || 'Someone';
+      const rawName = (o.customer?.name || '').split(' ')[0] || '';
+      if (!isRealName(rawName)) return [];
       const city = o.customer?.city || 'India';
       return (o.items || []).slice(0, 2).map(item => ({
-        name,
+        name: rawName,
         city,
         product: item.name || item.productName || 'a product',
         time: o.created_at,
