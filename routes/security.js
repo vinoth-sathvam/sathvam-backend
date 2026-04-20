@@ -904,6 +904,68 @@ router.get('/metrics', ...adminOrCeo, async (req, res) => {
   }
 });
 
+// ── GET /api/security/deploy-status — auto-deploy timer + last commit info ────
+router.get('/deploy-status', ...adminOrCeo, async (req, res) => {
+  try {
+    const repoPath = '/home/ubuntu/sathvam-backend';
+
+    // Last deployed commit (local HEAD)
+    const [commitHash, commitMsg, commitDate, timerStatus, timerNext, logTail] = await Promise.allSettled([
+      execAsync(`git -C ${repoPath} rev-parse --short HEAD`),
+      execAsync(`git -C ${repoPath} log -1 --pretty=%s`),
+      execAsync(`git -C ${repoPath} log -1 --pretty=%ci`),
+      execAsync(`systemctl is-active sathvam-auto-deploy.timer 2>/dev/null`),
+      execAsync(`systemctl list-timers sathvam-auto-deploy.timer --no-pager 2>/dev/null | grep sathvam`),
+      execAsync(`journalctl -u sathvam-auto-deploy --no-pager -n 40 --output=short-iso 2>/dev/null`),
+    ]);
+
+    // Parse recent deploy events from journal
+    const rawLog = logTail.status === 'fulfilled' ? logTail.value.stdout : '';
+    const deployEvents = [];
+    let currentDeploy = null;
+    rawLog.split('\n').forEach(line => {
+      if (line.includes('New commit detected')) {
+        const m = line.match(/(\d{4}-\d{2}-\d{2}T[\d:+]+)/);
+        currentDeploy = { ts: m?.[1] || null, commit: line.match(/: (\w+)/)?.[1] || null };
+      }
+      if (line.includes('Deploy complete') && currentDeploy) {
+        deployEvents.push({ ...currentDeploy, ok: true });
+        currentDeploy = null;
+      }
+    });
+
+    res.json({
+      timer: {
+        active: timerStatus.status === 'fulfilled' && timerStatus.value.stdout.trim() === 'active',
+        next: timerNext.status === 'fulfilled'
+          ? (timerNext.value.stdout.match(/\w{3}\s+\d{4}-\d{2}-\d{2}\s+[\d:]+/)?.[0] || null)
+          : null,
+      },
+      deployed: {
+        hash:    commitHash.status  === 'fulfilled' ? commitHash.value.stdout.trim()  : null,
+        message: commitMsg.status   === 'fulfilled' ? commitMsg.value.stdout.trim()   : null,
+        date:    commitDate.status  === 'fulfilled' ? commitDate.value.stdout.trim()  : null,
+      },
+      recentDeploys: deployEvents.slice(-5).reverse(),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /api/security/deploy-now — trigger immediate backend deploy ──────────
+router.post('/deploy-now', ...adminOrCeo, async (req, res) => {
+  try {
+    // Run in background — don't wait
+    exec('sudo systemctl start sathvam-auto-deploy.service', (err) => {
+      if (err) console.error('[deploy-now]', err.message);
+    });
+    res.json({ ok: true, message: 'Deploy triggered — check status in ~60 seconds' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── GET /api/security/ai-agents — status of all AI agents ────────────────────
 router.get('/ai-agents', ...adminOrCeo, async (req, res) => {
   const apiKeySet = !!process.env.ANTHROPIC_API_KEY;
