@@ -5,14 +5,10 @@ on:
     branches: [ main ]
 
 jobs:
-  deploy:
+  notify:
     runs-on: ubuntu-latest
     steps:
-      - name: Trigger deploy via webhook
+      - name: Deployment triggered
         run: |
-          PAYLOAD='{"ref":"refs/heads/main","commits":[{"id":"ci"}],"pusher":{"name":"github-actions"}}'
-          SIG=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "${{ secrets.WEBHOOK_SECRET }}" | awk '{print "sha256="$2}')
-          curl -sf -X POST https://api.sathvam.in/webhook/backend \
-            -H "Content-Type: application/json" \
-            -H "X-Hub-Signature-256: $SIG" \
-            -d "$PAYLOAD"
+          echo "✅ Push to main received. The host polling timer will pull and redeploy within 60 seconds."
+          echo "Monitor: sudo journalctl -u sathvam-auto-deploy -f"
