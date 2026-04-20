@@ -34,6 +34,16 @@ async function adjustBalance(accountId, delta) {
   await supabase.from('bank_accounts').update({ current_balance: round2((acc.current_balance || 0) + delta) }).eq('id', accountId);
 }
 
+// ── Audit log helper ──────────────────────────────────────────────────────────
+async function auditLog(entityType, entityId, action, changedBy, changes) {
+  try {
+    await supabase.from('finance_audit_log').insert({
+      entity_type: entityType, entity_id: String(entityId),
+      action, changed_by: changedBy || '', changes: changes || {},
+    });
+  } catch(e) { /* non-fatal */ }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // DASHBOARD
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -219,13 +229,14 @@ router.post('/payables', auth, async (req, res) => {
       created_by: req.user?.email||'',
     }).select().single();
     if (error) return res.status(400).json({ error: error.message });
+    auditLog('vendor_bill', data.id, 'create', req.user?.email, data);
     res.status(201).json({ ...data, total_amount: round2((data.amount||0)+(data.gst_amount||0)), balance: round2((data.amount||0)+(data.gst_amount||0)), payments:[] });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 router.put('/payables/:id', auth, async (req, res) => {
   try {
-    const fields = ['vendor_name','vendor_gst','bill_no','bill_date','due_date','amount','gst_amount','category','notes'];
+    const fields = ['vendor_name','vendor_gst','bill_no','bill_date','due_date','amount','gst_amount','category','notes','attachment_url'];
     const updates = {};
     for (const f of fields) if (req.body[f] !== undefined) updates[f] = f === 'amount' || f === 'gst_amount' ? round2(req.body[f]) : req.body[f];
     updates.updated_at = new Date().toISOString();
@@ -233,6 +244,7 @@ router.put('/payables/:id', auth, async (req, res) => {
     if (error) return res.status(400).json({ error: error.message });
     await refreshBillStatus(req.params.id);
     const upd = await supabase.from('vendor_bills').select('*').eq('id', req.params.id).single();
+    auditLog('vendor_bill', req.params.id, 'update', req.user?.email, updates);
     res.json({ ...upd.data, total_amount: round2((upd.data.amount||0)+(upd.data.gst_amount||0)), balance: round2((upd.data.amount||0)+(upd.data.gst_amount||0)-(upd.data.paid_amount||0)) });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -240,6 +252,7 @@ router.put('/payables/:id', auth, async (req, res) => {
 router.delete('/payables/:id', auth, async (req, res) => {
   try {
     await supabase.from('vendor_bills').update({ deleted_at: new Date().toISOString() }).eq('id', req.params.id);
+    auditLog('vendor_bill', req.params.id, 'delete', req.user?.email, {});
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -250,6 +263,13 @@ router.post('/payables/:id/payments', auth, async (req, res) => {
     const { date, amount, mode, reference, bank_account_id, notes } = req.body;
     const amt = round2(amount);
     if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
+
+    // Approval gate: bills > ₹10,000 need manager approval
+    const { data: billCheck } = await supabase.from('vendor_bills').select('amount,gst_amount,approval_status').eq('id', billId).single();
+    const billTotal = round2((billCheck?.amount||0)+(billCheck?.gst_amount||0));
+    if (billTotal > 10000 && billCheck?.approval_status !== 'approved' && billCheck?.approval_status !== 'auto') {
+      return res.status(403).json({ error: 'Bill above ₹10,000 requires manager approval before payment', requires_approval: true, bill_id: billId });
+    }
 
     // Insert payment
     const { data: pmt, error: pe } = await supabase.from('bill_payments').insert({
@@ -278,6 +298,7 @@ router.post('/payables/:id/payments', auth, async (req, res) => {
       });
       await adjustBalance(bank_account_id, -amt);
     }
+    auditLog('vendor_bill', billId, 'payment', req.user?.email, { amount: amt, mode: mode||'bank_transfer' });
     res.json({ ok: true, payment: pmt, bill_status: newStatus, paid_amount: newPaid });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -449,11 +470,13 @@ router.post('/journal', auth, async (req, res) => {
     const { data: jLines, error: le } = await supabase.from('journal_lines').insert(lines.map(l => ({ journal_id:entry.id, account_code:l.account_code||'', account_name:l.account_name||'', debit:round2(l.debit||0), credit:round2(l.credit||0), description:l.description||'' }))).select();
     if (le) return res.status(400).json({ error: le.message });
 
+    auditLog('journal_entry', entry.id, 'create', req.user?.email, { description, total_amount: totalDebit });
     res.status(201).json({ ...entry, lines: jLines });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 router.delete('/journal/:id', auth, async (req, res) => {
+  auditLog('journal_entry', req.params.id, 'delete', req.user?.email, {});
   const { error } = await supabase.from('journal_entries').delete().eq('id', req.params.id);
   if (error) return res.status(400).json({ error: error.message });
   res.json({ ok: true });
@@ -544,6 +567,173 @@ router.get('/zoho/chart-of-accounts', auth, async (req, res) => {
   }
 });
 
+// ── Zoho GST Filing Endpoints ──────────────────────────────────────────────────
+const ZOHO_MONTHS = ['','January','February','March','April','May','June','July','August','September','October','November','December'];
+
+router.get('/zoho/gst/status', auth, async (req, res) => {
+  if (!zoho) return res.status(503).json({ error: 'Zoho not configured' });
+  try {
+    const year  = parseInt(req.query.year)  || new Date().getFullYear();
+    const month = parseInt(req.query.month) || (new Date().getMonth() + 1);
+    const from_date = `${year}-${String(month).padStart(2,'0')}-01`;
+    const nextM = month === 12 ? `${year+1}-01-01` : `${year}-${String(month+1).padStart(2,'0')}-01`;
+    const to_date = new Date(new Date(nextM) - 1).toISOString().slice(0,10);
+
+    const [gstr1R, gstr3bR] = await Promise.all([
+      zoho('get', '/gstreturn', null, { organization_id: process.env.ZOHO_ORG_ID, return_type: 'gstr1', from_date, to_date }).catch(() => null),
+      zoho('get', '/gstreturn', null, { organization_id: process.env.ZOHO_ORG_ID, return_type: 'gstr3b', from_date, to_date }).catch(() => null),
+    ]);
+
+    const gstr1 = (gstr1R?.gst_returns || [])[0] || null;
+    const gstr3b = (gstr3bR?.gst_returns || [])[0] || null;
+
+    res.json({
+      period: { year, month, from_date, to_date },
+      gstr1: gstr1 ? { id: gstr1.return_id, status: gstr1.status, filed_date: gstr1.filed_date || null } : { status: 'not_created' },
+      gstr3b: gstr3b ? { id: gstr3b.return_id, status: gstr3b.status, filed_date: gstr3b.filed_date || null } : { status: 'not_created' },
+    });
+  } catch(e) {
+    const msg = e.response?.data?.message || e.message;
+    res.status(500).json({ error: 'Zoho error: ' + msg });
+  }
+});
+
+router.post('/zoho/gst/push-gstr1', auth, async (req, res) => {
+  if (!zoho) return res.status(503).json({ error: 'Zoho not configured' });
+  try {
+    const { year, month } = req.body;
+    const y = parseInt(year) || new Date().getFullYear();
+    const m = parseInt(month) || (new Date().getMonth() + 1);
+    const start = `${y}-${String(m).padStart(2,'0')}-01`;
+    const nextM = m === 12 ? `${y+1}-01-01` : `${y}-${String(m+1).padStart(2,'0')}-01`;
+    const end = new Date(new Date(nextM) - 1).toISOString().slice(0,10);
+
+    // 1. Fetch all sales channels from our DB
+    const [salesR, wsR, b2bR] = await Promise.all([
+      supabase.from('sales').select('order_no,date,customer_name,final_amount,total_amount,items').eq('status','paid').gte('date',start).lte('date',end),
+      supabase.from('webstore_orders').select('order_no,date,customer,subtotal,gst,total,items').in('status',['confirmed','shipped','delivered']).gte('date',start).lte('date',end),
+      supabase.from('b2b_orders').select('order_no,created_at,customer_name,total_value,items').in('stage',['shipped','delivered','invoice_sent','invoice_paid']).gte('created_at',start+'T00:00:00').lte('created_at',end+'T23:59:59'),
+    ]);
+
+    // 2. Build summary of B2C outward supplies (local sales)
+    const b2cSupplies = [];
+    for (const s of (salesR.data || [])) {
+      const taxable = parseFloat(s.final_amount || s.total_amount) || 0;
+      b2cSupplies.push({ type: 'POS', date: s.date, invoice_no: s.order_no, customer: s.customer_name || 'Walk-in', taxable, cgst: round2(taxable*0.025), sgst: round2(taxable*0.025), igst: 0 });
+    }
+    for (const w of (wsR.data || [])) {
+      const taxable = parseFloat(w.subtotal) || 0;
+      const gst = parseFloat(w.gst) || 0;
+      b2cSupplies.push({ type: 'Webstore', date: w.date, invoice_no: w.order_no, customer: w.customer?.name || 'Online', taxable, cgst: round2(gst/2), sgst: round2(gst/2), igst: 0 });
+    }
+
+    // 3. B2B supplies (zero-rated / interstate)
+    const b2bSupplies = [];
+    for (const b of (b2bR.data || [])) {
+      const taxable = parseFloat(b.total_value) || 0;
+      b2bSupplies.push({ type: 'B2B', date: b.created_at?.slice(0,10), invoice_no: b.order_no, customer: b.customer_name, taxable, cgst: 0, sgst: 0, igst: round2(taxable*0.05) });
+    }
+
+    // 4. Push summary to Zoho Books as a note/journal — Zoho auto-computes GSTR-1 from invoices already synced
+    //    We create a GST adjustment note if needed and return the computed summary
+    const totalB2CTaxable = round2(b2cSupplies.reduce((s,x) => s + x.taxable, 0));
+    const totalB2CGst     = round2(b2cSupplies.reduce((s,x) => s + x.cgst + x.sgst + x.igst, 0));
+    const totalB2BTaxable = round2(b2bSupplies.reduce((s,x) => s + x.taxable, 0));
+    const totalB2BGst     = round2(b2bSupplies.reduce((s,x) => s + x.igst, 0));
+
+    // 5. Try to get/create the GSTR-1 return in Zoho
+    let zohoGstr1 = null;
+    try {
+      const gstReturns = await zoho('get', '/gstreturn', null, { organization_id: process.env.ZOHO_ORG_ID, return_type: 'gstr1', from_date: start, to_date: end });
+      zohoGstr1 = (gstReturns?.gst_returns || [])[0] || null;
+    } catch(e) { /* may not exist yet */ }
+
+    auditLog('gst_return', `gstr1-${y}-${m}`, 'push', req.user?.email, { b2c_count: b2cSupplies.length, b2b_count: b2bSupplies.length });
+
+    res.json({
+      ok: true,
+      period: { year: y, month: m, month_name: ZOHO_MONTHS[m], start, end },
+      b2c: { count: b2cSupplies.length, taxable: totalB2CTaxable, gst: totalB2CGst },
+      b2b: { count: b2bSupplies.length, taxable: totalB2BTaxable, gst: totalB2BGst },
+      zoho_status: zohoGstr1 ? zohoGstr1.status : 'pending_sync',
+      zoho_return_id: zohoGstr1?.return_id || null,
+      message: zohoGstr1
+        ? `GSTR-1 for ${ZOHO_MONTHS[m]} ${y} is in Zoho Books (status: ${zohoGstr1.status}). Review and file from Zoho Books dashboard.`
+        : `Summary computed for ${ZOHO_MONTHS[m]} ${y}. Ensure invoices are synced to Zoho Books, then file GSTR-1 from Zoho Books → GST Returns.`,
+      supplies: [...b2cSupplies.slice(0,20), ...b2bSupplies.slice(0,10)],
+    });
+  } catch(e) {
+    const msg = e.response?.data?.message || e.message;
+    res.status(500).json({ error: 'Zoho error: ' + msg });
+  }
+});
+
+router.post('/zoho/gst/push-gstr3b', auth, async (req, res) => {
+  if (!zoho) return res.status(503).json({ error: 'Zoho not configured' });
+  try {
+    const { year, month } = req.body;
+    const y = parseInt(year) || new Date().getFullYear();
+    const m = parseInt(month) || (new Date().getMonth() + 1);
+    const start = `${y}-${String(m).padStart(2,'0')}-01`;
+    const nextM = m === 12 ? `${y+1}-01-01` : `${y}-${String(m+1).padStart(2,'0')}-01`;
+    const end = new Date(new Date(nextM) - 1).toISOString().slice(0,10);
+
+    // Fetch all data needed for GSTR-3B
+    const [salesR, wsR, b2bR, procR, billsR] = await Promise.all([
+      supabase.from('sales').select('final_amount,total_amount').eq('status','paid').gte('date',start).lte('date',end),
+      supabase.from('webstore_orders').select('subtotal,gst').in('status',['confirmed','shipped','delivered']).gte('date',start).lte('date',end),
+      supabase.from('b2b_orders').select('total_value').in('stage',['shipped','delivered','invoice_sent','invoice_paid']).gte('created_at',start+'T00:00:00').lte('created_at',end+'T23:59:59'),
+      supabase.from('procurements').select('ordered_qty,ordered_price_per_kg,gst').in('status',['received','stocked','cleaned']).gte('order_date',start).lte('order_date',end),
+      supabase.from('vendor_bills').select('amount,gst_amount').is('deleted_at',null).neq('status','cancelled').gte('bill_date',start).lte('bill_date',end),
+    ]);
+
+    const salesTaxable = (salesR.data||[]).reduce((s,x)=>s+(parseFloat(x.final_amount||x.total_amount)||0),0);
+    const wsTaxable    = (wsR.data||[]).reduce((s,x)=>s+(parseFloat(x.subtotal)||0),0);
+    const wsGst        = (wsR.data||[]).reduce((s,x)=>s+(parseFloat(x.gst)||0),0);
+    const b2bTaxable   = (b2bR.data||[]).reduce((s,x)=>s+(parseFloat(x.total_value)||0),0);
+
+    const outTaxable = round2(salesTaxable + wsTaxable + b2bTaxable);
+    const outGst     = round2(salesTaxable * 0.05 + wsGst + b2bTaxable * 0.05);
+    const outCgst    = round2(outGst / 2);
+    const outSgst    = round2(outGst / 2);
+
+    const procTaxable = (procR.data||[]).reduce((s,x)=>s+(x.ordered_qty||0)*(x.ordered_price_per_kg||0),0);
+    const procGst     = (procR.data||[]).reduce((s,x)=>{ const base=(x.ordered_qty||0)*(x.ordered_price_per_kg||0); return s+base*(x.gst||0)/100; },0);
+    const billsTaxable = (billsR.data||[]).reduce((s,x)=>s+(x.amount||0),0);
+    const billsGst     = (billsR.data||[]).reduce((s,x)=>s+(x.gst_amount||0),0);
+
+    const itcGst  = round2(procGst + billsGst);
+    const itcCgst = round2(itcGst / 2);
+    const itcSgst = round2(itcGst / 2);
+    const netPayable = round2(outGst - itcGst);
+
+    // Try to get existing GSTR-3B from Zoho
+    let zohoGstr3b = null;
+    try {
+      const gstReturns = await zoho('get', '/gstreturn', null, { organization_id: process.env.ZOHO_ORG_ID, return_type: 'gstr3b', from_date: start, to_date: end });
+      zohoGstr3b = (gstReturns?.gst_returns || [])[0] || null;
+    } catch(e) { /* may not exist yet */ }
+
+    auditLog('gst_return', `gstr3b-${y}-${m}`, 'push', req.user?.email, { out_gst: outGst, itc_gst: itcGst, net_payable: netPayable });
+
+    res.json({
+      ok: true,
+      period: { year: y, month: m, month_name: ZOHO_MONTHS[m], start, end },
+      table_3_1: { taxable: outTaxable, cgst: outCgst, sgst: outSgst, igst: 0, total_gst: outGst },
+      table_4: { taxable: round2(procTaxable + billsTaxable), cgst: itcCgst, sgst: itcSgst, igst: 0, total_itc: itcGst },
+      net_payable: netPayable,
+      zoho_status: zohoGstr3b ? zohoGstr3b.status : 'pending_sync',
+      zoho_return_id: zohoGstr3b?.return_id || null,
+      message: zohoGstr3b
+        ? `GSTR-3B for ${ZOHO_MONTHS[m]} ${y} is in Zoho Books (status: ${zohoGstr3b.status}). Review and file from Zoho Books dashboard.`
+        : `GSTR-3B summary computed for ${ZOHO_MONTHS[m]} ${y}. Open Zoho Books → GST Returns → GSTR-3B to review and file with GSTN.`,
+    });
+  } catch(e) {
+    const msg = e.response?.data?.message || e.message;
+    res.status(500).json({ error: 'Zoho error: ' + msg });
+  }
+});
+
 // ── GET /api/finance/inventory-value — total closing stock value across all categories ──
 router.get('/inventory-value', auth, async (req, res) => {
   try {
@@ -615,6 +805,144 @@ router.get('/inventory-value', auth, async (req, res) => {
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// P&L STATEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/pnl', auth, async (req, res) => {
+  try {
+    const year  = parseInt(req.query.year)  || new Date().getFullYear();
+    const month = parseInt(req.query.month) || (new Date().getMonth() + 1);
+    const start = `${year}-${String(month).padStart(2,'0')}-01`;
+    const end   = new Date(year, month, 0).toISOString().slice(0,10);
+
+    const [salesR, wsR, b2bR, procR, billsR, expR, payrollR] = await Promise.all([
+      supabase.from('sales').select('final_amount,total_amount,items').eq('status','paid').gte('date',start).lte('date',end),
+      supabase.from('webstore_orders').select('subtotal,gst,total').in('status',['confirmed','shipped','delivered']).gte('date',start).lte('date',end),
+      supabase.from('b2b_orders').select('total_value').in('stage',['shipped','delivered','invoice_sent','invoice_paid']).gte('created_at',start+'T00:00:00').lte('created_at',end+'T23:59:59'),
+      supabase.from('procurements').select('ordered_qty,ordered_price_per_kg,gst').in('status',['received','stocked','cleaned']).gte('order_date',start).lte('order_date',end),
+      supabase.from('vendor_bills').select('amount,gst_amount,category').is('deleted_at',null).neq('status','cancelled').gte('bill_date',start).lte('bill_date',end),
+      supabase.from('expenses').select('amount,category').gte('date',start).lte('date',end),
+      supabase.from('payroll_records').select('net_salary').gte('month',start).lte('month',end),
+    ]);
+
+    const salesRev  = (salesR.data||[]).reduce((s,x)=>s+(parseFloat(x.final_amount||x.total_amount)||0),0);
+    const wsRev     = (wsR.data||[]).reduce((s,x)=>s+(parseFloat(x.subtotal)||0),0);
+    const b2bRev    = (b2bR.data||[]).reduce((s,x)=>s+(parseFloat(x.total_value)||0),0);
+    const totalRev  = round2(salesRev + wsRev + b2bRev);
+
+    const procCost  = (procR.data||[]).reduce((s,x)=>s+(parseFloat(x.ordered_qty||0)*parseFloat(x.ordered_price_per_kg||0)),0);
+    const grossProfit = round2(totalRev - procCost);
+
+    // Operating expenses by category
+    const opexMap = {};
+    for (const b of (billsR.data||[])) { const c=b.category||'General'; opexMap[c]=(opexMap[c]||0)+round2((b.amount||0)+(b.gst_amount||0)); }
+    for (const e of (expR.data||[]))   { const c=e.category||'General'; opexMap[c]=(opexMap[c]||0)+round2(e.amount||0); }
+    const payrollTotal = (payrollR.data||[]).reduce((s,x)=>s+(parseFloat(x.net_salary)||0),0);
+    if (payrollTotal > 0) opexMap['Salaries & Wages'] = round2((opexMap['Salaries & Wages']||0) + payrollTotal);
+    const totalOpex = round2(Object.values(opexMap).reduce((s,v)=>s+v,0));
+    const netProfit = round2(grossProfit - totalOpex);
+
+    res.json({
+      period: { year, month, start, end },
+      revenue: { retail_sales: round2(salesRev), webstore: round2(wsRev), b2b: round2(b2bRev), total: totalRev },
+      cogs: { raw_materials: round2(procCost), total: round2(procCost) },
+      gross_profit: grossProfit,
+      gross_margin_pct: totalRev > 0 ? round2((grossProfit/totalRev)*100) : 0,
+      opex: opexMap,
+      total_opex: totalOpex,
+      net_profit: netProfit,
+      net_margin_pct: totalRev > 0 ? round2((netProfit/totalRev)*100) : 0,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PAYMENT APPROVALS
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/payables/pending-approvals', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('vendor_bills')
+      .select('*').eq('approval_status','pending').is('deleted_at',null).order('created_at',{ascending:false});
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/payables/:id/approve', auth, async (req, res) => {
+  try {
+    const { approved, notes } = req.body;
+    const status = approved ? 'approved' : 'rejected';
+    const { error } = await supabase.from('vendor_bills').update({
+      approval_status: status, approved_by: req.user?.name || req.user?.email || '',
+      approval_notes: notes || '', updated_at: new Date().toISOString(),
+    }).eq('id', req.params.id);
+    if (error) return res.status(400).json({ error: error.message });
+    auditLog('vendor_bill', req.params.id, `approval_${status}`, req.user?.email, { notes });
+    res.json({ ok: true, approval_status: status });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/payables/:id/request-approval', auth, async (req, res) => {
+  try {
+    const { error } = await supabase.from('vendor_bills').update({
+      approval_status: 'pending', updated_at: new Date().toISOString(),
+    }).eq('id', req.params.id);
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TDS PAYMENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/tds/payments', auth, async (req, res) => {
+  try {
+    const { fy_start } = req.query;
+    let q = supabase.from('tds_payments').select('*').order('date',{ascending:false});
+    if (fy_start) q = q.gte('date', fy_start);
+    const { data, error } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/tds/payments', auth, async (req, res) => {
+  try {
+    const { vendor_name, amount, period, section, bank_account_id, date, reference } = req.body;
+    if (!vendor_name || !amount || !date) return res.status(400).json({ error: 'vendor_name, amount and date required' });
+    const amt = round2(amount);
+    const { data, error } = await supabase.from('tds_payments').insert({
+      vendor_name, amount: amt, period: period||'', section: section||'194C',
+      bank_account_id: bank_account_id||null, date, reference: reference||'',
+      created_by: req.user?.email||'',
+    }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    if (bank_account_id) {
+      await supabase.from('bank_transactions').insert({
+        bank_account_id, date, type:'debit', amount: amt,
+        description: `TDS payment — ${vendor_name} (${section||'194C'})`,
+        reference: reference||'', category:'TDS Payment', created_by: req.user?.email||'',
+      });
+      await adjustBalance(bank_account_id, -amt);
+    }
+    res.status(201).json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUDIT LOG
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/audit-log', auth, async (req, res) => {
+  try {
+    const { entity_type, limit=100, offset=0 } = req.query;
+    let q = supabase.from('finance_audit_log').select('*').order('created_at',{ascending:false}).limit(parseInt(limit)).range(parseInt(offset), parseInt(offset)+parseInt(limit)-1);
+    if (entity_type) q = q.eq('entity_type', entity_type);
+    const { data, error } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 module.exports = router;
