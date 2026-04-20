@@ -156,7 +156,7 @@ const { startScheduler, buildWeeklyReport } = require('./config/scheduler');
 startScheduler();
 
 // ── Abandoned cart + failed-payment automation (cron every 2h) ────────────────
-require('./scripts/automation-service');
+try { require('./scripts/automation-service'); } catch(e) { console.error('[AUTOMATION] Failed to load:', e.message); }
 app.post('/api/send-weekly-report', require('./middleware/auth').auth, async (req, res) => {
   try {
     const nodemailer = require('nodemailer');
