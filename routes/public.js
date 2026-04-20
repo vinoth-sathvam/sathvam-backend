@@ -681,7 +681,7 @@ router.post('/heartbeat', async (req, res) => {
     }
     const ip = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
     const existing = sessions[session_id] || {};
-    const needsGeo = !existing.city || (ip && existing.ip && existing.ip !== ip);
+    const needsGeo = !existing.city || !existing.ip || (ip && existing.ip !== ip);
     // Detect device from User-Agent
     const ua = req.headers['user-agent'] || '';
     const device = /iPad|Android(?!.*Mobile)/i.test(ua) ? 'tablet'
