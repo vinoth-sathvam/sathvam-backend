@@ -684,4 +684,83 @@ b2bAnalytics.get('/', auth, requireRole('admin','manager','ceo'), async (req, re
   }});
 });
 
-module.exports = { b2bCustomers, b2bOrders, projects, b2bItemProgress, b2bStatement, b2bStock, b2bCustomPrices, b2bQuotes, b2bDocs, b2bSamples, b2bMessages, b2bAnalytics };
+// POST /api/b2b/orders/:id/payment — admin records advance or remaining payment
+b2bOrders.post('/:id/payment', auth, requireRole('admin','manager','ceo'), async (req, res) => {
+  const { type, amount, date, ref, notes } = req.body;
+  if (!['advance','remaining'].includes(type)) return res.status(400).json({ error: 'type must be advance or remaining' });
+  const updates = {};
+  if (type === 'advance') {
+    updates.advance_paid = parseFloat(amount)||0;
+    updates.advance_date = date || new Date().toISOString().slice(0,10);
+    updates.advance_ref  = ref || '';
+    updates.advance_notes= notes || '';
+    updates.payment_status = 'advance_paid';
+  } else {
+    updates.remaining_paid = parseFloat(amount)||0;
+    updates.remaining_date = date || new Date().toISOString().slice(0,10);
+    updates.remaining_ref  = ref || '';
+    updates.remaining_notes= notes || '';
+    updates.payment_status = 'fully_paid';
+  }
+  const { data, error } = await supabase.from('b2b_orders').update(updates).eq('id', req.params.id).select().single();
+  if (error) return res.status(400).json({ error: 'Payment update failed' });
+  res.json(data);
+  // Auto WhatsApp
+  setImmediate(async () => {
+    try {
+      const { data: order } = await supabase.from('b2b_orders').select('order_no,customer_id,buyer_name').eq('id', req.params.id).single();
+      if (!order) return;
+      const { data: cust } = await supabase.from('b2b_customers').select('phone,contact_name').eq('id', order.customer_id).maybeSingle();
+      const phone = cust?.phone;
+      if (!phone || !process.env.BOTSAILOR_API_TOKEN) return;
+      const typeLabel = type === 'advance' ? 'Advance Payment' : 'Final Payment';
+      const msg = `🌿 *Sathvam Organics – Payment Received*\n\nDear ${cust?.contact_name || order.buyer_name || 'Customer'},\n\nWe have received your *${typeLabel}* of *₹${amount}* for order *${order.order_no}*.\n\nReference: ${ref || 'N/A'} · Date: ${date}\n\nThank you!\n_sathvam.in_`;
+      const cleanPhone = phone.replace(/\D/g,'');
+      const waPhone = cleanPhone.startsWith('91') ? cleanPhone : '91' + cleanPhone;
+      await fetch(`https://app.botsailor.com/api/whatsapp-business/send-message`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${process.env.BOTSAILOR_API_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone_number_id: process.env.BOTSAILOR_PHONE_NUMBER_ID, to: waPhone, type: 'text', text: { body: msg } })
+      });
+    } catch(e) { console.error('[B2B-WA-PAYMENT]', e.message); }
+  });
+});
+
+const b2bProfile = express.Router();
+b2bProfile.put('/', auth, async (req, res) => {
+  if (req.user.type !== 'b2b_customer') return res.status(403).json({ error: 'B2B customers only' });
+  const c = req.body;
+  const updates = {};
+  if (c.contactName      !== undefined) updates.contact_name     = c.contactName;
+  if (c.phone            !== undefined) updates.phone            = c.phone;
+  if (c.address          !== undefined) updates.address          = c.address;
+  if (c.deliveryAddress  !== undefined) updates.delivery_address = c.deliveryAddress;
+  if (c.currency         !== undefined) updates.currency         = c.currency;
+  const { data, error } = await supabase.from('b2b_customers').update(updates).eq('id', req.user.id).select(B2B_CUST_SELECT).single();
+  if (error) return res.status(400).json({ error: 'Profile update failed' });
+  res.json(data);
+});
+
+const b2bNotifications = express.Router();
+b2bNotifications.get('/:customerId', auth, async (req, res) => {
+  const customerId = req.params.customerId;
+  if (req.user.type === 'b2b_customer' && req.user.id !== customerId) return res.status(403).json({ error: 'Access denied' });
+  const { data: orders } = await supabase.from('b2b_orders')
+    .select('id,order_no,stage,advance_paid,advance_date,remaining_paid,remaining_date,payment_status,b2b_order_stages(id,stage,date,note,created_at)')
+    .eq('customer_id', customerId)
+    .order('created_at', { ascending: false })
+    .limit(20);
+  const notifications = [];
+  (orders || []).forEach(order => {
+    const stages = (order.b2b_order_stages || []).sort((a,b) => new Date(b.created_at||b.date) - new Date(a.created_at||a.date));
+    stages.slice(0, 3).forEach(s => {
+      notifications.push({ id: `stage-${s.id}`, type:'stage_change', orderId:order.id, orderNo:order.order_no, title:`Order ${order.order_no} — Updated`, body: s.note || `Stage: ${s.stage}`, stage: s.stage, date: s.created_at || s.date });
+    });
+    if (order.advance_date) notifications.push({ id:`adv-${order.id}`, type:'payment', orderId:order.id, orderNo:order.order_no, title:`Advance Payment Received – ${order.order_no}`, body:`₹${order.advance_paid} on ${order.advance_date}`, date: order.advance_date });
+    if (order.remaining_date) notifications.push({ id:`rem-${order.id}`, type:'payment', orderId:order.id, orderNo:order.order_no, title:`Final Payment Received – ${order.order_no}`, body:`₹${order.remaining_paid} on ${order.remaining_date}`, date: order.remaining_date });
+  });
+  notifications.sort((a,b) => new Date(b.date) - new Date(a.date));
+  res.json(notifications.slice(0, 40));
+});
+
+module.exports = { b2bCustomers, b2bOrders, projects, b2bItemProgress, b2bStatement, b2bStock, b2bCustomPrices, b2bQuotes, b2bDocs, b2bSamples, b2bMessages, b2bAnalytics, b2bProfile, b2bNotifications };

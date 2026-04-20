@@ -80,7 +80,7 @@ app.use(express.json({ limit: '2mb' }));
 app.use(morgan('combined'));
 
 const { products, procurement, vendors, sales, settings, users } = require('./routes/core');
-const { b2bCustomers, b2bOrders, projects, b2bItemProgress, b2bStatement, b2bStock, b2bCustomPrices, b2bQuotes, b2bDocs, b2bSamples, b2bMessages, b2bAnalytics } = require('./routes/b2b');
+const { b2bCustomers, b2bOrders, projects, b2bItemProgress, b2bStatement, b2bStock, b2bCustomPrices, b2bQuotes, b2bDocs, b2bSamples, b2bMessages, b2bAnalytics, b2bProfile, b2bNotifications } = require('./routes/b2b');
 const b2bAuth = require('./routes/b2bAuth');
 const purchases = require('./routes/purchases');
 const flourBatches = require('./routes/flourBatches');
@@ -117,6 +117,8 @@ app.use('/api/b2b/docs',          b2bDocs);
 app.use('/api/b2b/samples',       b2bSamples);
 app.use('/api/b2b/messages',      b2bMessages);
 app.use('/api/b2b/analytics',     b2bAnalytics);
+app.use('/api/b2b/profile',       b2bProfile);
+app.use('/api/b2b/notifications', b2bNotifications);
 app.use('/api/admin/init',     require('./routes/adminInit'));
 app.use('/api/analytics', require('./routes/analytics'));
 app.use('/api/zoho-customers', require('./routes/zohoCustomers'));
