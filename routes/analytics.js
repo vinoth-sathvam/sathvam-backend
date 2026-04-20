@@ -699,14 +699,36 @@ router.get('/carts', auth, async (req, res) => {
     const carts = allCarts || [];
     const sessions = (csSessions || []).map(r => ({ id: r.key.replace('_cs_', ''), ...r.data }));
 
+    // Enrich carts that belong to logged-in customers (session_id = 'cust_<uuid>')
+    const custIds = [...new Set(
+      carts.filter(c => c.session_id && c.session_id.startsWith('cust_'))
+           .map(c => c.session_id.replace('cust_', ''))
+    )];
+    let custMap = {};
+    if (custIds.length > 0) {
+      const { data: custs } = await supabase
+        .from('customers')
+        .select('id, name, email, phone')
+        .in('id', custIds);
+      (custs || []).forEach(c => { custMap[c.id] = c; });
+    }
+    const enrichCart = (c) => {
+      if (c.session_id && c.session_id.startsWith('cust_')) {
+        const cust = custMap[c.session_id.replace('cust_', '')];
+        if (cust) return { ...c, customer_name: cust.name, customer_email: cust.email, customer_phone: cust.phone };
+      }
+      return c;
+    };
+    const enrichedCarts = carts.map(enrichCart);
+
     // Live = updated in last 30 min, not recovered
-    const live = carts.filter(c => !c.recovered && c.updated_at >= thirtyMinAgo);
+    const live = enrichedCarts.filter(c => !c.recovered && c.updated_at >= thirtyMinAgo);
     // Abandoned = not recovered, older than 30 min
-    const abandoned = carts.filter(c => !c.recovered && c.updated_at < thirtyMinAgo);
+    const abandoned = enrichedCarts.filter(c => !c.recovered && c.updated_at < thirtyMinAgo);
     // Failed payments = started checkout (have name/phone) but never placed order
     const failedPayments = sessions.filter(s => !s.recovered && (s.customer_name || s.customer_phone));
     // Recovered = carts that converted + checkout sessions that converted
-    const recoveredCarts = carts.filter(c => c.recovered);
+    const recoveredCarts = enrichedCarts.filter(c => c.recovered);
     const recoveredSessions = sessions.filter(s => s.recovered);
 
     res.json({ live, abandoned, failedPayments, recovered: [...recoveredCarts, ...recoveredSessions] });
