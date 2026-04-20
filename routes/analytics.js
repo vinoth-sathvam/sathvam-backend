@@ -105,9 +105,9 @@ router.post('/track', async (req, res) => {
       if (session_id && (customer_name || customer_phone)) {
         const key = `_cs_${session_id}`;
         const sessionData = {
-          customer_name: customer_name || null,
-          customer_phone: customer_phone || null,
-          customer_email: customer_email || null,
+          customer_name:  decrypt(customer_name)  || null,
+          customer_phone: decrypt(customer_phone) || null,
+          customer_email: decrypt(customer_email) || null,
           items: (items || []).slice(0, 5).map(i => ({ name: i.name || i.id, qty: i.qty || 1 })),
           cart_total: cart_total || 0,
           recovered: false,
@@ -698,7 +698,14 @@ router.get('/carts', auth, async (req, res) => {
     ]);
 
     const carts = allCarts || [];
-    const sessions = (csSessions || []).map(r => ({ id: r.key.replace('_cs_', ''), ...r.data }));
+    // Decrypt PII in checkout sessions (stored when checkout_start fires)
+    const sessions = (csSessions || []).map(r => ({
+      id: r.key.replace('_cs_', ''),
+      ...r.data,
+      customer_name:  decrypt(r.data?.customer_name),
+      customer_phone: decrypt(r.data?.customer_phone),
+      customer_email: decrypt(r.data?.customer_email),
+    }));
 
     // Enrich carts that belong to logged-in customers (session_id = 'cust_<uuid>')
     const custIds = [...new Set(
