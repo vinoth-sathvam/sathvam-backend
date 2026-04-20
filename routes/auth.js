@@ -1,10 +1,11 @@
 const express = require('express');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
+const bcrypt  = require('bcryptjs');
+const jwt     = require('jsonwebtoken');
+const crypto  = require('crypto');
 const supabase = require('../config/supabase');
 const { auth } = require('../middleware/auth');
-const make2FA = require('./twoFactor');
-const router = express.Router();
+const make2FA  = require('./twoFactor');
+const router   = express.Router();
 
 const COOKIE_OPTS = {
   httpOnly: true,
@@ -15,6 +16,14 @@ const COOKIE_OPTS = {
 
 const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// Generate a fresh session token and persist it to the users table.
+// Called on every successful admin login (including 2FA second step).
+async function issueSessionToken(userId) {
+  const sessionToken = crypto.randomBytes(32).toString('hex');
+  await supabase.from('users').update({ session_token: sessionToken }).eq('id', userId);
+  return sessionToken;
+}
+
 router.post('/login', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -24,15 +33,18 @@ router.post('/login', async (req, res) => {
     const valid = await bcrypt.compare(password, user.password);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
 
-    // 2FA — if enabled, return a short-lived pre-auth token instead of full session
+    // 2FA — if enabled, return a short-lived pre-auth token instead of full session.
+    // Session token is issued only after TOTP is verified (in /2fa/validate).
     if (user.totp_enabled) {
       const { issuePreAuthToken } = require('./twoFactor');
       const preAuthToken = issuePreAuthToken({ id: user.id });
       return res.json({ requiresTOTP: true, preAuthToken });
     }
 
+    // No 2FA — issue session token and full JWT now
+    const sessionToken = await issueSessionToken(user.id);
     const token = jwt.sign(
-      { id: user.id, username: user.username, name: user.name, role: user.role },
+      { id: user.id, username: user.username, name: user.name, role: user.role, session_token: sessionToken },
       process.env.JWT_SECRET, { expiresIn: '7d' }
     );
     res.cookie('sathvam_admin', token, COOKIE_OPTS);
@@ -53,6 +65,7 @@ router.post('/setup', (req, res) => res.status(410).json({ error: 'Gone' }));
 const { router: twoFARouter } = make2FA(supabase, 'users', auth, {
   name: 'sathvam_admin',
   opts: COOKIE_OPTS,
+  issueSessionToken, // passed so /validate can embed session_token in JWT
 });
 router.use('/2fa', twoFARouter);
 

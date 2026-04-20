@@ -34,6 +34,8 @@ function verifyTOTP(secret, token) {
 
 // ── factory ───────────────────────────────────────────────────────────────────
 module.exports = function make2FARouter(supabase, table, authMiddleware, cookieOpts) {
+  // issueSessionToken may be passed in cookieOpts for admin logins
+  const issueSessionToken = cookieOpts?.issueSessionToken || null;
   const router = express.Router();
 
   // POST /setup — generate secret + QR code (requires existing session)
@@ -129,10 +131,12 @@ module.exports = function make2FARouter(supabase, table, authMiddleware, cookieO
       // Issue full session
       if (cookieOpts && !cookieOpts.returnToken) {
         // Admin — httpOnly cookie only
-        const token = jwt.sign(
-          { id: row.id, username: row.username, name: row.name, role: row.role },
-          JWT_SECRET(), { expiresIn: '7d' }
-        );
+        // Generate session token for single-session enforcement
+        let sessionToken;
+        if (issueSessionToken) sessionToken = await issueSessionToken(row.id);
+        const payload = { id: row.id, username: row.username, name: row.name, role: row.role };
+        if (sessionToken) payload.session_token = sessionToken;
+        const token = jwt.sign(payload, JWT_SECRET(), { expiresIn: '7d' });
         res.cookie(cookieOpts.name, token, cookieOpts.opts);
         res.json({ user: { id: row.id, name: row.name, username: row.username, role: row.role } });
       } else {
