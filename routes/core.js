@@ -327,6 +327,130 @@ products.post('/offer-notify', auth, requireRole('admin','manager'), async (req,
 
   res.json({ sent: emailSent, wa_sent: waSent, total_recipients: allRecipients.length });
 });
+// POST /api/products/bulk-offer — apply % discount to ALL products by category + blast email
+products.post('/bulk-offer', auth, requireRole('admin','manager'), async (req, res) => {
+  const { oils_pct = 5, others_pct = 2.5, end_date, label } = req.body;
+  if (!end_date) return res.status(400).json({ error: 'end_date required (YYYY-MM-DD)' });
+
+  const endDateTime = end_date + 'T23:59:59';
+  const endFmt = new Date(endDateTime).toLocaleDateString('en-IN', { weekday:'long', day:'numeric', month:'long', year:'numeric' });
+
+  // 1. Fetch all active, non-raw products
+  const { data: prods, error: pe } = await supabase
+    .from('products')
+    .select('id, name, cat, website_price, price')
+    .eq('active', true)
+    .neq('cat', 'raw');
+  if (pe) return res.status(500).json({ error: pe.message });
+
+  // 2. Compute and apply offer_price per product
+  let updated = 0;
+  const oilLabel   = label || `${oils_pct}% OFF`;
+  const otherLabel = label || `${others_pct}% OFF`;
+
+  for (const p of prods) {
+    const base = parseFloat(p.website_price || p.price) || 0;
+    if (base <= 0) continue;
+    const isOil  = p.cat === 'oil';
+    const pct    = isOil ? oils_pct : others_pct;
+    const offPrc = Math.round(base * (1 - pct / 100));
+    const lbl    = isOil ? oilLabel : otherLabel;
+    await supabase.from('products').update({
+      offer_label:   lbl,
+      offer_price:   offPrc,
+      offer_ends_at: endDateTime,
+    }).eq('id', p.id);
+    updated++;
+  }
+
+  // 3. Fetch all customers + newsletter subscribers
+  const { data: customers } = await supabase.from('customers').select('name, email, phone').not('email', 'is', null);
+  const { data: nlRow }     = await supabase.from('store_analytics').select('data').eq('key', 'newsletter_subscribers').maybeSingle();
+  const nlEmails            = (nlRow?.data || []).map(s => s.email).filter(Boolean);
+  const recipMap = {};
+  for (const c of (customers || [])) {
+    if (c.email) recipMap[c.email.toLowerCase()] = { name: c.name || 'Valued Customer', phone: c.phone };
+  }
+  for (const e of nlEmails) {
+    if (!recipMap[e]) recipMap[e] = { name: 'Valued Customer', phone: null };
+  }
+  const recipients = Object.entries(recipMap).map(([email, d]) => ({ email, ...d }));
+
+  // 4. Send bulk email
+  const emailHtml = `
+<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#f7f3ef;font-family:Georgia,serif;">
+  <div style="max-width:580px;margin:32px auto;background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.10);">
+    <!-- Header -->
+    <div style="background:linear-gradient(135deg,#7b4f28,#c8813a);padding:32px;text-align:center;">
+      <div style="font-size:36px;margin-bottom:8px;">🎉</div>
+      <h1 style="color:#fff;margin:0 0 6px;font-size:26px;letter-spacing:1px;">Flash Sale — Today Only!</h1>
+      <p style="color:#fde8cc;margin:0;font-size:14px;">Offer ends ${endFmt}</p>
+    </div>
+    <!-- Offer boxes -->
+    <div style="padding:32px 32px 16px;">
+      <p style="font-size:15px;color:#444;margin-top:0;">Dear {{NAME}},</p>
+      <p style="font-size:15px;color:#444;">We're excited to share an exclusive limited-time offer on our pure cold-pressed products!</p>
+      <div style="display:flex;gap:16px;margin:24px 0;flex-wrap:wrap;">
+        <div style="flex:1;min-width:200px;background:linear-gradient(135deg,#fff8f0,#fde8cc);border:2px solid #c8813a;border-radius:12px;padding:20px;text-align:center;">
+          <div style="font-size:28px;font-weight:900;color:#c8813a;">${oils_pct}% OFF</div>
+          <div style="font-size:15px;font-weight:700;color:#7b4f28;margin-top:4px;">🫙 All Cold-Pressed Oils</div>
+          <div style="font-size:12px;color:#8a6a4a;margin-top:6px;">Sesame · Groundnut · Coconut & more</div>
+        </div>
+        <div style="flex:1;min-width:200px;background:linear-gradient(135deg,#f0fdf4,#dcfce7);border:2px solid #16a34a;border-radius:12px;padding:20px;text-align:center;">
+          <div style="font-size:28px;font-weight:900;color:#16a34a;">${others_pct}% OFF</div>
+          <div style="font-size:15px;font-weight:700;color:#14532d;margin-top:4px;">🌾 All Other Products</div>
+          <div style="font-size:12px;color:#4a7a50;margin-top:6px;">Grains · Spices · Natural Foods</div>
+        </div>
+      </div>
+      <div style="background:#fef9f0;border-radius:10px;padding:14px 18px;border-left:4px solid #c8813a;margin-bottom:24px;">
+        <div style="font-size:13px;color:#7b4f28;font-weight:700;">⏰ Hurry — Offer ends ${endFmt}</div>
+        <div style="font-size:12px;color:#9a8a78;margin-top:4px;">Discount automatically applied at checkout. No coupon code needed.</div>
+      </div>
+      <div style="text-align:center;margin:28px 0;">
+        <a href="https://sathvam.in" style="background:linear-gradient(135deg,#c8813a,#7b4f28);color:#fff;padding:14px 36px;border-radius:10px;text-decoration:none;font-size:16px;font-weight:bold;display:inline-block;letter-spacing:.5px;">Shop Now & Save →</a>
+      </div>
+    </div>
+    <!-- Footer -->
+    <div style="background:#f7f3ef;padding:16px 32px;text-align:center;border-top:1px solid #e8dfc8;">
+      <p style="font-size:12px;color:#9a8a78;margin:0;">Sathvam Natural Products · Pure · Cold-Pressed · Chemical-Free</p>
+      <p style="font-size:11px;color:#b0a090;margin:6px 0 0;"><a href="https://sathvam.in" style="color:#c8813a;text-decoration:none;">sathvam.in</a> · <a href="https://sathvam.in" style="color:#9a8a78;text-decoration:none;">Unsubscribe</a></p>
+    </div>
+  </div>
+</body>
+</html>`;
+
+  const transporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST || 'smtp.gmail.com',
+    port: parseInt(process.env.SMTP_PORT || '587'),
+    secure: false,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+  });
+  let emailSent = 0;
+  const BATCH = 10;
+  for (let i = 0; i < recipients.length; i += BATCH) {
+    const batch = recipients.slice(i, i + BATCH);
+    await Promise.allSettled(batch.map(r =>
+      transporter.sendMail({
+        from: process.env.SMTP_FROM || `Sathvam <${process.env.SMTP_USER}>`,
+        to: r.email,
+        subject: `🎉 Flash Sale: ${oils_pct}% off Oils, ${others_pct}% off Everything — Ends ${endFmt}`,
+        html: emailHtml.replace('{{NAME}}', r.name || 'Valued Customer'),
+      }).then(() => emailSent++).catch(e => console.error(`Bulk offer email failed ${r.email}:`, e.message))
+    ));
+  }
+
+  res.json({ ok: true, products_updated: updated, emails_sent: emailSent, total_recipients: recipients.length, offer_ends: endDateTime });
+});
+
+// POST /api/products/clear-offers — remove all active offers from all products
+products.post('/clear-offers', auth, requireRole('admin'), async (req, res) => {
+  const { error } = await supabase.from('products').update({ offer_label: null, offer_price: null, offer_ends_at: null }).eq('active', true);
+  if (error) return res.status(400).json({ error: error.message });
+  res.json({ ok: true });
+});
+
 products.delete('/:id', auth, requireRole('admin'), async (req, res) => {
   await supabase.from('products').update({ active: false }).eq('id', req.params.id);
   res.json({ message: 'Deactivated' });
