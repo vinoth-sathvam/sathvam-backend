@@ -100,6 +100,7 @@ app.use('/api/purchases',     purchases);
 app.use('/api/flour-batches', flourBatches);
 app.use('/api/webstore-orders', webstoreOrders);
 app.use('/api/customer/signup',             signupLimiter);
+app.use('/api/customer/login',             authLimiter);
 app.use('/api/customer/referral/validate', referralLimiter);
 app.use('/api/customer',                   require('./routes/customer'));
 app.use('/api/payments',      paymentsLimiter, require('./routes/payments'));

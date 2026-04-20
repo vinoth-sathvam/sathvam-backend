@@ -42,6 +42,7 @@ router.post('/signup', async (req, res) => {
   try {
     const { name, email, phone, password } = req.body;
     if (!name || !email) return res.status(400).json({ error: 'Name and email are required' });
+    if (password && password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
     const normEmail = email.toLowerCase().trim();
     const eHash = hmac(normEmail);
     // Use HMAC hash for duplicate check (email column is encrypted after migration)
