@@ -679,15 +679,16 @@ router.post('/heartbeat', async (req, res) => {
     for (const [sid, s] of Object.entries(sessions)) {
       if (nowMs - new Date(s.ts).getTime() > 2 * 60 * 1000) delete sessions[sid];
     }
-    // Preserve existing geo if already set (avoid redundant lookups)
+    const ip = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
     const existing = sessions[session_id] || {};
-    sessions[session_id] = { ts: now, page: page || '/', city: existing.city || null, country: existing.country || null, countryCode: existing.countryCode || null };
+    // Re-lookup geo if IP changed (e.g. VPN switch) or city not yet known
+    const needsGeo = !existing.city || (ip && existing.ip && existing.ip !== ip);
+    sessions[session_id] = { ts: now, page: page || '/', ip, city: needsGeo ? null : existing.city, country: needsGeo ? null : existing.country, countryCode: needsGeo ? null : existing.countryCode };
     await supabase.from('store_analytics').upsert({ key: 'live_sessions', data: sessions, updated_at: now }, { onConflict: 'key' });
     res.json({ ok: true, count: Object.keys(sessions).length });
 
-    // Geo lookup — fire after response, only if not already known for this session
-    if (!existing.city) {
-      const ip = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
+    // Geo lookup — fire after response
+    if (needsGeo) {
       geoIP(ip).then(async geo => {
         if (!geo) return;
         const { data: fresh } = await supabase.from('store_analytics').select('data').eq('key', 'live_sessions').maybeSingle();
