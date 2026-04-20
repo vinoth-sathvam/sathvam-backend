@@ -8,15 +8,11 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Pull latest code and restart backend container
-        uses: appleboy/ssh-action@v1.0.0
-        with:
-          host: ${{ secrets.AWS_HOST }}
-          username: ${{ secrets.AWS_USER }}
-          key: ${{ secrets.AWS_SSH_KEY }}
-          script: |
-            cd /home/ubuntu/sathvam-backend
-            git pull origin main
-            cd /home/ubuntu
-            docker compose up -d --force-recreate --build backend
-            docker compose ps
+      - name: Trigger deploy via webhook
+        run: |
+          PAYLOAD='{"ref":"refs/heads/main","commits":[{"id":"ci"}],"pusher":{"name":"github-actions"}}'
+          SIG=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "${{ secrets.WEBHOOK_SECRET }}" | awk '{print "sha256="$2}')
+          curl -sf -X POST https://api.sathvam.in/webhook/backend \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: $SIG" \
+            -d "$PAYLOAD"
