@@ -154,6 +154,9 @@ app.use('/api/restock-reminders', require('./routes/restockReminder'));
 // ── Weekly report manual trigger ──────────────────────────────────────────────
 const { startScheduler, buildWeeklyReport } = require('./config/scheduler');
 startScheduler();
+
+// ── Abandoned cart + failed-payment automation (cron every 2h) ────────────────
+require('./scripts/automation-service');
 app.post('/api/send-weekly-report', require('./middleware/auth').auth, async (req, res) => {
   try {
     const nodemailer = require('nodemailer');
