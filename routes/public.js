@@ -668,22 +668,35 @@ router.post('/live-viewers', async (req, res) => {
 // POST /api/public/heartbeat — store frontend pings every 30s to signal active session
 router.post('/heartbeat', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
-  const { session_id, page } = req.body;
+  const { session_id, page, referrer, utm_source, cart_value, is_new } = req.body;
   if (!session_id) return res.json({ ok: false });
   try {
     const now = new Date().toISOString();
     const { data } = await supabase.from('store_analytics').select('data').eq('key', 'live_sessions').maybeSingle();
     const sessions = data?.data || {};
-    // Prune sessions older than 2 minutes, then upsert current
+    // Prune sessions older than 2 minutes
     const nowMs = Date.now();
     for (const [sid, s] of Object.entries(sessions)) {
       if (nowMs - new Date(s.ts).getTime() > 2 * 60 * 1000) delete sessions[sid];
     }
     const ip = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
     const existing = sessions[session_id] || {};
-    // Re-lookup geo if IP changed (e.g. VPN switch) or city not yet known
     const needsGeo = !existing.city || (ip && existing.ip && existing.ip !== ip);
-    sessions[session_id] = { ts: now, page: page || '/', ip, city: needsGeo ? null : existing.city, country: needsGeo ? null : existing.country, countryCode: needsGeo ? null : existing.countryCode };
+    // Detect device from User-Agent
+    const ua = req.headers['user-agent'] || '';
+    const device = /iPad|Android(?!.*Mobile)/i.test(ua) ? 'tablet'
+      : /Mobile|Android|iPhone|iPod|webOS|BlackBerry|IEMobile|Opera Mini/i.test(ua) ? 'mobile' : 'desktop';
+    sessions[session_id] = {
+      ts: now, page: page || '/', ip, device,
+      referrer:   referrer   || existing.referrer   || null,
+      utm_source: utm_source || existing.utm_source || null,
+      cart_value: cart_value != null ? cart_value : (existing.cart_value || null),
+      is_new:     is_new     != null ? is_new     : (existing.is_new != null ? existing.is_new : true),
+      city:        needsGeo ? null : existing.city,
+      country:     needsGeo ? null : existing.country,
+      countryCode: needsGeo ? null : existing.countryCode,
+      first_seen:  existing.first_seen || now,
+    };
     await supabase.from('store_analytics').upsert({ key: 'live_sessions', data: sessions, updated_at: now }, { onConflict: 'key' });
     res.json({ ok: true, count: Object.keys(sessions).length });
 
@@ -709,12 +722,12 @@ router.get('/live-count', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
   try {
     const { data } = await supabase.from('store_analytics').select('data').eq('key', 'live_sessions').maybeSingle();
-    if (!data?.data) return res.json({ count: 0, pages: {}, locations: [] });
+    if (!data?.data) return res.json({ count: 0, pages: {}, locations: [], sessions: [] });
     const nowMs = Date.now();
     const active = Object.entries(data.data).filter(([, s]) => nowMs - new Date(s.ts).getTime() < 2 * 60 * 1000);
     const pages = {};
     active.forEach(([, s]) => { const p = s.page || '/'; pages[p] = (pages[p] || 0) + 1; });
-    // Build location list (one entry per unique city+country combo)
+    // Grouped locations
     const locMap = {};
     active.forEach(([, s]) => {
       if (!s.country) return;
@@ -723,8 +736,24 @@ router.get('/live-count', async (req, res) => {
       locMap[key].count++;
     });
     const locations = Object.values(locMap).sort((a, b) => b.count - a.count);
-    res.json({ count: active.length, pages, locations });
-  } catch { res.json({ count: 0, pages: {}, locations: [] }); }
+    // Individual sessions (enriched, no PII — just behaviour)
+    const sessions = active
+      .map(([, s]) => ({
+        page:        s.page || '/',
+        device:      s.device || 'desktop',
+        city:        s.city || null,
+        country:     s.country || null,
+        countryCode: s.countryCode || null,
+        referrer:    s.referrer || null,
+        utm_source:  s.utm_source || null,
+        cart_value:  s.cart_value || null,
+        is_new:      s.is_new != null ? s.is_new : true,
+        ts:          s.ts,
+        first_seen:  s.first_seen || s.ts,
+      }))
+      .sort((a, b) => new Date(b.ts) - new Date(a.ts));
+    res.json({ count: active.length, pages, locations, sessions });
+  } catch { res.json({ count: 0, pages: {}, locations: [], sessions: [] }); }
 });
 
 // GET /api/public/sitemap.xml — dynamic sitemap with all products + blog posts
