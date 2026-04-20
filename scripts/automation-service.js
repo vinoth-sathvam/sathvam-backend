@@ -568,33 +568,39 @@ async function runCartFollowUps() {
 
       if (!touch) continue;
 
-      // ── Touch 2 requires admin approval before sending ──────────────────────
+      // ── Touch 2: small carts (<₹300) auto-send; larger carts need approval ──
       if (touch === 2) {
         if (cartState.approval_queued) continue; // already waiting, don't re-queue
 
         const cartTotal = (cart.items || []).reduce((s, i) => s + (parseFloat(i.price || 0) * (i.qty || 1)), 0);
 
-        // Load existing approvals queue
-        const { data: aqRow } = await supabase.from('settings').select('value').eq('key', 'cart_discount_approvals').single();
-        const queue = aqRow?.value || [];
-        // Avoid duplicates
-        if (!queue.find(a => a.session_id === sid && a.status === 'pending')) {
-          queue.push({
-            id:                   `${sid}_t2_${Date.now()}`,
-            session_id:           sid,
-            cart,
-            cart_total:           Math.round(cartTotal),
-            suggested_discount_pct: 10,
-            queued_at:            new Date().toISOString(),
-            status:               'pending',
-          });
-          await supabase.from('settings').upsert({ key: 'cart_discount_approvals', value: queue, updated_at: new Date().toISOString() });
-          console.log(`[CART-T2] Queued for approval: ${sid} (cart ₹${Math.round(cartTotal)})`);
-        }
+        if (cartTotal < 300) {
+          // Auto-send for small carts — no discount, just a friendly nudge
+          console.log(`[CART-T2] Auto-send (small cart ₹${Math.round(cartTotal)}): ${sid}`);
+          // fall through to the send block below
+        } else {
+          // Load existing approvals queue for larger carts
+          const { data: aqRow } = await supabase.from('settings').select('value').eq('key', 'cart_discount_approvals').single();
+          const queue = aqRow?.value || [];
+          // Avoid duplicates
+          if (!queue.find(a => a.session_id === sid && a.status === 'pending')) {
+            queue.push({
+              id:                   `${sid}_t2_${Date.now()}`,
+              session_id:           sid,
+              cart,
+              cart_total:           Math.round(cartTotal),
+              suggested_discount_pct: 10,
+              queued_at:            new Date().toISOString(),
+              status:               'pending',
+            });
+            await supabase.from('settings').upsert({ key: 'cart_discount_approvals', value: queue, updated_at: new Date().toISOString() });
+            console.log(`[CART-T2] Queued for approval: ${sid} (cart ₹${Math.round(cartTotal)})`);
+          }
 
-        state[sid] = { ...cartState, approval_queued: true };
-        updated = true;
-        continue; // don't send — wait for admin approval
+          state[sid] = { ...cartState, approval_queued: true };
+          updated = true;
+          continue; // don't send — wait for admin approval
+        }
       }
 
       // ── Touch 1 & 3: auto-send (no discount involved) ──────────────────────

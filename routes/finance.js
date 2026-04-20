@@ -945,4 +945,568 @@ router.get('/audit-log', auth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// CHART OF ACCOUNTS
+// ═══════════════════════════════════════════════════════════════════════════════
+const DEFAULT_COA = [
+  // Assets
+  { code:'1000', name:'Cash in Hand',          type:'Asset',     subtype:'Current Asset',  normal:'debit' },
+  { code:'1010', name:'Petty Cash',             type:'Asset',     subtype:'Current Asset',  normal:'debit' },
+  { code:'1100', name:'Bank - Current Account', type:'Asset',     subtype:'Current Asset',  normal:'debit' },
+  { code:'1110', name:'Bank - Savings Account', type:'Asset',     subtype:'Current Asset',  normal:'debit' },
+  { code:'1200', name:'Accounts Receivable',    type:'Asset',     subtype:'Current Asset',  normal:'debit' },
+  { code:'1300', name:'Inventory - Raw Materials',    type:'Asset', subtype:'Current Asset', normal:'debit' },
+  { code:'1310', name:'Inventory - Finished Goods',   type:'Asset', subtype:'Current Asset', normal:'debit' },
+  { code:'1320', name:'Inventory - Packing Materials',type:'Asset', subtype:'Current Asset', normal:'debit' },
+  { code:'1400', name:'Prepaid Expenses',       type:'Asset',     subtype:'Current Asset',  normal:'debit' },
+  { code:'1500', name:'Plant & Machinery',      type:'Asset',     subtype:'Fixed Asset',    normal:'debit' },
+  { code:'1510', name:'Furniture & Fixtures',   type:'Asset',     subtype:'Fixed Asset',    normal:'debit' },
+  { code:'1520', name:'Vehicles',               type:'Asset',     subtype:'Fixed Asset',    normal:'debit' },
+  { code:'1590', name:'Accumulated Depreciation',type:'Asset',    subtype:'Contra Asset',   normal:'credit' },
+  // Liabilities
+  { code:'2000', name:'Accounts Payable',       type:'Liability', subtype:'Current Liability', normal:'credit' },
+  { code:'2100', name:'GST Payable',            type:'Liability', subtype:'Current Liability', normal:'credit' },
+  { code:'2110', name:'TDS Payable',            type:'Liability', subtype:'Current Liability', normal:'credit' },
+  { code:'2200', name:'Salary Payable',         type:'Liability', subtype:'Current Liability', normal:'credit' },
+  { code:'2300', name:'Short-term Loan',        type:'Liability', subtype:'Current Liability', normal:'credit' },
+  { code:'2400', name:'Long-term Loan',         type:'Liability', subtype:'Long-term Liability', normal:'credit' },
+  { code:'2500', name:'Deferred Revenue',       type:'Liability', subtype:'Current Liability', normal:'credit' },
+  // Equity
+  { code:'3000', name:'Share Capital',          type:'Equity',    subtype:'Equity',         normal:'credit' },
+  { code:'3100', name:'Retained Earnings',      type:'Equity',    subtype:'Equity',         normal:'credit' },
+  { code:'3200', name:'Owner\'s Drawings',      type:'Equity',    subtype:'Equity',         normal:'debit'  },
+  // Revenue
+  { code:'4000', name:'Sales Revenue - Retail', type:'Revenue',   subtype:'Operating Revenue', normal:'credit' },
+  { code:'4010', name:'Sales Revenue - Webstore',type:'Revenue',  subtype:'Operating Revenue', normal:'credit' },
+  { code:'4020', name:'Sales Revenue - B2B',    type:'Revenue',   subtype:'Operating Revenue', normal:'credit' },
+  { code:'4100', name:'Other Income',           type:'Revenue',   subtype:'Other Income',   normal:'credit' },
+  // COGS
+  { code:'5000', name:'Raw Material Cost',      type:'Expense',   subtype:'COGS',           normal:'debit' },
+  { code:'5100', name:'Direct Labour',          type:'Expense',   subtype:'COGS',           normal:'debit' },
+  { code:'5200', name:'Manufacturing Overhead', type:'Expense',   subtype:'COGS',           normal:'debit' },
+  // Operating Expenses
+  { code:'6000', name:'Salaries & Wages',       type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+  { code:'6100', name:'Rent',                   type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+  { code:'6200', name:'Utilities',              type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+  { code:'6300', name:'Transport & Logistics',  type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+  { code:'6400', name:'Marketing & Advertising',type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+  { code:'6500', name:'Office & Admin',         type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+  { code:'6600', name:'Maintenance & Repairs',  type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+  { code:'6700', name:'Packaging Materials',    type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+  { code:'6800', name:'Depreciation Expense',   type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+  { code:'6900', name:'Interest Expense',       type:'Expense',   subtype:'Finance Cost',   normal:'debit' },
+  { code:'7000', name:'Taxes & Duties',         type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+  { code:'7100', name:'Miscellaneous Expense',  type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+];
+
+router.get('/coa', auth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('chart_of_accounts').select('*').order('code');
+    if (!data || data.length === 0) {
+      // Seed defaults
+      const { data: seeded } = await supabase.from('chart_of_accounts').insert(DEFAULT_COA).select();
+      return res.json(seeded || DEFAULT_COA);
+    }
+    res.json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/coa', auth, async (req, res) => {
+  try {
+    const { code, name, type, subtype, normal } = req.body;
+    if (!code || !name || !type) return res.status(400).json({ error: 'code, name, type required' });
+    const { data, error } = await supabase.from('chart_of_accounts').insert({ code, name, type, subtype: subtype||type, normal: normal||'debit' }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.status(201).json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.put('/coa/:id', auth, async (req, res) => {
+  try {
+    const { name, subtype, normal, active } = req.body;
+    const updates = {};
+    if (name !== undefined) updates.name = name;
+    if (subtype !== undefined) updates.subtype = subtype;
+    if (normal !== undefined) updates.normal = normal;
+    if (active !== undefined) updates.active = active;
+    const { data, error } = await supabase.from('chart_of_accounts').update(updates).eq('id', req.params.id).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// TRIAL BALANCE
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/trial-balance', auth, async (req, res) => {
+  try {
+    const { as_of } = req.query;
+    const cutoff = as_of || new Date().toISOString().slice(0, 10);
+
+    // Get journal entry IDs up to cutoff date
+    const { data: jeRows } = await supabase.from('journal_entries').select('id').lte('date', cutoff);
+    const jeIds = (jeRows||[]).map(r=>r.id);
+    if (!jeIds.length) return res.json({ as_of: cutoff, rows: [], totalDebit: 0, totalCredit: 0, balanced: true });
+
+    // Aggregate journal line debits/credits per account code
+    const { data: lines } = await supabase.from('journal_lines').select('account_code,account_name,debit,credit').in('journal_id', jeIds);
+
+    const accounts = {};
+    for (const l of lines || []) {
+      const k = l.account_code || l.account_name || '?';
+      if (!accounts[k]) accounts[k] = { code: l.account_code, name: l.account_name, debit: 0, credit: 0 };
+      accounts[k].debit  += round2(l.debit  || 0);
+      accounts[k].credit += round2(l.credit || 0);
+    }
+
+    const rows = Object.values(accounts).map(a => ({
+      ...a,
+      net: round2(a.debit - a.credit),
+    })).sort((a,b) => (a.code||'').localeCompare(b.code||''));
+
+    const totalDebit  = round2(rows.reduce((s,r) => s + r.debit, 0));
+    const totalCredit = round2(rows.reduce((s,r) => s + r.credit, 0));
+
+    res.json({ as_of: cutoff, rows, totalDebit, totalCredit, balanced: Math.abs(totalDebit - totalCredit) < 0.01 });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BALANCE SHEET (synthesised from GL + operational data)
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/balance-sheet', auth, async (req, res) => {
+  try {
+    const { as_of } = req.query;
+    const cutoff = as_of || new Date().toISOString().slice(0, 10);
+    const yearStart = cutoff.slice(0,4) + '-04-01'; // Indian FY starts April
+
+    const [bankRes, arB2b, arWebstore, apRes, invRes, salaryRes, loanRes, expensesRes, revenueRes, cogRes] = await Promise.all([
+      // Cash & Bank
+      supabase.from('bank_accounts').select('name,current_balance').eq('is_active', true),
+      // AR — B2B outstanding
+      supabase.from('b2b_orders').select('total_value,stage').not('stage','eq','delivered').lte('created_at', cutoff + 'T23:59:59Z'),
+      // AR — Webstore unpaid/confirmed
+      supabase.from('webstore_orders').select('total').in('status',['confirmed','packed','shipped']).lte('date', cutoff),
+      // AP — Vendor bills unpaid
+      supabase.from('vendor_bills').select('amount,gst_amount,paid_amount').in('status',['unpaid','partial','overdue']).is('deleted_at',null).lte('bill_date', cutoff),
+      // Inventory value
+      supabase.from('settings').select('value').eq('key','inventory_valuation_snapshot').maybeSingle(),
+      // Salary payable (unpaid payroll current month)
+      supabase.from('payroll').select('net_salary,status').eq('status','pending').gte('month', cutoff.slice(0,7) + '-01').lte('month', cutoff),
+      // Loans (table may not exist yet — gracefully ignore)
+      supabase.from('loans').select('outstanding_balance,type').eq('active', true).then(r=>r).catch(()=>({data:[]})),
+      // Expenses YTD
+      supabase.from('company_expenses').select('amount,category').gte('date', yearStart).lte('date', cutoff).is('deleted_at',null),
+      // Revenue YTD
+      supabase.from('sales').select('final_amount,channel').gte('date', yearStart).lte('date', cutoff).eq('status','delivered'),
+      // COGS — procurement cost YTD
+      supabase.from('procurements').select('total_amount').gte('order_date', yearStart).lte('order_date', cutoff).eq('status','processed'),
+    ]);
+
+    const cashTotal = round2((bankRes.data||[]).reduce((s,b) => s + parseFloat(b.current_balance||0), 0));
+    const arB2bTotal = round2((arB2b.data||[]).reduce((s,o) => s + parseFloat(o.total_value||0), 0));
+    const arWebTotal = round2((arWebstore.data||[]).reduce((s,o) => s + parseFloat(o.total||0), 0));
+    const apTotal   = round2((apRes.data||[]).reduce((s,b) => s + round2((b.amount||0) + (b.gst_amount||0) - (b.paid_amount||0)), 0));
+    const invValue  = invRes.data?.value?.total || 0;
+    const salaryPayable = round2((salaryRes.data||[]).reduce((s,p) => s + parseFloat(p.net_salary||0), 0));
+    const shortTermLoans = round2((loanRes.data||[]).filter(l=>l.type==='short-term').reduce((s,l)=>s+parseFloat(l.outstanding_balance||0),0));
+    const longTermLoans  = round2((loanRes.data||[]).filter(l=>l.type==='long-term').reduce((s,l)=>s+parseFloat(l.outstanding_balance||0),0));
+
+    // Fixed assets (table may not exist yet)
+    let faRows = [];
+    try { const r = await supabase.from('fixed_assets').select('purchase_cost,accumulated_depreciation').eq('active', true).lte('purchase_date', cutoff); faRows = r.data||[]; } catch(e) {}
+    const faGross = round2((faRows||[]).reduce((s,a)=>s+parseFloat(a.purchase_cost||0),0));
+    const faAccumDep = round2((faRows||[]).reduce((s,a)=>s+parseFloat(a.accumulated_depreciation||0),0));
+    const faNet   = round2(faGross - faAccumDep);
+
+    const revenueYTD = round2((revenueRes.data||[]).reduce((s,r)=>s+parseFloat(r.final_amount||0),0));
+    const cogsYTD    = round2((cogRes.data||[]).reduce((s,p)=>s+parseFloat(p.total_amount||0),0));
+    const expYTD     = round2((expensesRes.data||[]).reduce((s,e)=>s+parseFloat(e.amount||0),0));
+    const netProfitYTD = round2(revenueYTD - cogsYTD - expYTD);
+
+    const totalCurrentAssets  = round2(cashTotal + arB2bTotal + arWebTotal + invValue);
+    const totalFixedAssets     = faNet;
+    const totalAssets          = round2(totalCurrentAssets + totalFixedAssets);
+    const totalCurrentLiab     = round2(apTotal + salaryPayable + shortTermLoans);
+    const totalLongTermLiab    = longTermLoans;
+    const retainedEarnings     = netProfitYTD;
+    const totalEquity          = retainedEarnings; // simplified (no share capital tracking yet)
+    const totalLiabAndEquity   = round2(totalCurrentLiab + totalLongTermLiab + totalEquity);
+
+    res.json({
+      as_of: cutoff,
+      assets: {
+        current: {
+          cash:           cashTotal,
+          accounts_receivable_b2b: arB2bTotal,
+          accounts_receivable_web: arWebTotal,
+          inventory:      invValue,
+          total:          totalCurrentAssets,
+        },
+        fixed: {
+          gross:          faGross,
+          accum_dep:      faAccumDep,
+          net:            faNet,
+          total:          totalFixedAssets,
+        },
+        total: totalAssets,
+      },
+      liabilities: {
+        current: {
+          accounts_payable: apTotal,
+          salary_payable:   salaryPayable,
+          short_term_loans: shortTermLoans,
+          total:            totalCurrentLiab,
+        },
+        long_term: {
+          loans: longTermLoans,
+          total: totalLongTermLiab,
+        },
+        total: round2(totalCurrentLiab + totalLongTermLiab),
+      },
+      equity: {
+        retained_earnings_ytd: retainedEarnings,
+        total: totalEquity,
+      },
+      total_liabilities_and_equity: totalLiabAndEquity,
+      balanced: Math.abs(totalAssets - totalLiabAndEquity) < 100,
+      revenue_ytd: revenueYTD,
+      cogs_ytd:    cogsYTD,
+      expenses_ytd: expYTD,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FIXED ASSETS & DEPRECIATION
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/fixed-assets', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('fixed_assets').select('*').order('purchase_date', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/fixed-assets', auth, async (req, res) => {
+  try {
+    const { name, category, purchase_date, purchase_cost, useful_life_years, method, salvage_value, notes } = req.body;
+    if (!name || !purchase_date || !purchase_cost) return res.status(400).json({ error: 'name, purchase_date, purchase_cost required' });
+    const cost = round2(purchase_cost);
+    const salvage = round2(salvage_value || 0);
+    const life = parseInt(useful_life_years) || 5;
+    const annualDep = method === 'wdv'
+      ? round2(cost * 0.2) // 20% WDV (Written Down Value — common in India)
+      : round2((cost - salvage) / life); // Straight Line
+    const { data, error } = await supabase.from('fixed_assets').insert({
+      name, category: category||'Equipment', purchase_date, purchase_cost: cost,
+      salvage_value: salvage, useful_life_years: life, method: method||'slm',
+      annual_depreciation: annualDep, accumulated_depreciation: 0, book_value: cost,
+      active: true, notes: notes||'',
+    }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.status(201).json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.put('/fixed-assets/:id', auth, async (req, res) => {
+  try {
+    const allowed = ['name','category','notes','active','disposal_date','disposal_value'];
+    const updates = {};
+    for (const k of allowed) if (req.body[k] !== undefined) updates[k] = req.body[k];
+    if (req.body.disposal_date) {
+      updates.active = false;
+      updates.disposal_value = round2(req.body.disposal_value || 0);
+    }
+    const { data, error } = await supabase.from('fixed_assets').update(updates).eq('id', req.params.id).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /fixed-assets/run-depreciation — runs monthly depreciation for all active assets
+router.post('/fixed-assets/run-depreciation', auth, async (req, res) => {
+  try {
+    const { month } = req.body; // 'YYYY-MM'
+    if (!month) return res.status(400).json({ error: 'month required (YYYY-MM)' });
+    const { data: assets } = await supabase.from('fixed_assets').select('*').eq('active', true);
+    if (!assets?.length) return res.json({ processed: 0 });
+
+    const results = [];
+    for (const asset of assets) {
+      if (asset.accumulated_depreciation >= (asset.purchase_cost - (asset.salvage_value||0))) continue;
+      const monthly = round2(asset.annual_depreciation / 12);
+      const maxMore = round2((asset.purchase_cost - (asset.salvage_value||0)) - asset.accumulated_depreciation);
+      const depAmt  = Math.min(monthly, maxMore);
+      const newAccum = round2((asset.accumulated_depreciation||0) + depAmt);
+      const newBook  = round2(asset.purchase_cost - newAccum);
+
+      await supabase.from('fixed_assets').update({ accumulated_depreciation: newAccum, book_value: newBook }).eq('id', asset.id);
+
+      // Create journal entry for depreciation
+      const { data: je } = await supabase.from('journal_entries').insert({
+        date: month + '-01', ref_no: `DEP-${month}-${asset.id.slice(0,6)}`,
+        description: `Depreciation — ${asset.name} (${month})`,
+        total_amount: depAmt, created_by: req.user?.email||'system',
+      }).select().single();
+
+      if (je?.id) {
+        await supabase.from('journal_lines').insert([
+          { journal_id: je.id, account_code:'6800', account_name:'Depreciation Expense', debit: depAmt, credit: 0 },
+          { journal_id: je.id, account_code:'1590', account_name:'Accumulated Depreciation', debit: 0, credit: depAmt },
+        ]);
+      }
+      results.push({ asset: asset.name, amount: depAmt });
+    }
+    res.json({ processed: results.length, entries: results });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// LOAN MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/loans', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('loans').select('*').order('disbursement_date', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/loans', auth, async (req, res) => {
+  try {
+    const { name, lender, type, principal, interest_rate, tenure_months, disbursement_date, emi, bank_account_id, notes } = req.body;
+    if (!name || !principal || !disbursement_date) return res.status(400).json({ error: 'name, principal, disbursement_date required' });
+    const p = round2(principal);
+    const r = parseFloat(interest_rate || 0);
+    const n = parseInt(tenure_months || 12);
+    // Calculate EMI if not provided: EMI = P × r/12 × (1+r/12)^n / ((1+r/12)^n - 1)
+    let calcEmi = emi ? round2(emi) : 0;
+    if (!calcEmi && r > 0) {
+      const monthlyR = r / 100 / 12;
+      calcEmi = round2(p * monthlyR * Math.pow(1+monthlyR, n) / (Math.pow(1+monthlyR, n) - 1));
+    } else if (!calcEmi) {
+      calcEmi = round2(p / n);
+    }
+    const { data, error } = await supabase.from('loans').insert({
+      name, lender: lender||'', type: type||'long-term', principal: p,
+      interest_rate: r, tenure_months: n, emi: calcEmi,
+      outstanding_balance: p, disbursement_date, bank_account_id: bank_account_id||null,
+      active: true, notes: notes||'',
+    }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.status(201).json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.put('/loans/:id', auth, async (req, res) => {
+  try {
+    const allowed = ['name','lender','notes','active'];
+    const updates = {};
+    for (const k of allowed) if (req.body[k] !== undefined) updates[k] = req.body[k];
+    const { data, error } = await supabase.from('loans').update(updates).eq('id', req.params.id).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/loans/:id/schedule', auth, async (req, res) => {
+  try {
+    const { data: loan } = await supabase.from('loans').select('*').eq('id', req.params.id).single();
+    if (!loan) return res.status(404).json({ error: 'Loan not found' });
+    const { data: payments } = await supabase.from('loan_payments').select('*').eq('loan_id', req.params.id).order('payment_date');
+
+    const schedule = [];
+    let balance = round2(loan.principal);
+    const monthlyR = (loan.interest_rate / 100) / 12;
+    const paidSet = new Set((payments||[]).map(p => p.period));
+
+    let d = new Date(loan.disbursement_date);
+    for (let i = 1; i <= loan.tenure_months; i++) {
+      d = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+      const period = d.toISOString().slice(0,7);
+      const interest = round2(balance * monthlyR);
+      const principal_part = round2(Math.min(loan.emi - interest, balance));
+      balance = round2(Math.max(0, balance - principal_part));
+      schedule.push({
+        installment: i, period, emi: loan.emi,
+        principal_part, interest_part: interest, closing_balance: balance,
+        paid: paidSet.has(period),
+      });
+      if (balance === 0) break;
+    }
+    res.json({ loan, schedule, payments: payments||[] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/loans/:id/payments', auth, async (req, res) => {
+  try {
+    const { period, principal_paid, interest_paid, date, bank_account_id, reference } = req.body;
+    if (!period || !date) return res.status(400).json({ error: 'period, date required' });
+    const pp = round2(principal_paid || 0);
+    const ip = round2(interest_paid  || 0);
+    const { data, error } = await supabase.from('loan_payments').insert({
+      loan_id: req.params.id, period, principal_paid: pp, interest_paid: ip,
+      total_paid: round2(pp+ip), payment_date: date, bank_account_id: bank_account_id||null,
+      reference: reference||'', created_by: req.user?.email||'',
+    }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    // Reduce outstanding balance
+    const { data: loanCurrent } = await supabase.from('loans').select('outstanding_balance').eq('id', req.params.id).single();
+    const newBalance = round2((loanCurrent?.outstanding_balance||0) - pp);
+    await supabase.from('loans').update({ outstanding_balance: Math.max(0, newBalance) }).eq('id', req.params.id);
+    // Bank transaction
+    if (bank_account_id) {
+      await supabase.from('bank_transactions').insert({ bank_account_id, date, type:'debit', amount: round2(pp+ip), description: `Loan EMI — ${period}`, category:'Loan Repayment', created_by: req.user?.email||'' });
+      await adjustBalance(bank_account_id, -round2(pp+ip));
+    }
+    // Journal entry: Dr Loan A/C + Dr Interest Expense / Cr Bank
+    const { data: je } = await supabase.from('journal_entries').insert({ date, ref_no:`LOAN-EMI-${period}`, description:`Loan EMI payment — ${period}`, total_amount: round2(pp+ip), created_by: req.user?.email||'' }).select().single();
+    if (je?.id) {
+      const lines = [{ journal_id: je.id, account_code:'2400', account_name:'Long-term Loan', debit: pp, credit: 0 }];
+      if (ip > 0) lines.push({ journal_id: je.id, account_code:'6900', account_name:'Interest Expense', debit: ip, credit: 0 });
+      lines.push({ journal_id: je.id, account_code:'1100', account_name:'Bank - Current Account', debit: 0, credit: round2(pp+ip) });
+      await supabase.from('journal_lines').insert(lines);
+    }
+    res.status(201).json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BUDGET vs ACTUAL
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/budget', auth, async (req, res) => {
+  try {
+    const { fy } = req.query; // 'YYYY-YYYY' e.g. '2025-2026'
+    let q = supabase.from('budget_lines').select('*').order('month').order('category');
+    if (fy) {
+      const [y1] = fy.split('-');
+      q = q.gte('month', y1 + '-04-01').lte('month', (parseInt(y1)+1) + '-03-31');
+    }
+    const { data: budget } = await q;
+    res.json(budget || []);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/budget', auth, async (req, res) => {
+  try {
+    const { month, category, budgeted_amount, notes } = req.body;
+    if (!month || !category || budgeted_amount == null) return res.status(400).json({ error: 'month, category, budgeted_amount required' });
+    const { data, error } = await supabase.from('budget_lines').upsert({
+      month, category, budgeted_amount: round2(budgeted_amount), notes: notes||'',
+      created_by: req.user?.email||'',
+    }, { onConflict: 'month,category' }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/budget/variance', auth, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const dateFrom = from || new Date().toISOString().slice(0,7) + '-01';
+    const dateTo   = to   || new Date().toISOString().slice(0,10);
+
+    // Get budget lines for period
+    const { data: budgetLines } = await supabase.from('budget_lines').select('*').gte('month', dateFrom.slice(0,7)).lte('month', dateTo.slice(0,7));
+
+    // Get actual expenses by category
+    const { data: actuals } = await supabase.from('company_expenses').select('category,amount').gte('date', dateFrom).lte('date', dateTo).is('deleted_at', null);
+    // Also vendor bills (as operational costs)
+    const { data: bills } = await supabase.from('vendor_bills').select('category,amount').gte('bill_date', dateFrom).lte('bill_date', dateTo).is('deleted_at', null);
+
+    const actualByCategory = {};
+    for (const e of actuals||[]) { actualByCategory[e.category] = round2((actualByCategory[e.category]||0) + parseFloat(e.amount||0)); }
+    for (const b of bills||[])   { actualByCategory[b.category||'Vendor Bills'] = round2((actualByCategory[b.category||'Vendor Bills']||0) + parseFloat(b.amount||0)); }
+
+    // Get actual revenue
+    const { data: sales } = await supabase.from('sales').select('final_amount,channel').gte('date', dateFrom).lte('date', dateTo);
+    const { data: wOrders } = await supabase.from('webstore_orders').select('total,channel').gte('date', dateFrom).lte('date', dateTo).in('status',['confirmed','packed','shipped','delivered']);
+    const revenueActual = round2(
+      (sales||[]).reduce((s,r)=>s+parseFloat(r.final_amount||0),0) +
+      (wOrders||[]).reduce((s,r)=>s+parseFloat(r.total||0),0)
+    );
+
+    const rows = (budgetLines||[]).map(bl => {
+      const actual = bl.category === 'Revenue' ? revenueActual : (actualByCategory[bl.category]||0);
+      const variance = bl.category === 'Revenue'
+        ? round2(actual - bl.budgeted_amount)        // positive = beat target
+        : round2(bl.budgeted_amount - actual);        // positive = under budget (good)
+      const pct = bl.budgeted_amount > 0 ? round2(variance / bl.budgeted_amount * 100) : null;
+      return { ...bl, actual, variance, variance_pct: pct };
+    });
+
+    const totalBudget  = round2(rows.reduce((s,r)=>s+r.budgeted_amount,0));
+    const totalActual  = round2(rows.reduce((s,r)=>s+r.actual,0));
+    res.json({ rows, totalBudget, totalActual, revenue_actual: revenueActual });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DETAILED AR/AP AGING (customer & vendor breakdown)
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/ar-aging-detail', auth, async (req, res) => {
+  try {
+    const today = new Date();
+    const { data: b2b } = await supabase.from('b2b_orders').select('id,order_no,customer_name,total_value,created_at').not('stage','eq','delivered');
+    const { data: web } = await supabase.from('webstore_orders').select('id,order_no,customer,total,date').in('status',['confirmed','packed']);
+
+    const rows = [];
+    for (const o of b2b||[]) {
+      const days = Math.floor((today - new Date(o.created_at)) / 86400000);
+      rows.push({ id:o.id, ref:o.order_no, customer:o.customer_name, amount:round2(o.total_value||0), days, bucket: days<=30?'0-30':days<=60?'31-60':days<=90?'61-90':'90+', source:'B2B' });
+    }
+    for (const o of web||[]) {
+      const days = Math.floor((today - new Date(o.date)) / 86400000);
+      const cust = typeof o.customer === 'object' ? (o.customer?.name||'Guest') : 'Guest';
+      rows.push({ id:o.id, ref:o.order_no, customer:cust, amount:round2(o.total||0), days, bucket: days<=30?'0-30':days<=60?'31-60':days<=90?'61-90':'90+', source:'Webstore' });
+    }
+
+    // Group by customer for summary
+    const byCustomer = {};
+    for (const r of rows) {
+      if (!byCustomer[r.customer]) byCustomer[r.customer] = { customer: r.customer, total: 0, oldest: 0, invoices: 0 };
+      byCustomer[r.customer].total   += r.amount;
+      byCustomer[r.customer].oldest   = Math.max(byCustomer[r.customer].oldest, r.days);
+      byCustomer[r.customer].invoices += 1;
+    }
+
+    const buckets = { '0-30':0, '31-60':0, '61-90':0, '90+':0 };
+    for (const r of rows) buckets[r.bucket] = round2((buckets[r.bucket]||0) + r.amount);
+
+    res.json({ rows: rows.sort((a,b)=>b.days-a.days), byCustomer: Object.values(byCustomer).sort((a,b)=>b.total-a.total), buckets, total: round2(rows.reduce((s,r)=>s+r.amount,0)) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/ap-aging-detail', auth, async (req, res) => {
+  try {
+    const today = new Date();
+    const { data: bills } = await supabase.from('vendor_bills').select('id,bill_no,vendor_name,amount,gst_amount,paid_amount,due_date,bill_date,category').in('status',['unpaid','partial','overdue']).is('deleted_at',null);
+
+    const rows = (bills||[]).map(b => {
+      const outstanding = round2((b.amount||0) + (b.gst_amount||0) - (b.paid_amount||0));
+      const daysOverdue = b.due_date ? Math.max(0, Math.floor((today - new Date(b.due_date)) / 86400000)) : 0;
+      const daysOld     = Math.floor((today - new Date(b.bill_date)) / 86400000);
+      return {
+        id: b.id, ref: b.bill_no||'—', vendor: b.vendor_name, outstanding, due_date: b.due_date,
+        days_overdue: daysOverdue, days_old: daysOld, category: b.category||'—',
+        bucket: daysOverdue===0?'current':daysOverdue<=30?'0-30':daysOverdue<=60?'31-60':daysOverdue<=90?'61-90':'90+',
+      };
+    });
+
+    const byVendor = {};
+    for (const r of rows) {
+      if (!byVendor[r.vendor]) byVendor[r.vendor] = { vendor: r.vendor, total: 0, oldest: 0, invoices: 0 };
+      byVendor[r.vendor].total    += r.outstanding;
+      byVendor[r.vendor].oldest    = Math.max(byVendor[r.vendor].oldest, r.days_overdue);
+      byVendor[r.vendor].invoices += 1;
+    }
+
+    const buckets = { current:0, '0-30':0, '31-60':0, '61-90':0, '90+':0 };
+    for (const r of rows) buckets[r.bucket] = round2((buckets[r.bucket]||0) + r.outstanding);
+
+    res.json({ rows: rows.sort((a,b)=>b.days_overdue-a.days_overdue), byVendor: Object.values(byVendor).sort((a,b)=>b.total-a.total), buckets, total: round2(rows.reduce((s,r)=>s+r.outstanding,0)) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 module.exports = router;

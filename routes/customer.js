@@ -282,7 +282,7 @@ router.post('/oauth/facebook', async (req, res) => {
 
 // GET /api/customer/me
 router.get('/me', custAuth, async (req, res) => {
-  const { data } = await supabase.from('customers').select('id,name,email,phone,address,city,state,pincode').eq('id', req.customer.id).single();
+  const { data } = await supabase.from('customers').select('id,name,email,phone,address,city,state,pincode,birthday').eq('id', req.customer.id).single();
   res.json(data ? decryptCustomer(data) : {});
 });
 
@@ -307,7 +307,7 @@ router.get('/orders', custAuth, async (req, res) => {
 // POST /api/customer/update
 router.post('/update', custAuth, async (req, res) => {
   try {
-    const { name, phone, address, city, state, pincode } = req.body;
+    const { name, phone, address, city, state, pincode, birthday } = req.body;
     const updates = {};
     if (name)    updates.name    = encrypt(name.trim());
     if (phone)   updates.phone   = encrypt(phone);
@@ -315,7 +315,8 @@ router.post('/update', custAuth, async (req, res) => {
     if (city)    updates.city    = encrypt(city);
     if (state)   updates.state   = encrypt(state);
     if (pincode) updates.pincode = encrypt(pincode);
-    const { data, error } = await supabase.from('customers').update(updates).eq('id', req.customer.id).select('id,name,email,phone,address,city,state,pincode').single();
+    if (birthday) updates.birthday = birthday; // stored as YYYY-MM-DD, not PII
+    const { data, error } = await supabase.from('customers').update(updates).eq('id', req.customer.id).select('id,name,email,phone,address,city,state,pincode,birthday').single();
     if (error) return res.status(400).json({ error: error.message });
     res.json({ customer: decryptCustomer(data) });
   } catch (err) { res.status(500).json({ error: err.message }); }
@@ -436,7 +437,7 @@ router.post('/referral/validate', async (req, res) => {
     if (!code) return res.status(400).json({ error: 'code required' });
     const { data } = await supabase.from('settings').select('value').eq('key', `ref_code_${code.toUpperCase()}`).maybeSingle();
     if (!data?.value) return res.status(404).json({ error: 'Invalid referral code' });
-    res.json({ valid: true, discount: 50, code: code.toUpperCase() }); // ₹50 discount for using referral
+    res.json({ valid: true, discount: 100, code: code.toUpperCase() }); // ₹100 discount for using referral
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 

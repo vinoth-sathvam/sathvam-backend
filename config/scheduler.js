@@ -356,7 +356,104 @@ function startScheduler() {
     } catch (e) { console.error('Low stock alert failed:', e.message); }
   });
 
-  console.log('Scheduler started — weekly report Mon 8 AM, daily reminders 9 AM / 1:30 PM / 7 PM IST, monitor agent 9 AM IST, low-stock 8 AM IST');
+  // ── Birthday coupon: 9:00 AM IST (3:30 AM UTC) daily ─────────────────────
+  cron.schedule('30 3 * * *', async () => {
+    try {
+      const { decrypt } = require('../config/crypto');
+      const today = new Date();
+      const mm = String(today.getMonth() + 1).padStart(2, '0');
+      const dd = String(today.getDate()).padStart(2, '0');
+      const monthDay = `${mm}-${dd}`; // compare LIKE %-MM-DD
+
+      // Find customers whose birthday matches today (stored as YYYY-MM-DD)
+      const { data: bCustomers } = await supabase.from('customers')
+        .select('id,name,email,phone,birthday')
+        .like('birthday', `%-${monthDay}`);
+
+      if (!bCustomers?.length) return;
+
+      const sendBirthdayWA = async (phone, msg) => {
+        const token   = process.env.BOTSAILOR_API_TOKEN;
+        const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
+        if (!token || !phoneId) return;
+        try {
+          await fetch('https://botsailor.com/api/v1/whatsapp/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message: msg }).toString(),
+          });
+        } catch(e) { console.error('Birthday WA failed:', e.message); }
+      };
+
+      for (const c of bCustomers) {
+        try {
+          const name  = decrypt(c.name)  || 'Valued Customer';
+          const email = decrypt(c.email) || '';
+          const phone = (decrypt(c.phone) || '').replace(/\D/g, '');
+          const firstName = name.split(' ')[0];
+
+          // Generate unique birthday coupon code: BDAY<customerIdPrefix>
+          const couponCode = `BDAY${c.id.replace(/-/g,'').slice(0,6).toUpperCase()}`;
+          const expiresAt  = new Date(today.getFullYear(), today.getMonth(), today.getDate() + 7).toISOString().slice(0,10);
+
+          // Upsert coupon in coupons table
+          await supabase.from('coupons').upsert({
+            code:        couponCode,
+            type:        'percent',
+            value:       10,
+            min_order:   0,
+            max_uses:    1,
+            uses_count:  0,
+            expires_at:  expiresAt,
+            active:      true,
+            description: `Birthday coupon for customer ${c.id}`,
+          }, { onConflict: 'code', ignoreDuplicates: false });
+
+          const waMsg =
+            `🎂 *Happy Birthday, ${firstName}!*\n\n` +
+            `சத்துவம் குடும்பத்தின் சார்பில் உங்களுக்கு பிறந்தநாள் வாழ்த்துக்கள்! 🌿\n` +
+            `_Wishing you a wonderful birthday from the Sathvam family!_\n\n` +
+            `🎁 உங்கள் சிறப்பு பிறந்தநாள் பரிசு:\n` +
+            `*${couponCode}* — 10% off your next order!\n` +
+            `_(Valid for 7 days — expires ${expiresAt})_\n\n` +
+            `🛒 Shop now: *sathvam.in*\n` +
+            `❓ Help: +91 70921 77092`;
+
+          if (phone) {
+            await sendBirthdayWA(phone, waMsg);
+            console.log(`[BIRTHDAY] Coupon ${couponCode} sent via WA to ${phone.slice(0,4)}****`);
+          }
+          if (email && process.env.SMTP_USER) {
+            await mailer.sendMail({
+              from:    process.env.SMTP_FROM || 'Sathvam <noreply@sathvam.in>',
+              to:      email,
+              subject: `🎂 Happy Birthday ${firstName}! Your special gift inside`,
+              html:    `<div style="font-family:sans-serif;max-width:520px;margin:0 auto">
+                <div style="background:#1a5c2a;color:#fff;padding:20px 24px;border-radius:8px 8px 0 0;text-align:center">
+                  <div style="font-size:40px">🎂</div>
+                  <h2 style="margin:8px 0">Happy Birthday, ${firstName}!</h2>
+                </div>
+                <div style="border:1px solid #ddd;border-top:none;padding:24px;border-radius:0 0 8px 8px;text-align:center">
+                  <p style="color:#374151;font-size:15px">சத்துவம் குடும்பத்தின் சார்பில் உங்களுக்கு பிறந்தநாள் வாழ்த்துக்கள்!</p>
+                  <p style="color:#374151;font-size:15px">Wishing you a wonderful birthday from the Sathvam family! 🌿</p>
+                  <div style="background:#f0fdf4;border:2px dashed #16a34a;border-radius:12px;padding:20px;margin:20px 0">
+                    <p style="margin:0 0 8px;color:#374151;font-size:14px">Your Birthday Gift</p>
+                    <div style="font-size:28px;font-weight:bold;color:#16a34a;letter-spacing:4px">${couponCode}</div>
+                    <p style="margin:8px 0 0;color:#6b7280;font-size:13px">10% off your next order · Valid until ${expiresAt}</p>
+                  </div>
+                  <a href="https://sathvam.in" style="display:inline-block;background:#1a5c2a;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:bold;font-size:15px">Shop Now →</a>
+                </div>
+              </div>`,
+            });
+            console.log(`[BIRTHDAY] Coupon email sent to ${email.slice(0,3)}***`);
+          }
+        } catch(ce) { console.error(`[BIRTHDAY] Failed for customer ${c.id}:`, ce.message); }
+      }
+      console.log(`[BIRTHDAY] Processed ${bCustomers.length} birthday(s) for ${mm}-${dd}`);
+    } catch(e) { console.error('[BIRTHDAY] Cron failed:', e.message); }
+  });
+
+  console.log('Scheduler started — weekly report Mon 8 AM, daily reminders 9 AM / 1:30 PM / 7 PM IST, monitor agent 9 AM IST, low-stock 8 AM IST, birthday coupons 9 AM IST');
 }
 
 module.exports = { startScheduler, buildWeeklyReport, checkDailyTasks, sendReminders };

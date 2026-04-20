@@ -123,15 +123,25 @@ async function sendCustomerOrderWhatsApp(order) {
   const phone = (cust.phone || '').replace(/\D/g, '');
   if (!phone) return;
 
+  const firstName = (cust.name || '').split(' ')[0] || 'அன்பான வாடிக்கையாளர்';
   const items = (order.items || []).map(i => `  • ${i.name} × ${i.qty}`).join('\n');
+
+  const firstOrderBonus = order.isFirstOrder
+    ? `\n🎉 *முதல் ஆர்டர் சிறப்பு!*\n` +
+      `_Welcome to Sathvam family! 🌱_\n` +
+      `உங்கள் அடுத்த ஆர்டருக்கு *WELCOME5* என்று குறிப்பிட்டு ₹50 சேமிக்கலாம்!\n` +
+      `_Use code *WELCOME5* on your next order and save ₹50!_\n`
+    : '';
+
   const text  =
     `🌿 *சத்துவம் இயற்கை உணவுகள்*\n` +
     `_Sathvam Natural Products_\n` +
     `━━━━━━━━━━━━━━━━━━━━━\n\n` +
     `✅ *ஆர்டர் உறுதிப்படுத்தப்பட்டது!*\n` +
     `_Order Confirmed & Payment Received!_\n\n` +
-    `வணக்கம் ${cust.name || 'அன்பான வாடிக்கையாளர்'}! 🙏\n` +
-    `_Dear ${cust.name || 'Valued Customer'}, thank you for choosing Sathvam!_\n\n` +
+    `வணக்கம் ${firstName}! 🙏\n` +
+    `_Dear ${cust.name || 'Valued Customer'}, thank you for choosing Sathvam!_\n` +
+    firstOrderBonus + `\n` +
     `📋 *ஆர்டர் எண்:* ${order.orderNo}\n` +
     `💳 *கட்டணம்:* ₹${parseFloat(order.total || 0).toLocaleString('en-IN')} பெறப்பட்டது\n` +
     `_Payment of ₹${parseFloat(order.total || 0).toLocaleString('en-IN')} received_\n\n` +
@@ -273,8 +283,17 @@ router.post('/verify', async (req, res) => {
       await sendWhatsAppAlert({ ...o, paymentId: razorpay_payment_id });
       await sendOrderEmail(o, razorpay_payment_id);
 
-      // WhatsApp confirmation to customer
-      await sendCustomerOrderWhatsApp({ ...o, orderNo: generatedOrderNo });
+      // Detect first-time customer (count orders with same email hash)
+      let isFirstOrder = false;
+      if (custEmailHash) {
+        const { count } = await supabase.from('webstore_orders')
+          .select('id', { count: 'exact', head: true })
+          .eq('customer_email_hash', custEmailHash);
+        isFirstOrder = (count || 0) <= 1; // just saved = 1 means first order
+      }
+
+      // WhatsApp confirmation to customer (first-order gets special message)
+      await sendCustomerOrderWhatsApp({ ...o, orderNo: generatedOrderNo, isFirstOrder });
 
       // Invoice/confirmation email to customer
       await sendCustomerInvoice({ ...o, orderNo: generatedOrderNo }, razorpay_payment_id);
