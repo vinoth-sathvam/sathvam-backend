@@ -3,6 +3,7 @@ const https = require('https');
 const http = require('http');
 const supabase = require('../config/supabase');
 const { auth } = require('../middleware/auth');
+const { decrypt } = require('../config/crypto');
 const router = express.Router();
 
 const TODAY = () => new Date().toISOString().slice(0, 10);
@@ -715,7 +716,12 @@ router.get('/carts', auth, async (req, res) => {
     const enrichCart = (c) => {
       if (c.session_id && c.session_id.startsWith('cust_')) {
         const cust = custMap[c.session_id.replace('cust_', '')];
-        if (cust) return { ...c, customer_name: cust.name, customer_email: cust.email, customer_phone: cust.phone };
+        if (cust) return {
+          ...c,
+          customer_name:  decrypt(cust.name),
+          customer_email: decrypt(cust.email),
+          customer_phone: decrypt(cust.phone),
+        };
       }
       return c;
     };
