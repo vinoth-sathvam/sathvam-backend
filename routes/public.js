@@ -1123,4 +1123,6 @@ router.get('/store-config', async (req, res) => {
   } catch (e) { res.json({ couponsEnabled: true, giftPackingEnabled: true }); }
 });
 
+const bustCache = () => { Object.keys(cache).forEach(k => delete cache[k]); };
 module.exports = router;
+module.exports.bustCache = bustCache;

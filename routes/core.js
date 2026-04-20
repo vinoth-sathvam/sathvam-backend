@@ -6,6 +6,7 @@ const nodemailer = require('nodemailer');
 const supabase = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
 const { createInvoice, recordPayment } = require('../config/zoho');
+const { bustCache } = require('./public');
 
 const ENV_PATH = path.join(__dirname, '../.env');
 
@@ -441,6 +442,9 @@ products.post('/bulk-offer', auth, requireRole('admin','manager'), async (req, r
     ));
   }
 
+  // Bust the public products cache so the store immediately shows updated offer prices
+  bustCache();
+
   res.json({ ok: true, products_updated: updated, emails_sent: emailSent, total_recipients: recipients.length, offer_ends: endDateTime });
 });
 
@@ -448,6 +452,7 @@ products.post('/bulk-offer', auth, requireRole('admin','manager'), async (req, r
 products.post('/clear-offers', auth, requireRole('admin'), async (req, res) => {
   const { error } = await supabase.from('products').update({ offer_label: null, offer_price: null, offer_ends_at: null }).eq('active', true);
   if (error) return res.status(400).json({ error: error.message });
+  bustCache();
   res.json({ ok: true });
 });
 
