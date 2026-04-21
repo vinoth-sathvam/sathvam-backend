@@ -2,8 +2,9 @@ const express  = require('express');
 const router   = express.Router();
 const { auth } = require('../middleware/auth');
 const supabase  = require('../config/supabase');
-const { exec }  = require('child_process');
-const path      = require('path');
+
+// monitor-api runs on the host — backend is in Docker, cannot exec scripts directly
+const MONITOR_API = 'http://host.docker.internal:9191';
 
 // Only admin/CEO/accountant can access
 const allowedRoles = ['admin', 'ceo', 'accountant', 'manager'];
@@ -89,17 +90,15 @@ router.patch('/findings/:id/resolve', auth, roleGuard, async (req, res) => {
   }
 });
 
-// POST /api/ca-agent/run — trigger a manual run
+// POST /api/ca-agent/run — trigger a manual run via monitor-api on the host
+// (backend runs in Docker; ca-agent.js needs host node + node_modules)
 router.post('/run', auth, roleGuard, async (req, res) => {
   try {
-    const scriptPath = path.join(__dirname, '../scripts/ca-agent.js');
-    // Fire and forget — agent runs in background
-    exec(`node ${scriptPath} >> /var/log/sathvam-ca-agent.log 2>&1`, (err) => {
-      if (err) console.error('[CA Agent] manual run error:', err.message);
-    });
-    res.json({ ok: true, message: 'CA Agent started — check findings in ~30 seconds' });
+    const r = await fetch(`${MONITOR_API}/ca-agent-run`, { method: 'POST' });
+    const data = await r.json();
+    res.json(data);
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: `Could not reach monitor-api: ${e.message}` });
   }
 });
 
