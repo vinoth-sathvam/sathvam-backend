@@ -19,10 +19,13 @@ const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) { console.error('FATAL: JWT_SECRET not set'); process.exit(1); }
 
 // Cookie options for customer JWT (httpOnly — XSS-safe)
+// sameSite:'none' + domain:'.sathvam.in' allows the cookie to be sent cross-subdomain
+// (sathvam.in → api.sathvam.in). Requires secure:true (HTTPS only).
 const CUST_COOKIE_OPTS = {
   httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: 'strict',
+  secure: true, // always required when sameSite:'none'
+  sameSite: 'none',
+  domain: process.env.NODE_ENV === 'production' ? '.sathvam.in' : undefined,
   maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
 };
 function setCustCookie(res, token) {
