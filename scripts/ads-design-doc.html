@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<title>Google Ads API Tool — Design Document | Sathvam Natural Products</title>
+<style>
+  body { font-family: Arial, sans-serif; font-size: 13px; color: #222; max-width: 750px; margin: 40px auto; padding: 0 20px; line-height: 1.6; }
+  h1 { font-size: 20px; color: #1a1a1a; border-bottom: 2px solid #333; padding-bottom: 8px; }
+  h2 { font-size: 15px; color: #333; margin-top: 28px; border-left: 4px solid #4a90d9; padding-left: 10px; }
+  h3 { font-size: 13px; color: #444; margin-top: 16px; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 12px; }
+  th { background: #f0f4f8; text-align: left; padding: 8px 10px; border: 1px solid #ccc; }
+  td { padding: 7px 10px; border: 1px solid #ddd; vertical-align: top; }
+  tr:nth-child(even) td { background: #f9f9f9; }
+  .meta { background: #f5f7fa; border: 1px solid #ddd; padding: 14px 18px; border-radius: 4px; margin-bottom: 24px; font-size: 12px; }
+  .meta p { margin: 4px 0; }
+  ul { margin: 6px 0; padding-left: 20px; }
+  li { margin: 3px 0; }
+  .note { background: #fff8e1; border-left: 4px solid #f9a825; padding: 8px 12px; font-size: 12px; margin: 10px 0; }
+</style>
+</head>
+<body>
+
+<h1>Google Ads API Tool — Design Document</h1>
+
+<div class="meta">
+  <p><strong>Company:</strong> Sathvam Natural Products</p>
+  <p><strong>Website:</strong> https://www.sathvam.in</p>
+  <p><strong>Contact:</strong> vinoth@sathvam.in</p>
+  <p><strong>MCC ID:</strong> 681-564-6913</p>
+  <p><strong>Document Date:</strong> April 2026</p>
+  <p><strong>Tool Type:</strong> Internal business tool — not for public or third-party use</p>
+</div>
+
+<h2>1. Company Overview</h2>
+<p>
+  Sathvam Natural Products is a cold-pressed oil manufacturing company headquartered in Karur, Tamil Nadu, India.
+  We manufacture and sell 100% pure cold-pressed oils (groundnut, sesame, coconut), millets, organic spices, and
+  natural products directly to consumers across India through our e-commerce website <strong>sathvam.in</strong>.
+</p>
+<p>
+  All products are manufactured in-house at our factory in Karur. We sell factory-direct with no intermediaries.
+  Our primary markets are Tamil Nadu, Karnataka (Bangalore), Telangana (Hyderabad), Kerala, and pan India.
+</p>
+
+<h2>2. Purpose of the Google Ads API Tool</h2>
+<p>
+  We are building an <strong>internal campaign management module</strong> integrated into our existing
+  business ERP and e-commerce admin panel (admin.sathvam.in). This tool allows our marketing team to
+  create, monitor, pause, and report on our own Google Ads campaigns without switching between multiple platforms.
+</p>
+<p>
+  The tool is used <strong>exclusively for managing Sathvam's own Google Ads account</strong>. It does not
+  manage accounts for any third-party clients or external businesses.
+</p>
+
+<h2>3. Tool Architecture</h2>
+
+<h3>3.1 Technology Stack</h3>
+<table>
+  <tr><th>Component</th><th>Technology</th></tr>
+  <tr><td>Backend API</td><td>Node.js / Express.js (hosted on our own server)</td></tr>
+  <tr><td>Frontend Admin Panel</td><td>React.js SPA (admin.sathvam.in)</td></tr>
+  <tr><td>Google Ads API Access</td><td>REST API v18 via axios HTTP client</td></tr>
+  <tr><td>Authentication</td><td>OAuth2 with offline refresh token</td></tr>
+  <tr><td>Hosting</td><td>Private VPS server, Docker containers</td></tr>
+  <tr><td>Database</td><td>Supabase (PostgreSQL) — for storing campaign reports</td></tr>
+</table>
+
+<h3>3.2 System Flow</h3>
+<table>
+  <tr><th>Step</th><th>Description</th></tr>
+  <tr><td>1</td><td>Admin user logs into admin.sathvam.in using secure JWT cookie authentication</td></tr>
+  <tr><td>2</td><td>Admin navigates to the "Google Ads" tab in the marketing section</td></tr>
+  <tr><td>3</td><td>Frontend calls our backend API (api.sathvam.in/api/google-ads/*)</td></tr>
+  <tr><td>4</td><td>Backend uses stored OAuth2 refresh token to get a fresh access token from Google</td></tr>
+  <tr><td>5</td><td>Backend makes authenticated REST API calls to Google Ads API v18</td></tr>
+  <tr><td>6</td><td>Results (campaigns, metrics, keywords) are returned to the admin panel</td></tr>
+</table>
+
+<h2>4. Google Ads API Features Used</h2>
+<table>
+  <tr><th>API Feature</th><th>Purpose</th></tr>
+  <tr><td>Campaign Management</td><td>Create search campaigns for each city target market (TN, Bangalore, Hyderabad, Kerala, Pan India)</td></tr>
+  <tr><td>Ad Group Management</td><td>Create ad groups per product category (Cold Pressed Oils, Millets, Spices)</td></tr>
+  <tr><td>Keyword Management</td><td>Add relevant search keywords with PHRASE and BROAD match types</td></tr>
+  <tr><td>Responsive Search Ads</td><td>Create ads with multiple headlines and descriptions for our products</td></tr>
+  <tr><td>Campaign Status Update</td><td>Enable or pause campaigns based on stock and marketing decisions</td></tr>
+  <tr><td>Performance Reporting</td><td>Fetch impressions, clicks, cost, conversions via GoogleAds:search query</td></tr>
+  <tr><td>Geo Targeting</td><td>Target specific Indian states and cities (Tamil Nadu, Karnataka, Telangana, Kerala)</td></tr>
+  <tr><td>Language Targeting</td><td>Target English, Tamil, Telugu, and Malayalam language users</td></tr>
+</table>
+
+<h2>5. API Endpoints Built</h2>
+<table>
+  <tr><th>Endpoint</th><th>Method</th><th>Description</th></tr>
+  <tr><td>/api/google-ads/status</td><td>GET</td><td>Verify API credentials and account connectivity</td></tr>
+  <tr><td>/api/google-ads/campaigns</td><td>GET</td><td>List all campaigns with 30-day performance metrics</td></tr>
+  <tr><td>/api/google-ads/campaigns</td><td>POST</td><td>Create a new search campaign with geo and language targeting</td></tr>
+  <tr><td>/api/google-ads/campaigns/:id/status</td><td>PATCH</td><td>Enable, pause, or remove a campaign</td></tr>
+  <tr><td>/api/google-ads/reports</td><td>GET</td><td>Performance report aggregated by campaign</td></tr>
+  <tr><td>/api/google-ads/keywords</td><td>GET</td><td>List all keywords with performance data</td></tr>
+  <tr><td>/api/google-ads/setup-sathvam</td><td>POST</td><td>One-click create all 5 city campaigns with ad groups, keywords, and ads</td></tr>
+</table>
+
+<h2>6. Access Control &amp; Security</h2>
+<ul>
+  <li><strong>Who has access:</strong> Internal employees only (admin and CEO roles in our system)</li>
+  <li><strong>Authentication:</strong> All API routes require a valid admin JWT cookie — no public access</li>
+  <li><strong>OAuth2 tokens:</strong> Stored securely in server environment variables, never exposed to frontend</li>
+  <li><strong>HTTPS only:</strong> All communication is encrypted via TLS (Let's Encrypt certificates)</li>
+  <li><strong>No third-party access:</strong> The tool is not shared with or accessible by any external clients or agencies</li>
+  <li><strong>Rate limiting:</strong> Backend enforces rate limits on all API routes</li>
+</ul>
+
+<h2>7. Campaign Strategy</h2>
+<p>We plan to run the following campaigns for our own products only:</p>
+<table>
+  <tr><th>Campaign</th><th>Target Location</th><th>Language</th><th>Daily Budget</th></tr>
+  <tr><td>Sathvam - Tamil Nadu</td><td>Tamil Nadu state</td><td>English, Tamil</td><td>₹500</td></tr>
+  <tr><td>Sathvam - Bangalore</td><td>Bangalore city</td><td>English, Tamil</td><td>₹500</td></tr>
+  <tr><td>Sathvam - Hyderabad</td><td>Hyderabad city</td><td>English, Telugu</td><td>₹500</td></tr>
+  <tr><td>Sathvam - Kerala</td><td>Kerala state</td><td>English, Malayalam</td><td>₹500</td></tr>
+  <tr><td>Sathvam - Pan India</td><td>India (country)</td><td>English</td><td>₹500</td></tr>
+</table>
+
+<h2>8. Data Handling</h2>
+<ul>
+  <li>No customer PII (personal data) is collected or stored via the Google Ads API</li>
+  <li>Only campaign performance metrics (impressions, clicks, cost) are stored for reporting</li>
+  <li>No remarketing lists or customer match data is used</li>
+  <li>No App Conversion Tracking or mobile app campaigns are planned</li>
+</ul>
+
+<h2>9. Developer Token Usage</h2>
+<div class="note">
+  The developer token is used exclusively to manage Sathvam Natural Products' own Google Ads account.
+  It is not shared with any third parties, agencies, or external clients. The token is stored
+  as a server-side environment variable and is never exposed in frontend code or public repositories.
+</div>
+
+<h2>10. Contact Information</h2>
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <tr><td>Company Name</td><td>Sathvam Natural Products</td></tr>
+  <tr><td>Website</td><td>https://www.sathvam.in</td></tr>
+  <tr><td>API Contact Email</td><td>vinoth@sathvam.in</td></tr>
+  <tr><td>MCC Account ID</td><td>681-564-6913</td></tr>
+  <tr><td>Ad Account ID</td><td>247-548-9800</td></tr>
+  <tr><td>Country</td><td>India</td></tr>
+</table>
+
+</body>
+</html>
