@@ -1054,4 +1054,29 @@ router.get('/docker-agent', ...adminOrCeo, async (req, res) => {
   }
 });
 
+// ── GET /api/security/audit-log — recent admin mutation log ────────────────────
+router.get('/audit-log', ...adminOrCeo, async (req, res) => {
+  try {
+    const limit  = Math.min(parseInt(req.query.limit  || '200'), 500);
+    const offset = parseInt(req.query.offset || '0');
+    const user   = req.query.user   || null;
+    const method = req.query.method || null;
+
+    let q = supabase
+      .from('admin_audit_logs')
+      .select('id,ts,username,role,method,path,status,ip', { count: 'exact' })
+      .order('ts', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (user)   q = q.eq('username', user);
+    if (method) q = q.eq('method', method);
+
+    const { data, error, count } = await q;
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ logs: data || [], total: count ?? 0 });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

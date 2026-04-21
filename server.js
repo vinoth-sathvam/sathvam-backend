@@ -78,6 +78,7 @@ const referralLimiter = rateLimit({
 app.use(cookieParser());
 app.use(express.json({ limit: '2mb' }));
 app.use(morgan('combined'));
+app.use(require('./middleware/auditLog'));
 
 const { products, procurement, vendors, sales, settings, users } = require('./routes/core');
 const { b2bCustomers, b2bOrders, projects, b2bItemProgress, b2bStatement, b2bStock, b2bCustomPrices, b2bQuotes, b2bDocs, b2bSamples, b2bMessages, b2bAnalytics, b2bProfile, b2bNotifications } = require('./routes/b2b');
