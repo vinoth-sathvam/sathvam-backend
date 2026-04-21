@@ -848,9 +848,10 @@ sales.post('/', auth, async (req, res) => {
       }
     }
 
-    // Auto-deduct from finished goods
+    // Auto-deduct from finished goods + stock_ledger
     try {
       const fgItems = (s.items || []).filter(i => parseFloat(i.qty) > 0);
+      const saleDate = s.date || new Date().toISOString().slice(0, 10);
       if (fgItems.length) {
         await supabase.from('finished_goods').insert(
           fgItems.map(i => ({
@@ -859,7 +860,7 @@ sales.post('/', auth, async (req, res) => {
             unit:         i.unit || 'pcs',
             qty:          parseFloat(i.qty),
             type:         'out',
-            date:         s.date || new Date().toISOString().slice(0, 10),
+            date:         saleDate,
             notes:        `Auto: POS sale ${s.orderNo}`,
             batch_ref:    s.orderNo || '',
             created_by:   'system',
@@ -867,6 +868,26 @@ sales.post('/', auth, async (req, res) => {
             updated_at:   new Date().toISOString(),
           }))
         );
+
+        // Also decrement stock_ledger so StockProfitForecast stays accurate
+        const ledgerRows = fgItems
+          .filter(i => i.productId)
+          .map(i => ({
+            product_id:   i.productId,
+            product_name: i.productName || '',
+            date:         saleDate,
+            type:         'out',
+            qty:          parseFloat(i.qty),
+            unit:         i.unit || 'pcs',
+            rate:         parseFloat(i.rate) || 0,
+            total_value:  parseFloat(i.total) || 0,
+            channel:      'sale',
+            reference:    s.orderNo || '',
+            notes:        `POS sale — ${s.orderNo}`,
+          }));
+        if (ledgerRows.length) {
+          await supabase.from('stock_ledger').insert(ledgerRows);
+        }
       }
     } catch (fgErr) {
       console.error('Finished goods POS deduction error:', fgErr.message);

@@ -1003,7 +1003,7 @@ async function updateOrder(req, res) {
         } catch (e) { console.error('[AUTO] Pack deduct error:', e.message); }
       }
 
-      // ── SHIPPED: deduct finished goods ─────────────────────────────────────
+      // ── SHIPPED: deduct finished goods + stock_ledger ──────────────────────
       if (status === 'shipped') {
         try {
           const rows = items.map(item => ({
@@ -1020,7 +1020,27 @@ async function updateOrder(req, res) {
             updated_at:   new Date().toISOString(),
           }));
           await supabase.from('finished_goods').insert(rows);
-          console.log(`[AUTO] Finished goods deducted for order ${orderNo}`);
+
+          // Also decrement stock_ledger so StockProfitForecast stays accurate
+          const ledgerRows = items
+            .filter(item => item.product_id)
+            .map(item => ({
+              product_id:   item.product_id,
+              product_name: item.productName || item.name || 'Unknown',
+              date:         today,
+              type:         'out',
+              qty:          parseFloat(item.qty) || 1,
+              unit:         'pcs',
+              rate:         parseFloat(item.price) || 0,
+              total_value:  (parseFloat(item.qty) || 1) * (parseFloat(item.price) || 0),
+              channel:      'webstore',
+              reference:    orderNo,
+              notes:        `Shipped — Order ${orderNo}`,
+            }));
+          if (ledgerRows.length) {
+            await supabase.from('stock_ledger').insert(ledgerRows);
+          }
+          console.log(`[AUTO] Finished goods + stock_ledger deducted for order ${orderNo}`);
         } catch (e) { console.error('[AUTO] FG deduct error:', e.message); }
       }
 
