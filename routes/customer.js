@@ -295,7 +295,7 @@ router.post('/oauth/facebook', async (req, res) => {
 
 // GET /api/customer/me
 router.get('/me', custAuth, async (req, res) => {
-  const { data } = await supabase.from('customers').select('id,name,email,phone,address,city,state,pincode,birthday').eq('id', req.customer.id).single();
+  const { data } = await supabase.from('customers').select('id,name,email,phone,address,city,state,pincode').eq('id', req.customer.id).single();
   res.json(data ? decryptCustomer(data) : {});
 });
 
