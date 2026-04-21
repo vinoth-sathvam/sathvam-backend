@@ -602,20 +602,40 @@ async function sendWhatsAppOTP(phone, code) {
   const token = process.env.BOTSAILOR_API_TOKEN;
   if (!token) throw new Error('WhatsApp not configured on this server');
   const digits = phone.replace(/\D/g, '');
-  const message = `Your Sathvam login OTP: *${code}*\n\nValid for 5 minutes. Do not share this code.\n— Sathvam Natural Products`;
-  const params = new URLSearchParams({
-    apiToken:        token,
-    phone_number_id: process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID || '',
-    phone_number:    digits,
-    message,
-  });
-  const r = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-    method:  'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body:    params.toString(),
-  });
-  const data = await r.json();
-  if (data.status !== '1' && data.status !== 1) throw new Error(data.message || 'WhatsApp OTP delivery failed');
+  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID || '';
+  const templateId = process.env.OTP_WA_TEMPLATE_ID; // set in .env after creating OTP template in BotSailor
+
+  if (templateId) {
+    // Use pre-approved template (works anytime, no 24-hour window restriction)
+    const params = new URLSearchParams({
+      apiToken:          token,
+      phoneNumberID:     phoneId,
+      botTemplateID:     String(templateId),
+      sendToPhoneNumber: digits,
+      'templateVariable-1': code,
+      'templateVariable-otp': code,
+      'templateVariable-code': code,
+    });
+    const r = await fetch(`https://botsailor.com/api/v1/whatsapp/send/template?${params.toString()}`, { method: 'POST' });
+    const data = await r.json().catch(() => ({}));
+    if (data.status !== '1' && data.status !== 1) throw new Error(data.message || 'WhatsApp OTP template delivery failed');
+  } else {
+    // Fallback: free-text (only works if customer messaged within 24h)
+    const message = `Your Sathvam OTP: *${code}*\n\nValid for 5 minutes. Do not share.\n— Sathvam Natural Products`;
+    const params = new URLSearchParams({
+      apiToken:        token,
+      phone_number_id: phoneId,
+      phone_number:    digits,
+      message,
+    });
+    const r = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:    params.toString(),
+    });
+    const data = await r.json();
+    if (data.status !== '1' && data.status !== 1) throw new Error(data.message || 'WhatsApp OTP delivery failed. If you have not messaged us on WhatsApp before, please set OTP_WA_TEMPLATE_ID in .env to use a pre-approved template.');
+  }
 }
 
 async function storeOTP(customerId, code) {
