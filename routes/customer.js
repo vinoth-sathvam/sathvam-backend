@@ -320,7 +320,7 @@ router.get('/orders', custAuth, async (req, res) => {
 // POST /api/customer/update
 router.post('/update', custAuth, async (req, res) => {
   try {
-    const { name, phone, address, city, state, pincode, birthday } = req.body;
+    const { name, phone, address, city, state, pincode } = req.body;
     const updates = {};
     if (name)    updates.name    = encrypt(name.trim());
     if (phone)   updates.phone   = encrypt(phone);
@@ -328,8 +328,7 @@ router.post('/update', custAuth, async (req, res) => {
     if (city)    updates.city    = encrypt(city);
     if (state)   updates.state   = encrypt(state);
     if (pincode) updates.pincode = encrypt(pincode);
-    if (birthday) updates.birthday = birthday; // stored as YYYY-MM-DD, not PII
-    const { data, error } = await supabase.from('customers').update(updates).eq('id', req.customer.id).select('id,name,email,phone,address,city,state,pincode,birthday').single();
+    const { data, error } = await supabase.from('customers').update(updates).eq('id', req.customer.id).select('id,name,email,phone,address,city,state,pincode').single();
     if (error) return res.status(400).json({ error: error.message });
     res.json({ customer: decryptCustomer(data) });
   } catch (err) { res.status(500).json({ error: err.message }); }
