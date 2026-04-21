@@ -143,7 +143,7 @@ router.get('/', auth, async (req, res) => {
 
     // ── 3. Finished Goods ─────────────────────────────────────────────────────
     const [{ data: fgSummary }, { data: dbProds }] = await Promise.all([
-      supabase.from('finished_goods').select('product_name,qty,type').eq('active', true),
+      supabase.from('finished_goods').select('product_name,qty,type'),
       supabase.from('products').select('name,price,website_price,retail_price').eq('active', true),
     ]);
 
