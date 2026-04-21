@@ -320,10 +320,16 @@ router.get('/store-features', async (req, res) => {
     festivalGuide: true, seasonalRec: true, oilPulling: true, backInStock: true,
     corpGifting: true, bundleBuilder: true, reorderReminder: true, reviewFeed: true,
     familiesCounter: true, expertQuotes: true,
+    custIdleMin: 60, // customer idle session timeout in minutes
   };
   try {
-    const { data } = await supabase.from('settings').select('value').eq('key', 'store_features').single();
-    res.json({ ...(data?.value || defaults) });
+    const [featRes, idleRes] = await Promise.all([
+      supabase.from('settings').select('value').eq('key', 'store_features').single(),
+      supabase.from('settings').select('value').eq('key', 'cust_idle_timeout_min').single(),
+    ]);
+    const features = { ...defaults, ...(featRes.data?.value || {}) };
+    if (idleRes.data?.value != null) features.custIdleMin = idleRes.data.value;
+    res.json(features);
   } catch {
     res.json(defaults);
   }
