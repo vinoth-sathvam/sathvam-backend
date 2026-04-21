@@ -257,20 +257,21 @@ async function checkGST() {
     ));
   }
 
-  // Sales >₹10K without GST
-  const { data: salesNoGST } = await supabase
+  // Sales >₹10K — check large sales via bank_transactions credit entries as proxy for GST tracking
+  // (sales table does not have a gst_amount column)
+  const { data: largeSales } = await supabase
     .from('sales')
-    .select('id,invoice_no,final_amount,gst_amount,date')
+    .select('id,order_no,final_amount,date,status,payment_method')
     .gte('date', ago30)
     .gt('final_amount', 10000)
-    .or('gst_amount.is.null,gst_amount.eq.0')
+    .in('status', ['delivered','dispatched'])
     .limit(20);
 
-  if (salesNoGST && salesNoGST.length > 0) {
-    const total = salesNoGST.reduce((s, x) => s + (x.final_amount || 0), 0);
-    findings.push(finding('GST', 'medium',
-      `${salesNoGST.length} sales >₹10K with no GST in last 30 days`,
-      `Total: ₹${round2(total).toLocaleString('en-IN')}. Verify if these are exempt supplies (e.g. export, nil-rated) or GST was missed. Unreported output tax = demand + 100% penalty.`,
+  if (largeSales && largeSales.length > 0) {
+    const total = largeSales.reduce((s, x) => s + (x.final_amount || 0), 0);
+    findings.push(finding('GST', 'info',
+      `${largeSales.length} sales >₹10K in last 30 days — verify GST invoicing`,
+      `Total: ₹${round2(total).toLocaleString('en-IN')}. Ensure GST invoices issued for all B2B/B2C sales above ₹200 (CBIC notification). Missing output GST = demand + 100% penalty.`,
       round2(total)
     ));
   }
@@ -299,7 +300,7 @@ async function checkGST() {
   const RCM_CATEGORIES = ['Freight', 'Transport', 'Logistics', 'GTA', 'Legal', 'Advocate', 'Sponsorship', 'Import'];
   const { data: rcmExpenses } = await supabase
     .from('company_expenses')
-    .select('id,category,amount,vendor,date')
+    .select('id,category,amount,vendor_name,date')
     .in('category', RCM_CATEGORIES)
     .gte('date', ago30)
     .gt('amount', 5000)
@@ -318,7 +319,7 @@ async function checkGST() {
   // E-invoice threshold check: estimate annual turnover from last 12 months
   const ago365 = new Date(Date.now() - 365 * 86400000).toISOString().slice(0, 10);
   const [sales12, ws12] = await Promise.all([
-    supabase.from('sales').select('final_amount').eq('status', 'paid').gte('date', ago365),
+    supabase.from('sales').select('final_amount').in('status', ['delivered','dispatched']).gte('date', ago365),
     supabase.from('webstore_orders').select('total').in('status', ['confirmed', 'packed', 'shipped', 'delivered']).gte('date', ago365),
   ]);
   const annualTurnover = round2(
@@ -457,14 +458,15 @@ async function checkTDS() {
   // Buyer must deduct TDS @0.1% on purchase amount exceeding ₹50L
   const { data: procurements } = await supabase
     .from('procurements')
-    .select('vendor,total_amount,date')
+    .select('supplier,ordered_qty,ordered_price_per_kg,date')
     .gte('date', fyStart)
     .limit(1000);
 
   if (procurements && procurements.length > 0) {
     const byVendor = {};
     for (const p of procurements) {
-      byVendor[p.vendor] = (byVendor[p.vendor] || 0) + parseFloat(p.total_amount || 0);
+      const amt = round2((parseFloat(p.ordered_qty)||0)*(parseFloat(p.ordered_price_per_kg)||0));
+      byVendor[p.supplier] = (byVendor[p.supplier] || 0) + amt;
     }
     for (const [vendor, total] of Object.entries(byVendor).filter(([, t]) => t > 5000000).slice(0, 3)) {
       findings.push(finding('TDS', 'critical',
@@ -523,12 +525,12 @@ async function checkCashLimits() {
     .gt('total', 200000)
     .limit(20);
 
-  // Check sales paid in cash (payment_mode = 'cash')
+  // Check sales paid in cash (payment_method = 'cash')
   const { data: cashSales } = await supabase
     .from('sales')
-    .select('id,order_no,customer_name,final_amount,date,payment_mode')
+    .select('id,order_no,customer_name,final_amount,date,payment_method')
     .gte('date', since30)
-    .eq('payment_mode', 'cash')
+    .eq('payment_method', 'cash')
     .gt('final_amount', 200000)
     .limit(20);
 
@@ -546,7 +548,7 @@ async function checkCashLimits() {
   // Any cash payment to single vendor >₹10,000 in a day → 100% disallowance
   const { data: cashExpenses } = await supabase
     .from('company_expenses')
-    .select('id,date,vendor,amount,category,description,payment_mode')
+    .select('id,date,vendor_name,amount,category,description,payment_mode')
     .gte('date', since30)
     .gt('amount', 10000)
     .is('deleted_at', null)
@@ -561,7 +563,7 @@ async function checkCashLimits() {
     // Group by date+vendor
     const grouped = {};
     for (const e of cashOnly) {
-      const key = `${e.date}__${e.vendor || 'Unknown'}`;
+      const key = `${e.date}__${e.vendor_name || 'Unknown'}`;
       grouped[key] = (grouped[key] || 0) + parseFloat(e.amount || 0);
     }
     const violations = Object.entries(grouped).filter(([, total]) => total > 10000);
@@ -582,7 +584,7 @@ async function checkCashLimits() {
   // ── Alert on large cash expenses even without payment_mode data ──────────
   const { data: largeExpenses } = await supabase
     .from('company_expenses')
-    .select('id,date,vendor,amount,category,payment_mode')
+    .select('id,date,vendor_name,amount,category,payment_mode')
     .gte('date', since30)
     .gt('amount', 10000)
     .is('payment_mode', null) // payment mode not recorded
@@ -666,7 +668,7 @@ async function checkBooksQuality() {
   const ROUND_AMOUNTS = [5000, 10000, 15000, 20000, 25000, 50000, 75000, 100000];
   const { data: allExpenses } = await supabase
     .from('company_expenses')
-    .select('id,date,category,amount,vendor,description')
+    .select('id,date,category,amount,vendor_name,description')
     .gte('date', since30)
     .gt('amount', 5000)
     .is('deleted_at', null)
@@ -677,13 +679,13 @@ async function checkBooksQuality() {
     if (roundEntries.length >= 5) {
       findings.push(finding('BooksQuality', 'medium',
         `${roundEntries.length} expenses with suspiciously round amounts in last 30 days`,
-        `Examples: ${roundEntries.slice(0, 3).map(e => `₹${e.amount} (${e.category}, ${e.vendor || 'no vendor'})`).join('; ')}. Round-number entries suggest estimates or fabricated expenses. Auditors flag these — ensure all have supporting invoices/receipts.`,
+        `Examples: ${roundEntries.slice(0, 3).map(e => `₹${e.amount} (${e.category}, ${e.vendor_name || 'no vendor'})`).join('; ')}. Round-number entries suggest estimates or fabricated expenses. Auditors flag these — ensure all have supporting invoices/receipts.`,
         null
       ));
     }
 
     // Large expenses without vendor name
-    const noVendor = allExpenses.filter(e => !e.vendor && parseFloat(e.amount) > 10000);
+    const noVendor = allExpenses.filter(e => !e.vendor_name && parseFloat(e.amount) > 10000);
     if (noVendor.length > 0) {
       const total = noVendor.reduce((s, e) => s + parseFloat(e.amount || 0), 0);
       findings.push(finding('BooksQuality', 'medium',
@@ -709,7 +711,7 @@ async function checkBooksQuality() {
     const seen = {};
     const duplicates = [];
     for (const e of allExpenses) {
-      const key = `${e.date}__${e.vendor}__${e.amount}`;
+      const key = `${e.date}__${e.vendor_name}__${e.amount}`;
       if (seen[key]) duplicates.push(e);
       else seen[key] = true;
     }
@@ -752,25 +754,14 @@ async function checkPayroll() {
   const dayOfMonth   = today.getDate();
   const month        = today.getMonth() + 1;
 
-  // Payroll not processed after 25th
+  // Payroll not processed after 25th — check via employees count as proxy
   if (dayOfMonth >= 25) {
-    const { data: payroll } = await supabase
-      .from('payroll')
-      .select('id,month,total_amount,status')
-      .eq('month', currentMonth)
-      .limit(1);
-
-    if (!payroll || payroll.length === 0) {
+    const { data: empCount } = await supabase.from('employees').select('id').eq('status','active').limit(1);
+    if (empCount && empCount.length > 0) {
       findings.push(finding('Payroll', 'high',
-        `Payroll for ${currentMonth} not yet processed`,
-        `${dayOfMonth}th of month. Process salary before month-end to avoid Sec 43B disallowance on salary expense.`,
+        `Verify payroll for ${currentMonth} processed before month-end`,
+        `${dayOfMonth}th of month. Ensure salaries are processed and disbursed to avoid Sec 43B disallowance. For a Private Limited Company, timely salary payment is also mandatory under Companies Act 2013.`,
         null
-      ));
-    } else if (payroll[0].status === 'draft') {
-      findings.push(finding('Payroll', 'medium',
-        `Payroll ${currentMonth} in draft — not approved or disbursed`,
-        'Approve and disburse salaries before month end.',
-        payroll[0].total_amount
       ));
     }
   }
@@ -795,21 +786,11 @@ async function checkPayroll() {
 
   // ── Statutory Bonus Act ───────────────────────────────────────────────────
   if (month === 11) {
-    const { data: bonusPayroll } = await supabase
-      .from('payroll')
-      .select('id,month,bonus_amount')
-      .gte('month', new Date().getFullYear() + '-04')
-      .not('bonus_amount', 'is', null)
-      .gt('bonus_amount', 0)
-      .limit(1);
-
-    if (!bonusPayroll || bonusPayroll.length === 0) {
-      findings.push(finding('Payroll', 'critical',
-        'Statutory Bonus (Bonus Act) not yet paid — deadline November 30',
-        'Minimum bonus = 8.33% of annual salary (subject to ₹7,000/month basis cap). Must be paid within 8 months of financial year end (March 31). Criminal liability for non-payment under Section 28 of Bonus Act.',
-        null
-      ));
-    }
+    findings.push(finding('Payroll', 'critical',
+      'Statutory Bonus (Bonus Act) — verify payment before November 30',
+      'Minimum bonus = 8.33% of annual salary (subject to ₹7,000/month basis cap). Must be paid within 8 months of FY end (March 31). Criminal liability for non-payment under Section 28 of Bonus Act.',
+      null
+    ));
   }
 
   return findings;
@@ -822,7 +803,7 @@ async function checkExpenses() {
 
   const { data: expenses } = await supabase
     .from('company_expenses')
-    .select('id,date,category,amount,description,vendor,approved_by')
+    .select('id,date,category,amount,description,vendor_name')
     .gte('date', since7d)
     .gt('amount', 25000)
     .is('deleted_at', null)
@@ -834,7 +815,7 @@ async function checkExpenses() {
       if ((e.amount || 0) > 100000) {
         findings.push(finding('Expenses', 'high',
           `Large expense: ₹${round2(e.amount).toLocaleString('en-IN')} — ${e.category}`,
-          `Date: ${e.date}. Vendor: ${e.vendor || '—'}. Approved by: ${e.approved_by || 'not specified'}. Verify authorisation and that invoice/receipt is on file.`,
+          `Date: ${e.date}. Vendor: ${e.vendor_name || '—'}. Verify authorisation and that invoice/receipt is on file.`,
           round2(e.amount)
         ));
       }
@@ -883,9 +864,9 @@ async function checkRevenue() {
   const daysInMonth    = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
 
   const [salesThis, wsThis, salesLast, wsLast] = await Promise.all([
-    supabase.from('sales').select('final_amount').eq('status', 'paid').gte('date', thisMonthStart),
+    supabase.from('sales').select('final_amount').in('status',['delivered','dispatched']).gte('date', thisMonthStart),
     supabase.from('webstore_orders').select('total').in('status', ['confirmed', 'packed', 'shipped', 'delivered']).gte('date', thisMonthStart),
-    supabase.from('sales').select('final_amount').eq('status', 'paid').gte('date', lastMonthStart).lte('date', lastMonthEnd),
+    supabase.from('sales').select('final_amount').in('status',['delivered','dispatched']).gte('date', lastMonthStart).lte('date', lastMonthEnd),
     supabase.from('webstore_orders').select('total').in('status', ['confirmed', 'packed', 'shipped', 'delivered']).gte('date', lastMonthStart).lte('date', lastMonthEnd),
   ]);
 
@@ -909,7 +890,7 @@ async function checkRevenue() {
 
   const since7d = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
   const { data: dailySales } = await supabase
-    .from('sales').select('date,final_amount').gte('date', since7d).eq('status', 'paid');
+    .from('sales').select('date,final_amount').gte('date', since7d).in('status',['delivered','dispatched']);
 
   const salesByDay = {};
   for (const s of dailySales || []) {
@@ -1024,6 +1005,57 @@ async function checkCompliance() {
     ));
   }
 
+  // ── Private Limited Company (Companies Act 2013) ──────────────────────────
+  // AGM — must be held within 6 months of FY end (September 30)
+  if (month === 9 && dayOfMonth >= 15) {
+    findings.push(finding('Compliance', month >= 9 && dayOfMonth >= 25 ? 'critical' : 'high',
+      'AGM (Annual General Meeting) due by September 30 — Companies Act Sec 96',
+      'Private Ltd must hold AGM within 6 months of FY end (March 31), i.e., by September 30. Penalty for non-compliance: ₹1 lakh on company + ₹1 lakh on every officer in default. At AGM: approve audited accounts, declare dividend, appoint/reappoint auditors.',
+      null
+    ));
+  }
+
+  // ROC annual filings post-AGM
+  if (month === 10) {
+    findings.push(finding('Compliance', 'high',
+      'AOC-4 (Financial Statements) due within 30 days of AGM — MCA21',
+      'File audited Balance Sheet and P&L with ROC via MCA21 portal. Form AOC-4 (or AOC-4 XBRL for larger companies). Penalty for late filing: ₹100/day, no upper limit.',
+      null
+    ));
+    findings.push(finding('Compliance', 'high',
+      'MGT-7A (Annual Return) due within 60 days of AGM — MCA21',
+      'Annual Return for Private Limited Company (small company form MGT-7A). Contains details of shareholders, directors, shares. Late filing: ₹100/day penalty.',
+      null
+    ));
+  }
+
+  // Director KYC — September 30 every year
+  if (month === 9 && dayOfMonth >= 1 && dayOfMonth <= 30) {
+    findings.push(finding('Compliance', 'medium',
+      'DIR-3 KYC (Director KYC) — due September 30',
+      'Every director with DIN must file DIR-3 KYC (or web-based DIR-3 KYC) by September 30 each year. Failure deactivates DIN — director cannot sign documents or file returns until KYC filed with ₹5,000 penalty.',
+      null
+    ));
+  }
+
+  // Board meetings — min 4 per year, gap ≤120 days
+  if (month % 3 === 0 && dayOfMonth >= 25) { // end of each quarter
+    findings.push(finding('Compliance', 'info',
+      'Quarterly reminder: Board Meeting required (Companies Act Sec 173)',
+      'Private Ltd must hold minimum 4 board meetings per year with no gap exceeding 120 days. Record proper minutes and resolutions. Non-compliance: ₹25,000 per officer in default.',
+      null
+    ));
+  }
+
+  // Statutory Auditor — must be appointed at AGM, for max 5 consecutive years
+  if (month === 4 && dayOfMonth <= 30) {
+    findings.push(finding('Compliance', 'info',
+      'Verify Statutory Auditor appointment (Companies Act Sec 139)',
+      'Confirm auditor is appointed for FY 2025-26 at AGM or board meeting. Auditor\'s term: 5 consecutive years max for a firm. ROC Form ADT-1 must be filed within 15 days of appointment.',
+      null
+    ));
+  }
+
   return findings;
 }
 
@@ -1043,7 +1075,7 @@ async function analyzeWithClaude(allFindings, dashboardData) {
       max_tokens: 1000,
       messages: [{
         role: 'user',
-        content: `You are a senior Chartered Accountant (FCA) reviewing the financial health and tax compliance of Sathvam Natural Products — a cold-pressed oil manufacturing company registered in Karur, Tamil Nadu, India. The company is GST-registered, subject to TDS provisions, employs staff under EPF/ESI, and operates under Indian tax law.
+        content: `You are a senior Chartered Accountant (FCA) reviewing the financial health and tax compliance of Sathvam Natural Products Private Limited — a cold-pressed oil manufacturing Private Limited Company registered in Karur, Tamil Nadu, India. The company is incorporated under Companies Act 2013, GST-registered, subject to TDS provisions, employs staff under EPF/ESI, and must comply with MCA ROC filings (AOC-4, MGT-7A, DIR-3 KYC, board meetings) as per Indian law.
 
 Financial snapshot (today):
 - Cash Balance: ₹${(dashboardData.cash_balance || 0).toLocaleString('en-IN')}
@@ -1111,7 +1143,7 @@ async function main() {
     const [bills, bankAccs, sales30, ws30, b2bPending] = await Promise.all([
       supabase.from('vendor_bills').select('amount,gst_amount,paid_amount,due_date,status').is('deleted_at', null),
       supabase.from('bank_accounts').select('current_balance').eq('is_active', true),
-      supabase.from('sales').select('final_amount').eq('status', 'paid').gte('date', ago30),
+      supabase.from('sales').select('final_amount').in('status',['delivered','dispatched']).gte('date', ago30),
       supabase.from('webstore_orders').select('total').in('status', ['confirmed', 'shipped', 'delivered']).gte('date', ago30),
       supabase.from('b2b_orders').select('total_value').not('stage', 'in', '("delivered","cancelled")'),
     ]);

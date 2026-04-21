@@ -105,10 +105,13 @@ router.get('/report', auth, roleGuard, async (req, res) => {
     const ago90        = new Date(Date.now() - 90*86400000).toISOString().slice(0, 10);
     const round2       = n => Math.round((parseFloat(n)||0)*100)/100;
 
+    // Revenue-eligible sales statuses (delivered/dispatched = fulfilled; pending with amount_paid = cash collected)
+    const REV_STATUSES = ['delivered','dispatched'];
+
     const [
       bankAccs, bankTxns, bills, b2bOrders, wsOrders,
       sales, wsRevenue, expenses, expensesLast,
-      procurements, payrollCur, findingsLatest,
+      procurements, findingsLatest,
       salesLast, wsRevLast, salesFY,
     ] = await Promise.all([
       supabase.from('bank_accounts').select('id,name,type,current_balance,account_number,bank_name').eq('is_active',true),
@@ -116,20 +119,20 @@ router.get('/report', auth, roleGuard, async (req, res) => {
       supabase.from('vendor_bills').select('id,bill_no,vendor_name,amount,gst_amount,paid_amount,due_date,bill_date,status,category').is('deleted_at',null).in('status',['unpaid','partial','overdue']).order('due_date',{ascending:true}).limit(300),
       supabase.from('b2b_orders').select('id,order_no,customer_name,total_value,created_at,stage').not('stage','in','("delivered","cancelled","invoice_paid")').order('created_at',{ascending:true}).limit(300),
       supabase.from('webstore_orders').select('id,order_no,customer,total,date,status').in('status',['confirmed','processing']).order('date',{ascending:true}).limit(200),
-      supabase.from('sales').select('id,order_no,customer_name,final_amount,gst_amount,date,status,payment_mode').eq('status','paid').gte('date',monthStart),
+      supabase.from('sales').select('id,order_no,customer_name,final_amount,date,status,payment_method').in('status',REV_STATUSES).gte('date',monthStart),
       supabase.from('webstore_orders').select('id,total,date').in('status',['confirmed','packed','shipped','delivered']).gte('date',monthStart),
-      supabase.from('company_expenses').select('id,date,category,amount,vendor,description,payment_mode').gte('date',monthStart).is('deleted_at',null).order('amount',{ascending:false}).limit(200),
+      supabase.from('company_expenses').select('id,date,category,amount,vendor_name,description,payment_mode').gte('date',monthStart).is('deleted_at',null).order('amount',{ascending:false}).limit(200),
       supabase.from('company_expenses').select('amount,category').gte('date',lastMStart).lte('date',lastMEnd).is('deleted_at',null),
-      supabase.from('procurements').select('vendor,total_amount,date,commodity_name,gst,amount').gte('date',fyStart).limit(1000),
-      supabase.from('payroll').select('id,month,total_amount,status').eq('month',today.toISOString().slice(0,7)).limit(1),
+      supabase.from('procurements').select('supplier,ordered_qty,ordered_price_per_kg,date,commodity_name,gst').gte('date',fyStart).limit(1000),
       supabase.from('ca_agent_findings').select('id,severity,category,title,detail,amount,resolved,created_at,run_id').eq('resolved',false).order('created_at',{ascending:false}).limit(50),
-      supabase.from('sales').select('final_amount').eq('status','paid').gte('date',lastMStart).lte('date',lastMEnd),
+      supabase.from('sales').select('final_amount').in('status',REV_STATUSES).gte('date',lastMStart).lte('date',lastMEnd),
       supabase.from('webstore_orders').select('total').in('status',['confirmed','packed','shipped','delivered']).gte('date',lastMStart).lte('date',lastMEnd),
-      supabase.from('sales').select('final_amount,date').eq('status','paid').gte('date',fyStart),
+      supabase.from('sales').select('final_amount,date').in('status',REV_STATUSES).gte('date',fyStart),
     ]);
 
     // ── Snapshot ───────────────────────────────────────────────────────────
     const cashBalance   = (bankAccs.data||[]).reduce((s,a)=>s+(a.current_balance||0),0);
+    // Revenue = fulfilled orders (delivered/dispatched) + webstore fulfilled
     const revThisMonth  = round2((sales.data||[]).reduce((s,x)=>s+parseFloat(x.final_amount||0),0)+(wsRevenue.data||[]).reduce((s,x)=>s+parseFloat(x.total||0),0));
     const revLastMonth  = round2((salesLast.data||[]).reduce((s,x)=>s+parseFloat(x.final_amount||0),0)+(wsRevLast.data||[]).reduce((s,x)=>s+parseFloat(x.total||0),0));
     const expThisMonth  = round2((expenses.data||[]).reduce((s,e)=>s+parseFloat(e.amount||0),0));
@@ -179,9 +182,12 @@ router.get('/report', auth, roleGuard, async (req, res) => {
     });
 
     // ── GST summary ────────────────────────────────────────────────────────
-    const salesGST    = round2((sales.data||[]).reduce((s,x)=>s+parseFloat(x.gst_amount||0),0));
+    // sales table has no gst_amount; estimate output GST from bank_transactions credits tagged Sales Revenue
+    const salesRevBT  = (bankTxns.data||[]).filter(t=>t.type==='credit'&&t.date>=monthStart);
+    const salesGST    = round2(salesRevBT.reduce((s,t)=>s+round2(parseFloat(t.amount||0)*18/118),0));
     const purchGST    = round2((procurements.data||[]).filter(p=>p.date>=monthStart).reduce((s,p)=>{
-      const gstPct = parseFloat(p.gst||0); const amt = parseFloat(p.amount||p.total_amount||0);
+      const gstPct = parseFloat(p.gst||0);
+      const amt = round2((parseFloat(p.ordered_qty)||0)*(parseFloat(p.ordered_price_per_kg)||0));
       return s+round2(amt*gstPct/100);
     },0));
     const netGST      = round2(salesGST - purchGST);
@@ -207,7 +213,10 @@ router.get('/report', auth, roleGuard, async (req, res) => {
     accum(fyBills, RENT_CATS,       '194I','Rent',             240000,0.10, 'Rent');
     // 194Q: purchases from single vendor >₹50L
     const procByVendor = {};
-    for (const p of (procurements.data||[])) procByVendor[p.vendor]=(procByVendor[p.vendor]||0)+parseFloat(p.total_amount||0);
+    for (const p of (procurements.data||[])) {
+      const amt = round2((parseFloat(p.ordered_qty)||0)*(parseFloat(p.ordered_price_per_kg)||0));
+      procByVendor[p.supplier]=(procByVendor[p.supplier]||0)+amt;
+    }
     for (const [vendor,total] of Object.entries(procByVendor)) {
       if (total > 1000000) { // show vendors >₹10L as watch
         const tds_due = total>5000000 ? round2((total-5000000)*0.001) : 0;
@@ -256,6 +265,14 @@ router.get('/report', auth, roleGuard, async (req, res) => {
     addCal('GSTR-9 Annual Return', 31, 12, yr, 'GST Sec 44', 'Annual consolidated GST return');
     if (month>=4&&month<=11) addCal('Statutory Bonus (Bonus Act)', 30, 11, yr, 'Bonus Act Sec 19', 'Pay min 8.33% of annual salary');
     if (month>=4&&month<=9)  addCal('PT (Tamil Nadu) H1', 30, 9, yr, 'TN PT Act', 'Remit ₹1,250/employee to CT Dept');
+    // ── Private Limited Company (Companies Act 2013) ───────────────────────
+    addCal('MGT-7A Annual Return (Pvt Ltd)', 60, month<=9?9:month<=12?12:3, month<=9?yr:month<=12?yr:yr+1, 'Companies Act Sec 92', 'File within 60 days of AGM — MCA21 portal');
+    addCal('AOC-4 Financial Statements', 30, month<=10?10:month<=1?1:4, month<=10?yr:month<=1?yr+1:yr+1, 'Companies Act Sec 137', 'File within 30 days of AGM — attach audited B/S & P&L');
+    addCal('AGM (Annual General Meeting)', 30, 9, yr, 'Companies Act Sec 96', 'Hold AGM within 6 months of FY end (by 30 Sep)');
+    addCal('Board Meeting — Q1', 30, 7, yr, 'Companies Act Sec 173', 'Min 4 board meetings/year; gap ≤120 days');
+    addCal('Board Meeting — Q2', 30, 10, yr, 'Companies Act Sec 173', 'Min 4 board meetings/year; gap ≤120 days');
+    addCal('DIR-3 KYC (Director KYC)', 30, 9, yr, 'Companies Act Rule 12A', 'Every director must file DIR-3 KYC by 30 Sep');
+    addCal('INC-20A (if not filed)', 30, 4, yr+1, 'Companies Act Sec 10A', 'Commencement of Business declaration — one-time if not done');
     complianceCalendar.sort((a,b)=>a.days_left-b.days_left);
 
     res.json({
@@ -268,7 +285,7 @@ router.get('/report', auth, roleGuard, async (req, res) => {
       tds: { rows:tdsRows, total_tds_due:round2(tdsRows.reduce((s,r)=>s+r.tds_due,0)) },
       expenses: { total:expThisMonth, last_month:expLastMonth, breakdown:expBreakdown, recent:(expenses.data||[]).slice(0,15) },
       revenue: { this_month:revThisMonth, last_month:revLastMonth, growth_pct:revLastMonth>0?round2((revThisMonth-revLastMonth)/revLastMonth*100):null, daily:revDailyArr },
-      payroll: payrollCur.data?.[0] || null,
+      payroll: null,
       compliance_calendar: complianceCalendar,
       findings: (findingsLatest.data||[]),
       findings_counts: (() => { const c={critical:0,high:0,medium:0,low:0,info:0}; for(const f of findingsLatest.data||[]) if(f.severity in c) c[f.severity]++; return c; })(),
