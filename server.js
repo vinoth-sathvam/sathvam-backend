@@ -164,6 +164,7 @@ app.use('/api/restock-reminders', require('./routes/restockReminder'));
 app.use('/api/ca-agent',          require('./routes/caAgent'));
 app.use('/api/google-ads',        require('./routes/googleAds'));
 app.use('/api/deploy-notify',     require('./routes/deployNotify'));
+app.use('/api/manager-daily',     require('./routes/managerDaily'));
 
 // ── Weekly report manual trigger ──────────────────────────────────────────────
 const { startScheduler, buildWeeklyReport } = require('./config/scheduler');
