@@ -124,7 +124,18 @@ router.post('/login', async (req, res) => {
       if (!valid) return res.status(400).json({ error: 'Incorrect password' });
     }
 
-    // 2FA — if enabled, return pre-auth token instead of full JWT
+    // Phone OTP 2FA — preferred over TOTP (simpler for customers)
+    if (cust.phone_otp_enabled && cust.phone) {
+      const { issuePreAuthToken } = require('./twoFactor');
+      const preAuthToken = issuePreAuthToken({ id: cust.id });
+      const phone = decrypt(cust.phone);
+      const code = genOTP();
+      await storeOTP(cust.id, code);
+      try { await sendWhatsAppOTP(phone, code); } catch (e) { console.error('[OTP]', e.message); }
+      return res.json({ requiresPhoneOTP: true, preAuthToken, hint: `...${phone.slice(-4)}` });
+    }
+
+    // TOTP authenticator 2FA
     if (cust.totp_enabled) {
       const { issuePreAuthToken } = require('./twoFactor');
       const preAuthToken = issuePreAuthToken({ id: cust.id });
@@ -503,6 +514,121 @@ router.post('/cart-reminder', custAuth, async (req, res) => {
     console.error('cart-reminder email:', err.message);
     res.json({ ok: true }); // always 200 — frontend doesn't need to know
   }
+});
+
+// ── WhatsApp OTP helpers ──────────────────────────────────────────────────────
+function genOTP() { return String(Math.floor(100000 + Math.random() * 900000)); }
+
+async function sendWhatsAppOTP(phone, code) {
+  const token = process.env.BOTSAILOR_API_TOKEN;
+  if (!token) throw new Error('WhatsApp not configured on this server');
+  const digits = phone.replace(/\D/g, '');
+  const message = `Your Sathvam login OTP: *${code}*\n\nValid for 5 minutes. Do not share this code.\n— Sathvam Natural Products`;
+  const params = new URLSearchParams({
+    apiToken:        token,
+    phone_number_id: process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID || '',
+    phone_number:    digits,
+    message,
+  });
+  const r = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body:    params.toString(),
+  });
+  const data = await r.json();
+  if (data.status !== '1' && data.status !== 1) throw new Error(data.message || 'WhatsApp OTP delivery failed');
+}
+
+async function storeOTP(customerId, code) {
+  const expires_at = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  await supabase.from('settings').upsert({ key: `otp_${customerId}`, value: { code, expires_at } }, { onConflict: 'key' });
+}
+
+async function verifyOTPCode(customerId, code) {
+  const { data } = await supabase.from('settings').select('value').eq('key', `otp_${customerId}`).maybeSingle();
+  if (!data?.value) return false;
+  const { code: stored, expires_at } = data.value;
+  if (String(stored) !== String(code).trim()) return false;
+  if (new Date(expires_at) < new Date()) return false;
+  await supabase.from('settings').delete().eq('key', `otp_${customerId}`); // one-time use
+  return true;
+}
+
+// POST /api/customer/otp/send — send WhatsApp OTP (requires preAuthToken from login)
+router.post('/otp/send', async (req, res) => {
+  const { preAuthToken } = req.body;
+  if (!preAuthToken) return res.status(400).json({ error: 'preAuthToken required' });
+  try {
+    const decoded = jwt.verify(preAuthToken, JWT_SECRET);
+    if (decoded.purpose !== 'pre-auth') return res.status(400).json({ error: 'Invalid token' });
+    const { data: cust } = await supabase.from('customers').select('id,phone').eq('id', decoded.id).single();
+    if (!cust?.phone) return res.status(400).json({ error: 'No phone number on file. Add one in your profile.' });
+    const phone = decrypt(cust.phone);
+    const code = genOTP();
+    await storeOTP(cust.id, code);
+    await sendWhatsAppOTP(phone, code);
+    res.json({ ok: true, hint: `...${phone.slice(-4)}` });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// POST /api/customer/otp/verify — verify WhatsApp OTP → issue JWT
+router.post('/otp/verify', async (req, res) => {
+  const { preAuthToken, code } = req.body;
+  if (!preAuthToken || !code) return res.status(400).json({ error: 'preAuthToken and code required' });
+  try {
+    const decoded = jwt.verify(preAuthToken, JWT_SECRET);
+    if (decoded.purpose !== 'pre-auth') return res.status(400).json({ error: 'Invalid token' });
+    const ok = await verifyOTPCode(decoded.id, code);
+    if (!ok) return res.status(400).json({ error: 'Invalid or expired OTP. Try resending.' });
+    const { data: cust } = await supabase.from('customers').select('*').eq('id', decoded.id).single();
+    const plain = decryptCustomer(cust);
+    const normEmail = decrypt(cust.email) || '';
+    const token = jwt.sign({ id: plain.id, email: normEmail, name: plain.name }, JWT_SECRET, { expiresIn: '30d' });
+    setCustCookie(res, token);
+    res.json({ customer: { id: plain.id, name: plain.name, email: normEmail, phone: plain.phone }, token });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// GET /api/customer/otp/status — phone OTP enabled?
+router.get('/otp/status', custAuth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('customers').select('phone_otp_enabled,phone').eq('id', req.customer.id).single();
+    const phone = data?.phone ? decrypt(data.phone) : null;
+    res.json({ enabled: data?.phone_otp_enabled || false, hasPhone: !!phone, hint: phone ? `...${phone.slice(-4)}` : null });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/customer/otp/setup — send test OTP to verify phone before enabling
+router.post('/otp/setup', custAuth, async (req, res) => {
+  try {
+    const { data: cust } = await supabase.from('customers').select('phone').eq('id', req.customer.id).single();
+    if (!cust?.phone) return res.status(400).json({ error: 'Add a phone number to your profile first.' });
+    const phone = decrypt(cust.phone);
+    const code = genOTP();
+    await storeOTP(req.customer.id, code);
+    await sendWhatsAppOTP(phone, code);
+    res.json({ ok: true, hint: `...${phone.slice(-4)}` });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// POST /api/customer/otp/confirm-setup — verify test OTP → enable phone OTP 2FA
+router.post('/otp/confirm-setup', custAuth, async (req, res) => {
+  const { code } = req.body;
+  if (!code) return res.status(400).json({ error: 'OTP code required' });
+  try {
+    const ok = await verifyOTPCode(req.customer.id, code);
+    if (!ok) return res.status(400).json({ error: 'Invalid or expired OTP' });
+    await supabase.from('customers').update({ phone_otp_enabled: true }).eq('id', req.customer.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
+});
+
+// POST /api/customer/otp/disable — disable phone OTP
+router.post('/otp/disable', custAuth, async (req, res) => {
+  try {
+    await supabase.from('customers').update({ phone_otp_enabled: false }).eq('id', req.customer.id);
+    res.json({ ok: true });
+  } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
 // POST /api/customer/logout — clear httpOnly cookie
