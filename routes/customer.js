@@ -379,6 +379,85 @@ router.post('/wishlist', custAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// ── SAVED ADDRESSES ────────────────────────────────────────────────────────
+// Stored as JSONB array in settings table: key = cust_addresses_<id>
+// Each address: { id, label, name, phone, address, city, state, pincode, type, is_default }
+
+const getAddressKey = id => `cust_addresses_${id}`;
+
+// GET /api/customer/addresses
+router.get('/addresses', custAuth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', getAddressKey(req.customer.id)).maybeSingle();
+    res.json({ addresses: data?.value || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/customer/addresses — add new address
+router.post('/addresses', custAuth, async (req, res) => {
+  try {
+    const { label, name, phone, address, city, state, pincode, type } = req.body;
+    if (!address || !city || !pincode) return res.status(400).json({ error: 'address, city, pincode required' });
+    const key = getAddressKey(req.customer.id);
+    const { data: existing } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
+    const addresses = existing?.value || [];
+    const newAddr = {
+      id: require('crypto').randomUUID(),
+      label: label || 'Home',
+      name: name || '',
+      phone: phone || '',
+      address, city,
+      state: state || 'Tamil Nadu',
+      pincode,
+      type: type || 'both',
+      is_default: addresses.length === 0, // first address is default
+    };
+    addresses.push(newAddr);
+    await supabase.from('settings').upsert({ key, value: addresses }, { onConflict: 'key' });
+    res.json({ address: newAddr, addresses });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PUT /api/customer/addresses/:id — update address
+router.put('/addresses/:id', custAuth, async (req, res) => {
+  try {
+    const key = getAddressKey(req.customer.id);
+    const { data: existing } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
+    let addresses = existing?.value || [];
+    const idx = addresses.findIndex(a => a.id === req.params.id);
+    if (idx === -1) return res.status(404).json({ error: 'Address not found' });
+    const { label, name, phone, address, city, state, pincode, type, is_default } = req.body;
+    addresses[idx] = { ...addresses[idx], label, name, phone, address, city, state, pincode, type };
+    if (is_default) addresses = addresses.map((a, i) => ({ ...a, is_default: i === idx }));
+    await supabase.from('settings').upsert({ key, value: addresses }, { onConflict: 'key' });
+    res.json({ addresses });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// DELETE /api/customer/addresses/:id — delete address
+router.delete('/addresses/:id', custAuth, async (req, res) => {
+  try {
+    const key = getAddressKey(req.customer.id);
+    const { data: existing } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
+    let addresses = (existing?.value || []).filter(a => a.id !== req.params.id);
+    // If default was deleted, make first one default
+    if (addresses.length > 0 && !addresses.some(a => a.is_default)) addresses[0].is_default = true;
+    await supabase.from('settings').upsert({ key, value: addresses }, { onConflict: 'key' });
+    res.json({ addresses });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// PATCH /api/customer/addresses/:id/default — set as default
+router.patch('/addresses/:id/default', custAuth, async (req, res) => {
+  try {
+    const key = getAddressKey(req.customer.id);
+    const { data: existing } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
+    let addresses = (existing?.value || []).map(a => ({ ...a, is_default: a.id === req.params.id }));
+    await supabase.from('settings').upsert({ key, value: addresses }, { onConflict: 'key' });
+    res.json({ addresses });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // ── LOYALTY POINTS ─────────────────────────────────────────────────────────
 
 // GET /api/customer/loyalty — get points balance
