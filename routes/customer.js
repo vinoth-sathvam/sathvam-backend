@@ -124,15 +124,16 @@ router.post('/login', async (req, res) => {
       if (!valid) return res.status(400).json({ error: 'Incorrect password' });
     }
 
-    // Phone OTP 2FA — preferred over TOTP (simpler for customers)
-    if (cust.phone_otp_enabled && cust.phone) {
+    // Email OTP 2FA — preferred over TOTP (simpler for customers)
+    if (cust.phone_otp_enabled) {
       const { issuePreAuthToken } = require('./twoFactor');
       const preAuthToken = issuePreAuthToken({ id: cust.id });
-      const phone = decrypt(cust.phone);
+      const emailAddr = decrypt(cust.email) || normEmail;
       const code = genOTP();
       await storeOTP(cust.id, code);
-      try { await sendWhatsAppOTP(phone, code); } catch (e) { console.error('[OTP]', e.message); }
-      return res.json({ requiresPhoneOTP: true, preAuthToken, hint: `...${phone.slice(-4)}` });
+      try { await sendEmailOTP(emailAddr, code); } catch (e) { console.error('[OTP]', e.message); }
+      const hint = emailAddr.replace(/(.{2})(.*)(@.*)/, (_, a, b, c) => a + b.replace(/./g, '*') + c);
+      return res.json({ requiresPhoneOTP: true, preAuthToken, hint });
     }
 
     // TOTP authenticator 2FA
@@ -595,47 +596,30 @@ router.post('/cart-reminder', custAuth, async (req, res) => {
   }
 });
 
-// ── WhatsApp OTP helpers ──────────────────────────────────────────────────────
+// ── Email OTP helpers ─────────────────────────────────────────────────────────
 function genOTP() { return String(Math.floor(100000 + Math.random() * 900000)); }
 
-async function sendWhatsAppOTP(phone, code) {
-  const token = process.env.BOTSAILOR_API_TOKEN;
-  if (!token) throw new Error('WhatsApp not configured on this server');
-  const digits = phone.replace(/\D/g, '');
-  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID || '';
-  const templateId = process.env.OTP_WA_TEMPLATE_ID; // set in .env after creating OTP template in BotSailor
-
-  if (templateId) {
-    // Use pre-approved template (works anytime, no 24-hour window restriction)
-    const params = new URLSearchParams({
-      apiToken:          token,
-      phoneNumberID:     phoneId,
-      botTemplateID:     String(templateId),
-      sendToPhoneNumber: digits,
-      'templateVariable-1': code,
-      'templateVariable-otp': code,
-      'templateVariable-code': code,
-    });
-    const r = await fetch(`https://botsailor.com/api/v1/whatsapp/send/template?${params.toString()}`, { method: 'POST' });
-    const data = await r.json().catch(() => ({}));
-    if (data.status !== '1' && data.status !== 1) throw new Error(data.message || 'WhatsApp OTP template delivery failed');
-  } else {
-    // Fallback: free-text (only works if customer messaged within 24h)
-    const message = `Your Sathvam OTP: *${code}*\n\nValid for 5 minutes. Do not share.\n— Sathvam Natural Products`;
-    const params = new URLSearchParams({
-      apiToken:        token,
-      phone_number_id: phoneId,
-      phone_number:    digits,
-      message,
-    });
-    const r = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body:    params.toString(),
-    });
-    const data = await r.json();
-    if (data.status !== '1' && data.status !== 1) throw new Error(data.message || 'WhatsApp OTP delivery failed. If you have not messaged us on WhatsApp before, please set OTP_WA_TEMPLATE_ID in .env to use a pre-approved template.');
-  }
+async function sendEmailOTP(toEmail, code) {
+  await mailer.sendMail({
+    from: process.env.SMTP_FROM || `Sathvam <${process.env.SMTP_USER}>`,
+    to:   toEmail,
+    subject: `${code} — Your Sathvam login code`,
+    html: `
+<div style="font-family:sans-serif;max-width:480px;margin:0 auto;background:#fffdf7;border:1px solid #e8dfc8;border-radius:12px;overflow:hidden;">
+  <div style="background:linear-gradient(135deg,#2d1a0e,#5c3317);padding:24px;text-align:center;">
+    <div style="font-size:28px;margin-bottom:6px;">🛡️</div>
+    <div style="color:#fff;font-size:18px;font-weight:700;">Sathvam Login Code</div>
+  </div>
+  <div style="padding:28px 32px;text-align:center;">
+    <div style="font-size:13px;color:#6b7280;margin-bottom:16px;">Use this code to complete your login. Valid for <strong>5 minutes</strong>.</div>
+    <div style="font-size:42px;font-weight:900;letter-spacing:10px;color:#2d1a0e;background:#f5f0e8;border-radius:10px;padding:18px 24px;display:inline-block;margin-bottom:20px;">${code}</div>
+    <div style="font-size:12px;color:#9a8a78;">Do not share this code with anyone. Sathvam will never ask for it.</div>
+  </div>
+  <div style="background:#f5f0e8;padding:14px 24px;text-align:center;font-size:11px;color:#9a8a78;">
+    Sathvam Natural Products · sathvam.in
+  </div>
+</div>`,
+  });
 }
 
 async function storeOTP(customerId, code) {
@@ -653,20 +637,20 @@ async function verifyOTPCode(customerId, code) {
   return true;
 }
 
-// POST /api/customer/otp/send — send WhatsApp OTP (requires preAuthToken from login)
+// POST /api/customer/otp/send — resend Email OTP (requires preAuthToken from login)
 router.post('/otp/send', async (req, res) => {
   const { preAuthToken } = req.body;
   if (!preAuthToken) return res.status(400).json({ error: 'preAuthToken required' });
   try {
     const decoded = jwt.verify(preAuthToken, JWT_SECRET);
     if (decoded.purpose !== 'pre-auth') return res.status(400).json({ error: 'Invalid token' });
-    const { data: cust } = await supabase.from('customers').select('id,phone').eq('id', decoded.id).single();
-    if (!cust?.phone) return res.status(400).json({ error: 'No phone number on file. Add one in your profile.' });
-    const phone = decrypt(cust.phone);
+    const { data: cust } = await supabase.from('customers').select('id,email').eq('id', decoded.id).single();
+    const emailAddr = decrypt(cust.email) || decoded.email || '';
     const code = genOTP();
     await storeOTP(cust.id, code);
-    await sendWhatsAppOTP(phone, code);
-    res.json({ ok: true, hint: `...${phone.slice(-4)}` });
+    await sendEmailOTP(emailAddr, code);
+    const hint = emailAddr.replace(/(.{2})(.*)(@.*)/, (_, a, b, c) => a + b.replace(/./g, '*') + c);
+    res.json({ ok: true, hint });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
@@ -688,25 +672,27 @@ router.post('/otp/verify', async (req, res) => {
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
-// GET /api/customer/otp/status — phone OTP enabled?
+// GET /api/customer/otp/status — email OTP enabled?
 router.get('/otp/status', custAuth, async (req, res) => {
   try {
-    const { data } = await supabase.from('customers').select('phone_otp_enabled,phone').eq('id', req.customer.id).single();
-    const phone = data?.phone ? decrypt(data.phone) : null;
-    res.json({ enabled: data?.phone_otp_enabled || false, hasPhone: !!phone, hint: phone ? `...${phone.slice(-4)}` : null });
+    const { data } = await supabase.from('customers').select('phone_otp_enabled,email').eq('id', req.customer.id).single();
+    const emailAddr = data?.email ? decrypt(data.email) : null;
+    const hint = emailAddr ? emailAddr.replace(/(.{2})(.*)(@.*)/, (_, a, b, c) => a + b.replace(/./g, '*') + c) : null;
+    res.json({ enabled: data?.phone_otp_enabled || false, hasEmail: true, hint });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/customer/otp/setup — send test OTP to verify phone before enabling
+// POST /api/customer/otp/setup — send test OTP to customer's email before enabling
 router.post('/otp/setup', custAuth, async (req, res) => {
   try {
-    const { data: cust } = await supabase.from('customers').select('phone').eq('id', req.customer.id).single();
-    if (!cust?.phone) return res.status(400).json({ error: 'Add a phone number to your profile first.' });
-    const phone = decrypt(cust.phone);
+    const { data: cust } = await supabase.from('customers').select('email').eq('id', req.customer.id).single();
+    const emailAddr = decrypt(cust.email) || req.customer.email || '';
+    if (!emailAddr) return res.status(400).json({ error: 'No email on file.' });
     const code = genOTP();
     await storeOTP(req.customer.id, code);
-    await sendWhatsAppOTP(phone, code);
-    res.json({ ok: true, hint: `...${phone.slice(-4)}` });
+    await sendEmailOTP(emailAddr, code);
+    const hint = emailAddr.replace(/(.{2})(.*)(@.*)/, (_, a, b, c) => a + b.replace(/./g, '*') + c);
+    res.json({ ok: true, hint });
   } catch (e) { res.status(400).json({ error: e.message }); }
 });
 
