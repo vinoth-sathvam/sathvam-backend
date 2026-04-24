@@ -239,6 +239,7 @@ router.post('/verify', async (req, res) => {
       shipping:            parseFloat(o.shipping) || 0,
       total:               parseFloat(o.total) || 0,
       status:              'confirmed',
+      payment_status:      'paid',
       channel:             'website',
       notes:               `Razorpay: ${razorpay_payment_id}`,
     }, { onConflict: 'id' });
