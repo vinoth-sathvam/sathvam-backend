@@ -1152,11 +1152,23 @@ router.get('/store-config', async (req, res) => {
   try {
     const { data } = await supabase.from('settings').select('value').eq('key', 'web_settings').maybeSingle();
     const cfg = data?.value || {};
+    const DEFAULT_SLABS = [
+      { upTo: 0.5, charge: 49 },
+      { upTo: 1,   charge: 59 },
+      { upTo: 2,   charge: 79 },
+      { upTo: 5,   charge: 99 },
+      { upTo: 10,  charge: 149 },
+      { upTo: 999, charge: 199 },
+    ];
     res.json({
-      couponsEnabled:    cfg.couponsEnabled    !== false,
+      couponsEnabled:     cfg.couponsEnabled    !== false,
       giftPackingEnabled: cfg.giftPackingEnabled !== false,
+      storePaused:        cfg.storePaused        === true,
+      freeShippingAbove:  cfg.freeShippingAbove  || 2500,
+      courierSlabs:       (cfg.courierSlabs && cfg.courierSlabs.length) ? cfg.courierSlabs : DEFAULT_SLABS,
+      separateDelivery:   cfg.separateDelivery   !== false,
     });
-  } catch (e) { res.json({ couponsEnabled: true, giftPackingEnabled: true }); }
+  } catch (e) { res.json({ couponsEnabled: true, giftPackingEnabled: true, freeShippingAbove: 2500, courierSlabs: [], separateDelivery: true }); }
 });
 
 const bustCache = () => { Object.keys(cache).forEach(k => delete cache[k]); };
