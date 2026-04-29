@@ -1167,8 +1167,9 @@ router.get('/store-config', async (req, res) => {
       freeShippingAbove:  cfg.freeShippingAbove  || 2500,
       courierSlabs:       (cfg.courierSlabs && cfg.courierSlabs.length) ? cfg.courierSlabs : DEFAULT_SLABS,
       separateDelivery:   cfg.separateDelivery   !== false,
+      effectsEnabled:     cfg.effectsEnabled     !== false,
     });
-  } catch (e) { res.json({ couponsEnabled: true, giftPackingEnabled: true, freeShippingAbove: 2500, courierSlabs: [], separateDelivery: true }); }
+  } catch (e) { res.json({ couponsEnabled: true, giftPackingEnabled: true, freeShippingAbove: 2500, courierSlabs: [], separateDelivery: true, effectsEnabled: true }); }
 });
 
 const bustCache = () => { Object.keys(cache).forEach(k => delete cache[k]); };
