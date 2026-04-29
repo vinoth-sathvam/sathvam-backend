@@ -1172,5 +1172,46 @@ router.get('/store-config', async (req, res) => {
 });
 
 const bustCache = () => { Object.keys(cache).forEach(k => delete cache[k]); };
+
+// GET /api/public/track-order/:orderNo — public order status (no auth, no PII returned)
+router.get('/track-order/:orderNo', async (req, res) => {
+  try {
+    const orderNo = (req.params.orderNo || '').trim().toUpperCase();
+    if (!orderNo) return res.status(400).json({ error: 'Order number required' });
+    const { data, error } = await supabase
+      .from('webstore_orders')
+      .select('order_no,date,status,payment_status,courier,tracking_no,items,shipping,total,created_at')
+      .eq('order_no', orderNo)
+      .maybeSingle();
+    if (error || !data) return res.status(404).json({ error: 'Order not found' });
+    const STATUS_LABELS = {
+      new:       { label: 'Order Placed',    color: '#6b7280', icon: '📋' },
+      confirmed: { label: 'Confirmed',       color: '#2563eb', icon: '✅' },
+      packed:    { label: 'Packed',          color: '#7c3aed', icon: '📦' },
+      shipped:   { label: 'Shipped',         color: '#d97706', icon: '🚚' },
+      delivered: { label: 'Delivered',       color: '#16a34a', icon: '🎉' },
+      cancelled: { label: 'Cancelled',       color: '#dc2626', icon: '❌' },
+    };
+    const st = STATUS_LABELS[data.status] || { label: data.status, color: '#6b7280', icon: '📋' };
+    res.json({
+      order_no:       data.order_no,
+      date:           data.date,
+      status:         data.status,
+      status_label:   st.label,
+      status_color:   st.color,
+      status_icon:    st.icon,
+      payment_status: data.payment_status,
+      courier:        data.courier || null,
+      tracking_no:    data.tracking_no || null,
+      item_count:     Array.isArray(data.items) ? data.items.length : 0,
+      total:          data.total,
+      shipping:       data.shipping,
+    });
+  } catch (e) {
+    console.error('track-order error:', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
 module.exports = router;
 module.exports.bustCache = bustCache;

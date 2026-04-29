@@ -53,12 +53,13 @@ router.get('/dashboard', auth, async (req, res) => {
     const ago30  = new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10);
     const week   = new Date(Date.now() + 7  * 864e5).toISOString().slice(0, 10);
 
-    const [bills, bankAccs, sales30, ws30, b2bPending] = await Promise.all([
+    const [bills, bankAccs, sales30, ws30, b2bPending, pmtSettings] = await Promise.all([
       supabase.from('vendor_bills').select('amount,gst_amount,paid_amount,due_date,status').is('deleted_at', null),
       supabase.from('bank_accounts').select('name,current_balance,type').eq('is_active', true),
       supabase.from('sales').select('final_amount').eq('status','paid').gte('date', ago30),
       supabase.from('webstore_orders').select('total').in('status',['confirmed','shipped','delivered']).gte('date', ago30),
-      supabase.from('b2b_orders').select('total_value,stage').not('stage','in','("delivered","cancelled")'),
+      supabase.from('b2b_orders').select('id,total_value,stage').not('stage','in','("delivered","cancelled")'),
+      supabase.from('settings').select('value').eq('key', 'b2b_payments').single(),
     ]);
 
     const billList  = bills.data || [];
@@ -68,7 +69,12 @@ router.get('/dashboard', auth, async (req, res) => {
     const cashBal   = (bankAccs.data || []).reduce((s,a) => s + (a.current_balance || 0), 0);
     const rev30     = (sales30.data||[]).reduce((s,x)=>s+(x.final_amount||0),0)
                     + (ws30.data||[]).reduce((s,x)=>s+(x.total||0),0);
-    const arTotal   = (b2bPending.data||[]).reduce((s,x)=>s+(x.total_value||0),0);
+    const b2bPayments = pmtSettings?.data?.value || {};
+    const arTotal   = (b2bPending.data||[]).reduce((s,x)=>{
+      const pmt = b2bPayments[x.id] || {};
+      const paid = (parseFloat(pmt.advance_paid)||0) + (parseFloat(pmt.remaining_paid)||0);
+      return s + Math.max(0, (x.total_value||0) - paid);
+    }, 0);
 
     res.json({ ap_total:round2(apTotal), ap_overdue:round2(apOverdue), ap_due_this_week:apDueWeek, cash_balance:round2(cashBal), ar_total:round2(arTotal), revenue_30d:round2(rev30), bank_accounts: bankAccs.data||[] });
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -87,14 +93,31 @@ router.get('/receivables', auth, async (req, res) => {
 
     // ── Local B2B orders ─────────────────────────────────────────────────────
     if (source === 'all' || source === 'b2b') {
-      const { data: b2b } = await supabase.from('b2b_orders').select('id,order_no,customer_name,created_at,total_value,stage').not('stage','in','("delivered","cancelled","invoice_paid")').order('created_at', { ascending:false }).limit(200);
+      const [{ data: b2b }, { data: pmtSetting }] = await Promise.all([
+        supabase.from('b2b_orders').select('id,order_no,customer_name,created_at,total_value,stage').not('stage','in','("delivered","cancelled","invoice_paid")').order('created_at', { ascending:false }).limit(200),
+        supabase.from('settings').select('value').eq('key', 'b2b_payments').single(),
+      ]);
+      const b2bPmts = pmtSetting?.value || {};
       for (const o of (b2b || [])) {
+        const pmt = b2bPmts[o.id] || {};
+        const advPaid  = parseFloat(pmt.advance_paid)  || 0;
+        const remPaid  = parseFloat(pmt.remaining_paid) || 0;
+        const totalPaid = round2(advPaid + remPaid);
+        const balance   = round2(Math.max(0, (o.total_value||0) - totalPaid));
+        const st = totalPaid >= (o.total_value||0) && (o.total_value||0) > 0 ? 'paid'
+                 : totalPaid > 0 ? 'partial'
+                 : 'unpaid';
         invoices.push({
           id: `b2b-${o.id}`, source:'b2b', invoice_no: o.order_no,
           customer_name: o.customer_name || '',
           date: (o.created_at||'').slice(0,10), due_date: null,
-          amount: o.total_value || 0, paid_amount: 0,
-          balance: o.total_value || 0, status: 'unpaid',
+          amount: o.total_value || 0,
+          paid_amount: totalPaid,
+          advance_paid: advPaid,
+          advance_date: pmt.advance_date || null,
+          remaining_paid: remPaid,
+          balance,
+          status: st,
           ref_id: o.id,
         });
       }

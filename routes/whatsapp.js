@@ -67,19 +67,15 @@ async function getProductContext() {
 
 // ── Helper: lookup recent orders for a WhatsApp phone number ─────────────────
 async function getOrdersByPhone(waPhone) {
-  // WA numbers arrive as 91XXXXXXXXXX; match last 10 digits
   const digits = waPhone.replace(/\D/g, '').slice(-10);
   try {
     const { data } = await supabase
       .from('webstore_orders')
       .select('order_no,status,total,created_at,customer,tracking_no,courier')
+      .ilike('customer->>phone', `%${digits}`)
       .order('created_at', { ascending: false })
-      .limit(200);
-
-    return (data || []).filter(o => {
-      const ph = (o.customer?.phone || '').replace(/\D/g, '').slice(-10);
-      return ph === digits;
-    }).slice(0, 5);
+      .limit(5);
+    return data || [];
   } catch (e) {
     console.error('WA getOrdersByPhone error:', e.message);
     return [];
@@ -380,9 +376,9 @@ router.get('/conversations', auth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('whatsapp_messages')
-      .select('*')
+      .select('phone,contact_name,content,direction,timestamp,read_at,type')
       .order('timestamp', { ascending: false })
-      .limit(2000);
+      .limit(500);
     if (error) throw error;
 
     const convMap = {};

@@ -59,9 +59,14 @@ b2bOrders.get('/', auth, async (req, res) => {
   if (req.user.type === 'b2b_customer') {
     query = query.eq('customer_id', req.user.id);
   }
-  const { data, error } = await query;
+  const [{ data, error }, { data: pmtSettings }] = await Promise.all([
+    query,
+    supabase.from('settings').select('value').eq('key', 'b2b_payments').single()
+  ]);
   if (error) return res.status(500).json({ error: 'Failed to load orders' });
-  res.json(data);
+  const payments = pmtSettings?.value || {};
+  const merged = (data || []).map(o => ({ ...o, ...(payments[o.id] || {}) }));
+  res.json(merged);
 });
 b2bOrders.post('/', auth, async (req, res) => {
   const o = req.body;
@@ -688,23 +693,32 @@ b2bAnalytics.get('/', auth, requireRole('admin','manager','ceo'), async (req, re
 b2bOrders.post('/:id/payment', auth, requireRole('admin','manager','ceo'), async (req, res) => {
   const { type, amount, date, ref, notes } = req.body;
   if (!['advance','remaining'].includes(type)) return res.status(400).json({ error: 'type must be advance or remaining' });
-  const updates = {};
+
+  // Payment data stored in settings table (key: b2b_payments) as {[orderId]: {...}}
+  const SETTINGS_KEY = 'b2b_payments';
+  const { data: existing } = await supabase.from('settings').select('value').eq('key', SETTINGS_KEY).single();
+  const allPayments = existing?.value || {};
+  const orderPayment = allPayments[req.params.id] || {};
+
   if (type === 'advance') {
-    updates.advance_paid = parseFloat(amount)||0;
-    updates.advance_date = date || new Date().toISOString().slice(0,10);
-    updates.advance_ref  = ref || '';
-    updates.advance_notes= notes || '';
-    updates.payment_status = 'advance_paid';
+    orderPayment.advance_paid   = parseFloat(amount)||0;
+    orderPayment.advance_date   = date || new Date().toISOString().slice(0,10);
+    orderPayment.advance_ref    = ref || '';
+    orderPayment.advance_notes  = notes || '';
+    orderPayment.payment_status = 'advance_paid';
   } else {
-    updates.remaining_paid = parseFloat(amount)||0;
-    updates.remaining_date = date || new Date().toISOString().slice(0,10);
-    updates.remaining_ref  = ref || '';
-    updates.remaining_notes= notes || '';
-    updates.payment_status = 'fully_paid';
+    orderPayment.remaining_paid   = parseFloat(amount)||0;
+    orderPayment.remaining_date   = date || new Date().toISOString().slice(0,10);
+    orderPayment.remaining_ref    = ref || '';
+    orderPayment.remaining_notes  = notes || '';
+    orderPayment.payment_status   = 'fully_paid';
   }
-  const { data, error } = await supabase.from('b2b_orders').update(updates).eq('id', req.params.id).select().single();
-  if (error) return res.status(400).json({ error: 'Payment update failed' });
-  res.json(data);
+  allPayments[req.params.id] = orderPayment;
+
+  const { error } = await supabase.from('settings').upsert({ key: SETTINGS_KEY, value: allPayments });
+  if (error) return res.status(400).json({ error: 'Payment update failed: ' + error.message });
+
+  res.json({ id: req.params.id, ...orderPayment });
   // Auto WhatsApp
   setImmediate(async () => {
     try {
@@ -745,19 +759,24 @@ const b2bNotifications = express.Router();
 b2bNotifications.get('/:customerId', auth, async (req, res) => {
   const customerId = req.params.customerId;
   if (req.user.type === 'b2b_customer' && req.user.id !== customerId) return res.status(403).json({ error: 'Access denied' });
-  const { data: orders } = await supabase.from('b2b_orders')
-    .select('id,order_no,stage,advance_paid,advance_date,remaining_paid,remaining_date,payment_status,b2b_order_stages(id,stage,date,note,created_at)')
-    .eq('customer_id', customerId)
-    .order('created_at', { ascending: false })
-    .limit(20);
+  const [{ data: orders }, { data: pmtSettings }] = await Promise.all([
+    supabase.from('b2b_orders')
+      .select('id,order_no,stage,b2b_order_stages(id,stage,date,note,created_at)')
+      .eq('customer_id', customerId)
+      .order('created_at', { ascending: false })
+      .limit(20),
+    supabase.from('settings').select('value').eq('key', 'b2b_payments').single()
+  ]);
+  const payments = pmtSettings?.value || {};
   const notifications = [];
   (orders || []).forEach(order => {
+    const pmt = payments[order.id] || {};
     const stages = (order.b2b_order_stages || []).sort((a,b) => new Date(b.created_at||b.date) - new Date(a.created_at||a.date));
     stages.slice(0, 3).forEach(s => {
       notifications.push({ id: `stage-${s.id}`, type:'stage_change', orderId:order.id, orderNo:order.order_no, title:`Order ${order.order_no} — Updated`, body: s.note || `Stage: ${s.stage}`, stage: s.stage, date: s.created_at || s.date });
     });
-    if (order.advance_date) notifications.push({ id:`adv-${order.id}`, type:'payment', orderId:order.id, orderNo:order.order_no, title:`Advance Payment Received – ${order.order_no}`, body:`₹${order.advance_paid} on ${order.advance_date}`, date: order.advance_date });
-    if (order.remaining_date) notifications.push({ id:`rem-${order.id}`, type:'payment', orderId:order.id, orderNo:order.order_no, title:`Final Payment Received – ${order.order_no}`, body:`₹${order.remaining_paid} on ${order.remaining_date}`, date: order.remaining_date });
+    if (pmt.advance_date) notifications.push({ id:`adv-${order.id}`, type:'payment', orderId:order.id, orderNo:order.order_no, title:`Advance Payment Received – ${order.order_no}`, body:`₹${pmt.advance_paid} on ${pmt.advance_date}`, date: pmt.advance_date });
+    if (pmt.remaining_date) notifications.push({ id:`rem-${order.id}`, type:'payment', orderId:order.id, orderNo:order.order_no, title:`Final Payment Received – ${order.order_no}`, body:`₹${pmt.remaining_paid} on ${pmt.remaining_date}`, date: pmt.remaining_date });
   });
   notifications.sort((a,b) => new Date(b.date) - new Date(a.date));
   res.json(notifications.slice(0, 40));

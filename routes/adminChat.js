@@ -1432,7 +1432,7 @@ async function executeTool(name, input) {
       }
 
       case 'get_crm_summary': {
-        const { data: orders, error } = await supabase.from('webstore_orders').select('customer_name,customer_phone,customer_email,total_amount,status,created_at').neq('status','cancelled');
+        const { data: orders, error } = await supabase.from('webstore_orders').select('customer_name,customer_phone,customer_email,total_amount,status,created_at').neq('status','cancelled').limit(2000);
         if (error) return { error: error.message };
         const map = {};
         for (const o of orders||[]) {
@@ -1563,7 +1563,16 @@ When listing items: use short readable lines, no markdown tables. For action con
         headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
         body: JSON.stringify({ model:'claude-sonnet-4-6', max_tokens:1024, system:systemPrompt, tools:TOOLS, messages:apiMessages }),
       });
-      if (!response.ok) { const err = await response.text(); console.error('Admin chat error:', err); return res.status(502).json({ error: 'AI service error' }); }
+      if (!response.ok) {
+        const err = await response.text();
+        console.error('Admin chat error:', err);
+        let parsed = {};
+        try { parsed = JSON.parse(err); } catch {}
+        if (parsed?.error?.message?.includes('credit balance is too low') || parsed?.error?.type === 'invalid_request_error' && parsed?.error?.message?.includes('credit')) {
+          return res.status(402).json({ error: 'no_credits', message: 'Anthropic API credit balance is too low. Top up at console.anthropic.com → Billing.' });
+        }
+        return res.status(502).json({ error: 'AI service error' });
+      }
       const data = await response.json();
 
       if (data.stop_reason === 'tool_use') {

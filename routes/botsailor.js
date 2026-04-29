@@ -107,16 +107,14 @@ async function getOrdersByPhone(phone) {
   const digits = (phone || '').replace(/\D/g, '').slice(-10);
   if (digits.length < 10) return [];
   try {
+    // Filter by last 10 digits using ilike on customer->phone JSON field
     const { data } = await supabase
       .from('webstore_orders')
       .select('order_no,status,total,created_at,customer,tracking_no,courier')
+      .ilike('customer->>phone', `%${digits}`)
       .order('created_at', { ascending: false })
-      .limit(300);
-
-    return (data || []).filter(o => {
-      const ph = (o.customer?.phone || '').replace(/\D/g, '').slice(-10);
-      return ph === digits;
-    }).slice(0, 5);
+      .limit(5);
+    return data || [];
   } catch (e) { return []; }
 }
 
@@ -423,6 +421,51 @@ router.post('/send-template', async (req, res) => {
       ? `[Template #${templateId}] vars: ${JSON.stringify(variables)}`
       : `[Template #${templateId}]`;
     await storeMessage({ phone: digits, direction: 'outbound', type: 'template', content: bodyText, status: 'sent', sent_by: 'admin', timestamp: new Date().toISOString() });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/botsailor/trigger-bot  — Trigger a pre-built BotSailor bot flow to a phone
+// Body: { phone, botFlowId }
+// botFlowId: the "Bot Flow Unique ID" from BotSailor Bot Reply settings
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/trigger-bot', async (req, res) => {
+  const token   = BOTSAILOR_API_TOKEN();
+  const phoneId = BOTSAILOR_PHONE_ID() || '';
+  if (!token) return res.status(500).json({ error: 'BOTSAILOR_API_TOKEN not set' });
+
+  const { phone, botFlowId } = req.body;
+  if (!phone || !botFlowId) return res.status(400).json({ error: 'phone and botFlowId are required' });
+
+  const digits = phone.replace(/\D/g, '');
+  if (digits.length < 10) return res.status(400).json({ error: 'Invalid phone number' });
+
+  try {
+    const params = new URLSearchParams({
+      apiToken:          token,
+      phone_number_id:   phoneId,
+      bot_flow_unique_id: String(botFlowId),
+      phone_number:      digits,
+    });
+    const bsRes = await fetch('https://botsailor.com/api/v1/whatsapp/trigger-bot', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:    params.toString(),
+    });
+    const rawText = await bsRes.text();
+    let data;
+    try { data = JSON.parse(rawText); } catch { return res.status(502).json({ error: 'BotSailor non-JSON', raw: rawText.slice(0,200) }); }
+    if (data.status !== '1' && data.status !== 1) {
+      return res.status(400).json({ error: data.message || data.error || JSON.stringify(data) });
+    }
+    await storeMessage({
+      phone: digits, direction: 'outbound', type: 'bot_flow',
+      content: `[Bot Flow: ${botFlowId}]`, status: 'sent', sent_by: 'admin',
+      timestamp: new Date().toISOString(),
+    });
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });

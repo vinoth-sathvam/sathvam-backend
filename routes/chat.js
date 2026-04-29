@@ -216,6 +216,32 @@ async function saveSession(sessionId, lead, messages, hasIssue, issueType) {
   } catch (e) { console.warn('chat_sessions save skipped:', e.message); return { isNew: false, wasIssue: false }; }
 }
 
+// ── Fetch recent orders for logged-in customer ────────────────────────────────
+async function getCustomerOrderHistory(token) {
+  if (!token) return '';
+  try {
+    const jwt = require('jsonwebtoken');
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const customerId = decoded.id;
+    if (!customerId) return '';
+    const { data: orders } = await supabase
+      .from('webstore_orders')
+      .select('order_no,status,total,created_at,items')
+      .eq('customer_id', customerId)
+      .order('created_at', { ascending: false })
+      .limit(3);
+    if (!orders || !orders.length) return '';
+    const lines = orders.map(o => {
+      const items = (o.items || []).slice(0, 3).map(i => `${i.qty||1}x ${i.productName||i.name||''}`).join(', ');
+      const date = o.created_at ? new Date(o.created_at).toLocaleDateString('en-IN') : '';
+      return `  → ${o.order_no} | ${o.status?.toUpperCase()} | ₹${o.total} | ${date} | ${items}`;
+    });
+    return `\nCUSTOMER'S RECENT ORDERS (last ${orders.length}):\n${lines.join('\n')}\nUse this to personalize — greet them as a returning customer, suggest reorders if relevant.`;
+  } catch (e) {
+    return ''; // invalid token or error — ignore silently
+  }
+}
+
 // ── Send issue alert email ────────────────────────────────────────────────────
 async function sendIssueAlert(lead, messages, issueType) {
   if (!process.env.SMTP_USER || !process.env.SMTP_PASS) return;
@@ -503,7 +529,7 @@ router.post('/stream', chatLimiter, async (req, res) => {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) return res.status(503).json({ error: 'Service unavailable' });
 
-  const { messages, lead, sessionId, cart, currentProduct } = req.body;
+  const { messages, lead, sessionId, cart, currentProduct, customerToken, uiLang } = req.body;
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: 'No messages provided' });
   }
@@ -529,6 +555,7 @@ router.post('/stream', chatLimiter, async (req, res) => {
   const cartContext    = buildCartContext(cart);
   const pageContext    = buildPageContext(currentProduct);
   const pincodeCtx    = buildPincodeContext(messages);
+  const orderHistory  = await getCustomerOrderHistory(customerToken);
 
   let orderContext = '';
   const isOrderIntent = detectOrderIntent(messages);
@@ -562,7 +589,7 @@ router.post('/stream', chatLimiter, async (req, res) => {
 
   const systemPrompt = `You are Sathvam's friendly AI sales assistant on www.sathvam.in.
 Sathvam Natural Products — factory-direct from Karur, Tamil Nadu. Cold pressed oils, millets, spices. 100% natural, zero chemicals.
-Be warm, concise, action-focused. Max 4 lines per reply. If customer writes in Tamil, reply ONLY in Tamil.
+Be warm, concise, action-focused. Max 4 lines per reply.${uiLang === 'ta' ? ' The customer has selected Tamil mode — reply ONLY in Tamil throughout this conversation.' : ' If customer writes in Tamil, reply ONLY in Tamil.'}
 
 FORMATTING — plain text chat only, no markdown:
 - No **, no *, no #, no tables, no dashes. Use → for lists.
@@ -574,6 +601,7 @@ ${couponContext}
 ${cartContext}
 ${pageContext}
 ${pincodeCtx}
+${orderHistory}
 
 ━━━━ SECURITY — ABSOLUTE RULES (never break these) ━━━━
 NEVER ask for or accept: card number, CVV, OTP, UPI PIN, NetBanking password, bank account/IFSC, any payment credentials.
@@ -642,7 +670,7 @@ NEVER make up prices or stock. If unsure, say "Check +91 70921 77092 for latest 
         'content-type': 'application/json',
       },
       body: JSON.stringify({
-        model: 'claude-sonnet-4-6',
+        model: 'claude-haiku-4-5-20251001',
         max_tokens: 650,
         stream: true,
         system: systemPrompt,
