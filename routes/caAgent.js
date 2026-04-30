@@ -1108,16 +1108,28 @@ router.get('/simple-dashboard', auth, roleGuard, async (req, res) => {
     const r2     = n => Math.round((parseFloat(n) || 0) * 100) / 100;
     const today  = new Date();
     const ist    = new Date(today.getTime() + 5.5 * 3600000);
-    const yr     = ist.getUTCFullYear();
-    const mo     = ist.getUTCMonth();
+
+    // Allow ?month=YYYY-MM override; default to IST current month
+    let yr, mo;
+    if (req.query.month && /^\d{4}-\d{2}$/.test(req.query.month)) {
+      [yr, mo] = req.query.month.split('-').map(Number);
+      mo = mo - 1; // 0-indexed
+    } else {
+      yr = ist.getUTCFullYear();
+      mo = ist.getUTCMonth();
+    }
+
     const mStr   = `${yr}-${String(mo+1).padStart(2,'0')}`;
     const mStart = `${mStr}-01`;
     const mEnd   = new Date(yr, mo+1, 0).toISOString().slice(0,10);
-    const prevM  = `${yr}-${String(mo).padStart(2,'0')}`;
-    const prevStart = `${yr}-${String(mo).padStart(2,'0')}-01`;
-    const prevEnd   = new Date(yr, mo, 0).toISOString().slice(0,10);
+    const prevYr  = mo === 0 ? yr - 1 : yr;
+    const prevMo  = mo === 0 ? 11 : mo - 1;
+    const prevStart = `${prevYr}-${String(prevMo+1).padStart(2,'0')}-01`;
+    const prevEnd   = new Date(prevYr, prevMo+1, 0).toISOString().slice(0,10);
     const next30 = new Date(today.getTime() + 30*86400000).toISOString().slice(0,10);
-    const fyStart = `${mo >= 3 ? yr : yr-1}-04-01`;
+
+    const SALE_STATUSES = ['delivered','dispatched','paid'];
+    const WEB_STATUSES  = ['confirmed','packed','shipped','delivered','dispatched','paid'];
 
     const [
       bankAccs, cifSetting,
@@ -1131,10 +1143,10 @@ router.get('/simple-dashboard', auth, roleGuard, async (req, res) => {
     ] = await Promise.all([
       supabase.from('bank_accounts').select('name,current_balance').eq('is_active', true),
       supabase.from('settings').select('value').eq('key','cash_in_factory').single(),
-      supabase.from('sales').select('final_amount').gte('date',mStart).lte('date',mEnd).in('status',['delivered','dispatched']),
-      supabase.from('sales').select('final_amount').gte('date',prevStart).lte('date',prevEnd).in('status',['delivered','dispatched']),
-      supabase.from('webstore_orders').select('total').gte('date',mStart).lte('date',mEnd).in('status',['confirmed','packed','shipped','delivered']),
-      supabase.from('webstore_orders').select('total').gte('date',prevStart).lte('date',prevEnd).in('status',['confirmed','packed','shipped','delivered']),
+      supabase.from('sales').select('final_amount').gte('date',mStart).lte('date',mEnd).in('status',SALE_STATUSES),
+      supabase.from('sales').select('final_amount').gte('date',prevStart).lte('date',prevEnd).in('status',SALE_STATUSES),
+      supabase.from('webstore_orders').select('total').gte('date',mStart).lte('date',mEnd).in('status',WEB_STATUSES),
+      supabase.from('webstore_orders').select('total').gte('date',prevStart).lte('date',prevEnd).in('status',WEB_STATUSES),
       supabase.from('bank_transactions').select('amount,description,date').eq('type','credit').gte('date',mStart).lte('date',mEnd).ilike('description','%TUTR%'), // foreign inward / B2B wire
       supabase.from('company_expenses').select('amount,category,date,description').gte('date',mStart).lte('date',mEnd).is('deleted_at',null),
       supabase.from('company_expenses').select('amount').gte('date',prevStart).lte('date',prevEnd).is('deleted_at',null),
