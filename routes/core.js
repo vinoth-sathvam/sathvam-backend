@@ -141,7 +141,8 @@ products.post('/', auth, requireRole('admin'), async (req, res) => {
     web_profit_pct:p.webProfitPct, web_courier_charge:p.webCourierCharge,
     intl_profit_pct:p.intlProfitPct, intl_carton_key:p.intlCartonKey,
     label_cost:p.labelCost||0, pkg_type_key:p.pkgTypeKey, featured:p.featured||false,
-    image_url:p.imageUrl||null, description:p.description||null, hsn_code:p.hsnCode||null
+    image_url:p.imageUrl||null, description:p.description||null, hsn_code:p.hsnCode||null,
+    commodity_id:p.commodityId||null
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
 
@@ -179,6 +180,7 @@ products.put('/batch', auth, requireRole('admin', 'manager'), async (req, res) =
     image_url: p.imageUrl ?? undefined,
     description: p.description ?? undefined,
     hsn_code: p.hsnCode ?? undefined,
+    commodity_id: p.commodityId ?? null,
   }));
   const { error } = await supabase.from('products').upsert(updates, { onConflict: 'id' });
   if (error) return res.status(400).json({ error: error.message });
@@ -204,6 +206,7 @@ products.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
     offer_label:p.offer_label!==undefined?p.offer_label:undefined,
     offer_price:p.offer_price!==undefined?p.offer_price:undefined,
     offer_ends_at:p.offer_ends_at!==undefined?p.offer_ends_at:undefined,
+    commodity_id:p.commodityId!==undefined?p.commodityId:undefined,
   }).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
@@ -599,6 +602,35 @@ procurement.get('/', auth, async (req, res) => {
   }));
   res.json(mapped);
 });
+// Returns latest landed cost per commodity_id from most recent stocked/received procurement
+procurement.get('/commodity-costs', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('procurements')
+      .select('commodity_id, commodity_name, ordered_price_per_kg, logistics_cost_per_kg, date, supplier, status')
+      .in('status', ['stocked', 'cleaned', 'received'])
+      .not('commodity_id', 'is', null)
+      .order('date', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+
+    // Keep only the most recent entry per commodity_id
+    const costMap = {};
+    (data || []).forEach(p => {
+      if (!costMap[p.commodity_id]) {
+        costMap[p.commodity_id] = {
+          commodityId: p.commodity_id,
+          commodityName: p.commodity_name,
+          costPerKg: parseFloat(p.ordered_price_per_kg) || 0,
+          logisticsCostPerKg: parseFloat(p.logistics_cost_per_kg) || 0,
+          date: p.date,
+          supplier: p.supplier,
+        };
+      }
+    });
+    res.json(costMap);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 procurement.post('/', auth, requireRole('admin','manager'), async (req, res) => {
   const p = req.body;
   const payStatus = p.paymentStatus || 'unpaid';
