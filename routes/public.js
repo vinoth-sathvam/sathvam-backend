@@ -1194,50 +1194,62 @@ router.get('/track-order/:orderNo', async (req, res) => {
     // 1. Try webstore_orders first
     const { data: wsData } = await supabase
       .from('webstore_orders')
-      .select('order_no,date,status,payment_status,courier,awb_number,items,shipping,total')
+      .select('order_no,date,status,payment_status,courier,awb_number,items,shipping,total,dispatch_date,delivered_date,cancel_reason,created_at')
       .eq('order_no', orderNo)
       .maybeSingle();
 
     if (wsData) {
       const st = STATUS_LABELS[wsData.status] || { label: wsData.status, color: '#6b7280', icon: '📋' };
+      const items = Array.isArray(wsData.items) ? wsData.items : [];
       return res.json({
-        order_no:       wsData.order_no,
-        date:           wsData.date,
-        status:         wsData.status,
-        status_label:   st.label,
-        status_color:   st.color,
-        status_icon:    st.icon,
-        payment_status: wsData.payment_status,
-        courier:        wsData.courier || null,
-        tracking_no:    wsData.awb_number || null,
-        item_count:     Array.isArray(wsData.items) ? wsData.items.length : 0,
-        total:          wsData.total,
-        shipping:       wsData.shipping,
+        order_no:        wsData.order_no,
+        date:            wsData.date,
+        status:          wsData.status,
+        status_label:    st.label,
+        status_color:    st.color,
+        status_icon:     st.icon,
+        payment_status:  wsData.payment_status,
+        courier:         wsData.courier || null,
+        tracking_no:     wsData.awb_number || null,
+        item_count:      items.length,
+        items:           items.map(i => ({ name: i.name || i.product_name || '', qty: i.qty || i.quantity || 1 })),
+        total:           wsData.total,
+        shipping:        wsData.shipping,
+        dispatch_date:   wsData.dispatch_date || null,
+        delivered_date:  wsData.delivered_date || null,
+        cancel_reason:   wsData.cancel_reason || null,
+        created_at:      wsData.created_at || null,
       });
     }
 
     // 2. Fallback: try sales table (internal/retail orders use same order number format)
     const { data: saleData } = await supabase
       .from('sales')
-      .select('order_no,date,status,payment_method,items,final_amount')
+      .select('order_no,date,status,payment_method,items,final_amount,customer_name')
       .eq('order_no', orderNo)
       .maybeSingle();
 
     if (saleData) {
       const st = STATUS_LABELS[saleData.status] || { label: saleData.status, color: '#6b7280', icon: '📋' };
+      const items = Array.isArray(saleData.items) ? saleData.items : [];
       return res.json({
-        order_no:       saleData.order_no,
-        date:           saleData.date,
-        status:         saleData.status,
-        status_label:   st.label,
-        status_color:   st.color,
-        status_icon:    st.icon,
-        payment_status: saleData.status === 'delivered' || saleData.status === 'dispatched' ? 'paid' : 'pending',
-        courier:        null,
-        tracking_no:    null,
-        item_count:     Array.isArray(saleData.items) ? saleData.items.length : 0,
-        total:          saleData.final_amount,
-        shipping:       0,
+        order_no:        saleData.order_no,
+        date:            saleData.date,
+        status:          saleData.status,
+        status_label:    st.label,
+        status_color:    st.color,
+        status_icon:     st.icon,
+        payment_status:  ['delivered','dispatched'].includes(saleData.status) ? 'paid' : 'pending',
+        courier:         null,
+        tracking_no:     null,
+        item_count:      items.length,
+        items:           items.map(i => ({ name: i.productName || i.name || '', qty: i.qty || i.quantity || 1 })),
+        total:           saleData.final_amount,
+        shipping:        0,
+        dispatch_date:   null,
+        delivered_date:  null,
+        cancel_reason:   null,
+        created_at:      null,
       });
     }
 
