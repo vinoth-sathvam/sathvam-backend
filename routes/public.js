@@ -1194,7 +1194,7 @@ router.get('/track-order/:orderNo', async (req, res) => {
     // 1. Try webstore_orders first
     const { data: wsData } = await supabase
       .from('webstore_orders')
-      .select('order_no,date,status,payment_status,courier,tracking_no,items,shipping,total')
+      .select('order_no,date,status,payment_status,courier,awb_number,items,shipping,total')
       .eq('order_no', orderNo)
       .maybeSingle();
 
@@ -1209,7 +1209,7 @@ router.get('/track-order/:orderNo', async (req, res) => {
         status_icon:    st.icon,
         payment_status: wsData.payment_status,
         courier:        wsData.courier || null,
-        tracking_no:    wsData.tracking_no || null,
+        tracking_no:    wsData.awb_number || null,
         item_count:     Array.isArray(wsData.items) ? wsData.items.length : 0,
         total:          wsData.total,
         shipping:       wsData.shipping,
