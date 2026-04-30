@@ -757,6 +757,167 @@ router.post('/reconcile', auth, roleGuard, upload.single('statement'), async (re
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/ca-agent/cashflow
+// Intelligent cash flow forecast:
+//   • Current bank balance (live)
+//   • Salary this month (auto-calculated from attendance × daily_rate)
+//   • Recurring monthly commitments
+//   • Average monthly operating expenses (last 3 months)
+//   • Vendor bills due in next 30 days
+//   • Net position + status verdict
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/cashflow', auth, roleGuard, async (req, res) => {
+  try {
+    const today     = new Date();
+    const r2        = n => Math.round((parseFloat(n) || 0) * 100) / 100;
+    const todayStr  = today.toISOString().slice(0, 10);
+
+    // IST-aware current month
+    const istNow    = new Date(today.getTime() + 5.5 * 3600000);
+    const yr        = istNow.getUTCFullYear();
+    const mo        = istNow.getUTCMonth(); // 0-based
+    const monthStr  = `${yr}-${String(mo + 1).padStart(2, '0')}`;
+    const monthStart= `${monthStr}-01`;
+    const monthEnd  = new Date(yr, mo + 1, 0).toISOString().slice(0, 10);
+    const next30    = new Date(today.getTime() + 30 * 86400000).toISOString().slice(0, 10);
+
+    // Last 3 months for average
+    const ago3m     = new Date(yr, mo - 3, 1).toISOString().slice(0, 10);
+
+    const [
+      bankAccs, employees, attendance,
+      expensesThis, expensesPast, recurringExp,
+      billsAll,
+    ] = await Promise.all([
+      supabase.from('bank_accounts').select('id,name,current_balance').eq('is_active', true),
+      supabase.from('employees').select('id,name,role,pay_type,daily_rate,monthly_salary').eq('active', true),
+      supabase.from('attendance').select('employee_id,date,status').gte('date', monthStart).lte('date', monthEnd),
+      supabase.from('company_expenses').select('category,amount,date').gte('date', monthStart).lte('date', monthEnd).is('deleted_at', null),
+      supabase.from('company_expenses').select('category,amount,date').gte('date', ago3m).lt('date', monthStart).is('deleted_at', null),
+      supabase.from('recurring_expenses').select('*'),
+      supabase.from('vendor_bills').select('vendor_name,category,amount,gst_amount,paid_amount,due_date,status').in('status', ['unpaid', 'partial', 'overdue']),
+    ]);
+
+    // ── 1. Bank balance ──────────────────────────────────────────────────────
+    const bankBalance = r2((bankAccs.data || []).reduce((s, a) => s + (a.current_balance || 0), 0));
+    const bankAccList = (bankAccs.data || []).map(a => ({ name: a.name, balance: r2(a.current_balance || 0) }));
+
+    // ── 2. Salary this month (from attendance) ───────────────────────────────
+    const workDays = {};
+    for (const a of (attendance.data || [])) {
+      if (a.status === 'present')  workDays[a.employee_id] = (workDays[a.employee_id] || 0) + 1;
+      if (a.status === 'half-day') workDays[a.employee_id] = (workDays[a.employee_id] || 0) + 0.5;
+    }
+    const salaryBreakdown = (employees.data || []).map(e => {
+      const days   = workDays[e.id] || 0;
+      const earned = e.pay_type === 'daily' ? r2(days * (e.daily_rate || 0)) : r2(e.monthly_salary || 0);
+      return { id: e.id, name: e.name, role: e.role, pay_type: e.pay_type, days_worked: days, rate: e.pay_type === 'daily' ? e.daily_rate : e.monthly_salary, earned };
+    });
+    const totalSalary = r2(salaryBreakdown.reduce((s, e) => s + e.earned, 0));
+
+    // ── 3. Recurring monthly commitments ────────────────────────────────────
+    const recurringTotal = r2((recurringExp.data || []).reduce((s, r) => s + (r.amount || 0), 0));
+    const recurringList  = (recurringExp.data || []).map(r => ({ name: r.name || r.description, amount: r2(r.amount), frequency: r.frequency || 'monthly' }));
+
+    // ── 4. Average monthly operating expenses (last 3 months) ───────────────
+    const pastByMonth = {};
+    for (const e of (expensesPast.data || [])) {
+      const m = e.date?.slice(0, 7);
+      pastByMonth[m] = (pastByMonth[m] || 0) + parseFloat(e.amount || 0);
+    }
+    const pastMonths  = Object.values(pastByMonth);
+    const avgMonthlyExp = pastMonths.length > 0 ? r2(pastMonths.reduce((s, v) => s + v, 0) / pastMonths.length) : 0;
+    const thisMonthExp  = r2((expensesThis.data || []).reduce((s, e) => s + parseFloat(e.amount || 0), 0));
+
+    // Category breakdown for this month
+    const expByCat = {};
+    for (const e of (expensesThis.data || [])) {
+      expByCat[e.category] = r2((expByCat[e.category] || 0) + parseFloat(e.amount || 0));
+    }
+
+    // ── 5. Vendor bills due in next 30 days ──────────────────────────────────
+    const billsDue30 = (billsAll.data || []).filter(b => b.due_date && b.due_date <= next30);
+    const billsOverdue = (billsAll.data || []).filter(b => b.due_date && b.due_date < todayStr);
+    const billsDueAmt  = r2(billsDue30.reduce((s, b) => s + Math.max(0, r2((b.amount || 0) + (b.gst_amount || 0) - (b.paid_amount || 0))), 0));
+    const billsOverdueAmt = r2(billsOverdue.reduce((s, b) => s + Math.max(0, r2((b.amount || 0) + (b.gst_amount || 0) - (b.paid_amount || 0))), 0));
+
+    // ── 6. Total projected outflows ──────────────────────────────────────────
+    // Remaining operating expenses this month (avg - already spent)
+    const remainingOpEx = r2(Math.max(0, avgMonthlyExp - thisMonthExp));
+
+    const totalOutflow = r2(totalSalary + recurringTotal + remainingOpEx + billsDueAmt);
+
+    // ── 7. Net position & status ─────────────────────────────────────────────
+    const netPosition  = r2(bankBalance - totalOutflow);
+    const salaryGap    = r2(bankBalance - totalSalary); // just salary vs bank
+    let status, statusDetail;
+    if (netPosition >= 50000) {
+      status = 'healthy';
+      statusDetail = `You have ₹${netPosition.toLocaleString('en-IN')} surplus after all upcoming obligations.`;
+    } else if (netPosition >= 0) {
+      status = 'tight';
+      statusDetail = `Only ₹${netPosition.toLocaleString('en-IN')} left after all obligations — keep close watch.`;
+    } else {
+      status = 'shortage';
+      statusDetail = `Cash short by ₹${Math.abs(netPosition).toLocaleString('en-IN')} to meet all obligations.`;
+    }
+
+    // Salary-specific alert
+    const salaryStatus = salaryGap >= 0 ? 'ok' : 'shortage';
+    const salaryAlert  = salaryGap < 0
+      ? `⚠️ Bank balance (₹${bankBalance.toLocaleString('en-IN')}) is less than salary due (₹${totalSalary.toLocaleString('en-IN')}). Short by ₹${Math.abs(salaryGap).toLocaleString('en-IN')}.`
+      : null;
+
+    res.json({
+      as_of: todayStr,
+      month: monthStr,
+      bank: { balance: bankBalance, accounts: bankAccList },
+      salary: {
+        total: totalSalary,
+        status: salaryStatus,
+        alert: salaryAlert,
+        breakdown: salaryBreakdown,
+        period: `${monthStart} to ${todayStr}`,
+      },
+      recurring: { total: recurringTotal, items: recurringList },
+      operating_expenses: {
+        this_month_spent: thisMonthExp,
+        avg_monthly_3m: avgMonthlyExp,
+        remaining_estimate: remainingOpEx,
+        by_category: expByCat,
+      },
+      bills: {
+        due_next_30_days: billsDueAmt,
+        overdue: billsOverdueAmt,
+        count: billsDue30.length,
+        list: billsDue30.map(b => ({
+          vendor: b.vendor_name,
+          category: b.category,
+          outstanding: r2((b.amount || 0) + (b.gst_amount || 0) - (b.paid_amount || 0)),
+          due_date: b.due_date,
+          status: b.status,
+        })).sort((a, b) => a.due_date?.localeCompare(b.due_date)),
+      },
+      forecast: {
+        total_outflow: totalOutflow,
+        net_position: netPosition,
+        status,
+        status_detail: statusDetail,
+        breakdown: {
+          salary:    totalSalary,
+          recurring: recurringTotal,
+          operating: remainingOpEx,
+          bills:     billsDueAmt,
+        },
+      },
+    });
+  } catch (e) {
+    console.error('[Cashflow]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/ca-agent/run — trigger a manual run via monitor-api on the host
 // (backend runs in Docker; ca-agent.js needs host node + node_modules)
 router.post('/run', auth, roleGuard, async (req, res) => {
