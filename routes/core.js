@@ -659,7 +659,7 @@ procurement.put('/:id', auth, requireRole('admin','manager'), async (req, res) =
   const p = req.body;
 
   // Fetch existing record to detect status change → received
-  const { data: existing } = await supabase.from('procurements').select('status,payable_id').eq('id', req.params.id).single();
+  const { data: existing } = await supabase.from('procurements').select('status,payable_id').eq('id', req.params.id).single().catch(()=>({data:null}));
 
   const { data, error } = await supabase.from('procurements').update({
     date:p.date, commodity_id:p.commodityId||null, commodity_name:p.commodityName, supplier:p.supplier, vendor_id:p.vendorId||null,
@@ -674,8 +674,10 @@ procurement.put('/:id', auth, requireRole('admin','manager'), async (req, res) =
   }).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: error.message });
 
-  // Auto-create vendor payable when status first changes to 'received'
-  if (p.status === 'received' && existing?.status !== 'received' && !existing?.payable_id) {
+  // Auto-create vendor payable when status first changes to 'received' (goods arrived at factory)
+  // Only if not already paid upfront (advance/paid) — those already have a vendor bill from POST
+  const alreadyPaidUpfront = ['advance','paid'].includes(p.paymentStatus||existing?.payment_status);
+  if (p.status === 'received' && !['received','cleaned','stocked'].includes(existing?.status) && !existing?.payable_id && !alreadyPaidUpfront) {
     setImmediate(async () => {
       try {
         const qty    = parseFloat(p.receivedQty || p.orderedQty) || 0;
