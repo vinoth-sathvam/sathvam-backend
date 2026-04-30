@@ -430,4 +430,83 @@ router.get('/work-log/report', auth, async (req, res) => {
   res.json({ year, month, days_in_month: daysInMonth, employees: rows });
 });
 
+// ── GET salary payments for a month ───────────────────────────────────────────
+router.get('/salary-payments', auth, async (req, res) => {
+  const { month } = req.query; // YYYY-MM
+  let q = supabase.from('salary_payments').select('*').order('employee_name');
+  if (month) q = q.eq('month', month);
+  const { data, error } = await q;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
+// ── POST record a single salary payment ────────────────────────────────────────
+router.post('/salary-payments', auth, requireRole('admin', 'manager'), async (req, res) => {
+  const { employee_id, employee_name, month, amount, payment_mode, payment_date, reference_no, notes } = req.body;
+  if (!employee_id || !month || !amount) return res.status(400).json({ error: 'employee_id, month, amount required' });
+  const { data, error } = await supabase.from('salary_payments').upsert({
+    employee_id: parseInt(employee_id),
+    employee_name: employee_name || '',
+    month,
+    amount: parseFloat(amount),
+    payment_mode: payment_mode || 'cash',
+    payment_date: payment_date || new Date().toISOString().slice(0, 10),
+    reference_no: reference_no || '',
+    notes: notes || '',
+    paid_by: req.user?.name || '',
+  }, { onConflict: 'employee_id,month' }).select().single();
+  if (error) return res.status(400).json({ error: error.message });
+  res.status(201).json(data);
+});
+
+// ── DELETE undo a salary payment ───────────────────────────────────────────────
+router.delete('/salary-payments/:id', auth, requireRole('admin'), async (req, res) => {
+  await supabase.from('salary_payments').delete().eq('id', req.params.id);
+  res.json({ ok: true });
+});
+
+// ── POST create a bulk pay run (all employees at once) ────────────────────────
+router.post('/pay-run', auth, requireRole('admin', 'manager'), async (req, res) => {
+  const { month, employees, payment_mode, payment_date, reference_no, notes } = req.body;
+  // employees: [{ employee_id, employee_name, amount }]
+  if (!month || !Array.isArray(employees) || employees.length === 0)
+    return res.status(400).json({ error: 'month and employees[] required' });
+
+  const pDate = payment_date || new Date().toISOString().slice(0, 10);
+  const pMode = payment_mode || 'cash';
+  const paidBy = req.user?.name || '';
+
+  const rows = employees.map(e => ({
+    employee_id:   parseInt(e.employee_id),
+    employee_name: e.employee_name || '',
+    month,
+    amount:        parseFloat(e.amount),
+    payment_mode:  pMode,
+    payment_date:  pDate,
+    reference_no:  reference_no || '',
+    notes:         notes || '',
+    paid_by:       paidBy,
+  }));
+
+  const { data, error } = await supabase.from('salary_payments').upsert(rows, { onConflict: 'employee_id,month' }).select();
+  if (error) return res.status(400).json({ error: error.message });
+
+  // Record the pay run summary
+  const totalAmount = rows.reduce((s, r) => s + r.amount, 0);
+  await supabase.from('pay_runs').upsert({
+    month, total_amount: totalAmount, employee_count: rows.length,
+    payment_mode: pMode, payment_date: pDate,
+    reference_no: reference_no || '', notes: notes || '', created_by: paidBy,
+  }, { onConflict: 'month' });
+
+  res.json({ ok: true, count: data?.length || rows.length, total_amount: totalAmount });
+});
+
+// ── GET pay run history ────────────────────────────────────────────────────────
+router.get('/pay-runs', auth, async (req, res) => {
+  const { data, error } = await supabase.from('pay_runs').select('*').order('month', { ascending: false }).limit(24);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data || []);
+});
+
 module.exports = router;
