@@ -758,6 +758,133 @@ router.post('/reconcile', auth, roleGuard, upload.single('statement'), async (re
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// POST /api/ca-agent/detect-recurring
+// Scans all bank_transactions debits for:
+//   1. Multi-month recurrence (same normalised description in 2+ months)
+//   2. Keyword matching for known categories (EB, Rent, Internet, subscriptions)
+//   3. MIN/ prefix = card-auto-debit (always recurring)
+// Auto-updates recurring_expenses table with detected amounts.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Known keyword → category map (checked against full description)
+const RECUR_KEYWORDS = [
+  { re: /tneb|tangedco|bescom|msedcl|tnpdcl|electricity|tsspdcl|cesc|wbsedcl/i, category:'Utilities',      name:'Electricity Bill (EB)',    due_day:15 },
+  { re: /bsnl|airtel\s*(broadband|fiber|home|wifi)|act\s*fiber|hathway|tikona|tata\s*play\s*fiber|jio\s*fiber|d2h|broadband|internet\s*bill/i, category:'Office & Admin', name:'Internet / Broadband', due_day:5 },
+  { re: /rent|lease\s*rent|godown\s*rent|office\s*rent|shop\s*rent/i,            category:'Rent',           name:'Rent',                     due_day:1  },
+  { re: /sqsp\s*works|squarespace\s*works/i,    category:'Marketing',   name:'Squarespace Website',      due_day:12 },
+  { re: /sqsp\s*dom|squarespace\s*dom/i,        category:'Marketing',   name:'Squarespace Domain',       due_day:19 },
+  { re: /anthropic/i,                           category:'Software',    name:'Anthropic / Claude AI',    due_day:7  },
+  { re: /swiggy|swgy/i,                         category:'Marketing',   name:'Swiggy',                   due_day:12 },
+  { re: /facebook|meta\s*ads|fb\s*ads/i,        category:'Marketing',   name:'Facebook Ads',             due_day:16 },
+  { re: /google\s*ads|googleads/i,              category:'Marketing',   name:'Google Ads',               due_day:1  },
+  { re: /amazon\s*(aws|web)/i,                  category:'Software',    name:'AWS / Amazon Cloud',       due_day:1  },
+  { re: /mobile\s*alert|mob\s*alrt|sms\s*alert/i, category:'Office & Admin', name:'Mobile Alert / SMS Charges', due_day:9 },
+  { re: /tata\s*sky|dish\s*tv|videocon\s*d2h/i, category:'Office & Admin', name:'DTH / Cable TV',       due_day:1  },
+];
+
+// Normalise a description into a grouping key
+function normaliseDesc(desc) {
+  return (desc || '')
+    .replace(/\d{8,}/g, '#')          // remove long reference numbers
+    .replace(/\d{2}\/\d{2}\/\d{4}/g, '') // remove dates
+    .replace(/[~_]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+    .slice(0, 35);
+}
+
+router.post('/detect-recurring', auth, roleGuard, async (req, res) => {
+  try {
+    const r2 = n => Math.round((parseFloat(n) || 0) * 100) / 100;
+
+    // Fetch all debit transactions (last 12 months max)
+    const since = new Date(Date.now() - 365 * 86400000).toISOString().slice(0, 10);
+    const { data: txns, error: txErr } = await supabase
+      .from('bank_transactions')
+      .select('date,amount,description,reference')
+      .eq('type', 'debit')
+      .gte('date', since)
+      .order('date');
+
+    if (txErr) return res.status(500).json({ error: txErr.message });
+
+    const detected = []; // { name, category, due_day, amounts[], months[], avg, source }
+
+    // ── Step 1: Keyword matching ─────────────────────────────────────────────
+    for (const kw of RECUR_KEYWORDS) {
+      const matches = (txns || []).filter(t => kw.re.test(t.description || ''));
+      if (matches.length === 0) continue;
+      const months  = [...new Set(matches.map(t => t.date?.slice(0, 7)))];
+      const amounts = matches.map(t => parseFloat(t.amount));
+      const avg     = r2(amounts.reduce((s, a) => s + a, 0) / amounts.length);
+      detected.push({ name: kw.name, category: kw.category, due_day: kw.due_day, avg, months, txn_count: matches.length, source: 'keyword', sample_desc: matches[0].description?.slice(0, 60) });
+    }
+
+    // ── Step 2: MIN/ prefix = card auto-debit (always recurring) ────────────
+    // Group by normalised description
+    const minTxns = (txns || []).filter(t => /^(MIN|MSI)\//.test(t.description || ''));
+    const minGroups = {};
+    for (const t of minTxns) {
+      const key = normaliseDesc(t.description);
+      if (!minGroups[key]) minGroups[key] = [];
+      minGroups[key].push(t);
+    }
+    for (const [key, group] of Object.entries(minGroups)) {
+      // Skip if already picked up by keyword
+      if (detected.some(d => group.some(g => d.sample_desc?.includes(g.description?.slice(0, 20))))) continue;
+      const months  = [...new Set(group.map(t => t.date?.slice(0, 7)))];
+      const amounts = group.map(t => parseFloat(t.amount));
+      const avg     = r2(amounts.reduce((s, a) => s + a, 0) / amounts.length);
+      const vendor  = (group[0].description || '').replace(/^(MIN|MSI)\//, '').split('/')[0].trim().slice(0, 30);
+      detected.push({ name: vendor || key, category: 'Subscription', due_day: parseInt(group[0].date?.slice(8)) || 1, avg, months, txn_count: group.length, source: 'auto-debit', sample_desc: group[0].description?.slice(0, 60) });
+    }
+
+    // ── Step 3: Multi-month recurrence (same normalised desc in 2+ months) ──
+    const allGroups = {};
+    for (const t of (txns || [])) {
+      const key = normaliseDesc(t.description);
+      if (!allGroups[key]) allGroups[key] = [];
+      allGroups[key].push(t);
+    }
+    for (const [key, group] of Object.entries(allGroups)) {
+      const months = [...new Set(group.map(t => t.date?.slice(0, 7)))];
+      if (months.length < 2) continue; // must appear in 2+ months
+      // Skip if already detected
+      if (detected.some(d => d.sample_desc && d.sample_desc.toLowerCase().includes(key.slice(0, 15)))) continue;
+      const amounts = group.map(t => parseFloat(t.amount));
+      const avg     = r2(amounts.reduce((s, a) => s + a, 0) / amounts.length);
+      detected.push({ name: key.slice(0, 40), category: 'Recurring', due_day: 1, avg, months, txn_count: group.length, source: 'multi-month', sample_desc: group[0].description?.slice(0, 60) });
+    }
+
+    // ── Step 4: Auto-upsert into recurring_expenses table ───────────────────
+    const { data: existing } = await supabase.from('recurring_expenses').select('id,name,amount');
+    const existingMap = Object.fromEntries((existing || []).map(r => [r.name.toLowerCase(), r]));
+
+    let updated = 0, inserted = 0;
+    for (const d of detected) {
+      if (d.avg <= 0) continue;
+      const ex = existingMap[d.name.toLowerCase()];
+      if (ex) {
+        // Update amount if it was 0 or if it changed by >5%
+        if (ex.amount === 0 || Math.abs(ex.amount - d.avg) / Math.max(ex.amount, 1) > 0.05) {
+          await supabase.from('recurring_expenses').update({ amount: d.avg, updated_at: new Date().toISOString() }).eq('id', ex.id);
+          updated++;
+        }
+      } else {
+        await supabase.from('recurring_expenses').insert({ name: d.name, category: d.category, amount: d.avg, frequency: 'monthly', due_day: d.due_day, vendor: '', notes: `Auto-detected from bank transactions (${d.source})`, active: true, updated_at: new Date().toISOString() });
+        inserted++;
+      }
+    }
+
+    res.json({ detected, total_detected: detected.length, auto_updated: updated, auto_inserted: inserted, monthly_total: r2(detected.reduce((s, d) => s + d.avg, 0)) });
+  } catch (e) {
+    console.error('[detect-recurring]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET /api/ca-agent/cashflow
 // Intelligent cash flow forecast:
 //   • Current bank balance (live)
@@ -785,6 +912,46 @@ router.get('/cashflow', auth, roleGuard, async (req, res) => {
     // Last 3 months for average
     const ago3m     = new Date(yr, mo - 3, 1).toISOString().slice(0, 10);
 
+    // ── 0. Auto-detect recurring from bank transactions (runs silently) ──────
+    try {
+      const since = new Date(Date.now() - 365 * 86400000).toISOString().slice(0, 10);
+      const { data: txns } = await supabase.from('bank_transactions').select('date,amount,description').eq('type','debit').gte('date', since).order('date');
+      const { data: existingRec } = await supabase.from('recurring_expenses').select('id,name,amount');
+      const existingMap = Object.fromEntries((existingRec || []).map(r => [r.name.toLowerCase(), r]));
+
+      for (const kw of RECUR_KEYWORDS) {
+        const matches = (txns || []).filter(t => kw.re.test(t.description || ''));
+        if (matches.length === 0) continue;
+        const avg = Math.round(matches.reduce((s, t) => s + parseFloat(t.amount), 0) / matches.length * 100) / 100;
+        if (avg <= 0) continue;
+        const ex = existingMap[kw.name.toLowerCase()];
+        if (ex) {
+          if (ex.amount === 0 || Math.abs(ex.amount - avg) / Math.max(ex.amount, 1) > 0.05)
+            await supabase.from('recurring_expenses').update({ amount: avg, updated_at: new Date().toISOString() }).eq('id', ex.id);
+        } else {
+          await supabase.from('recurring_expenses').insert({ name: kw.name, category: kw.category, amount: avg, frequency: 'monthly', due_day: kw.due_day, vendor: '', notes: 'Auto-detected from bank transactions', active: true, updated_at: new Date().toISOString() });
+        }
+      }
+
+      // MIN/ auto-debits not already in recurring
+      const minTxns = (txns || []).filter(t => /^(MIN|MSI)\//.test(t.description || ''));
+      const minGroups = {};
+      for (const t of minTxns) {
+        const key = normaliseDesc(t.description);
+        if (!minGroups[key]) minGroups[key] = [];
+        minGroups[key].push(t);
+      }
+      for (const [, group] of Object.entries(minGroups)) {
+        const vendor = (group[0].description || '').replace(/^(MIN|MSI)\//, '').split('/')[0].trim().slice(0, 30);
+        if (!vendor) continue;
+        if (existingMap[vendor.toLowerCase()]) continue; // already tracked
+        // Only add if it's a known-type MIN charge (skip random UPI auto-debits)
+        if (!RECUR_KEYWORDS.some(kw => kw.re.test(group[0].description || ''))) continue;
+        const avg = Math.round(group.reduce((s, t) => s + parseFloat(t.amount), 0) / group.length * 100) / 100;
+        if (avg > 0) await supabase.from('recurring_expenses').insert({ name: vendor, category: 'Subscription', amount: avg, frequency: 'monthly', due_day: parseInt(group[0].date?.slice(8)) || 1, notes: 'Auto-detected MIN/ auto-debit', active: true, updated_at: new Date().toISOString() });
+      }
+    } catch (_) { /* silent — don't break cashflow if detection fails */ }
+
     const [
       bankAccs, employees, attendance,
       expensesThis, expensesPast, recurringExp,
@@ -795,7 +962,7 @@ router.get('/cashflow', auth, roleGuard, async (req, res) => {
       supabase.from('attendance').select('employee_id,date,status').gte('date', monthStart).lte('date', monthEnd),
       supabase.from('company_expenses').select('category,amount,date').gte('date', monthStart).lte('date', monthEnd).is('deleted_at', null),
       supabase.from('company_expenses').select('category,amount,date').gte('date', ago3m).lt('date', monthStart).is('deleted_at', null),
-      supabase.from('recurring_expenses').select('*'),
+      supabase.from('recurring_expenses').select('*').eq('active', true),
       supabase.from('vendor_bills').select('vendor_name,category,amount,gst_amount,paid_amount,due_date,status').in('status', ['unpaid', 'partial', 'overdue']),
     ]);
 
