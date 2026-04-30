@@ -42,6 +42,8 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
       items, gst_pct, notes, bill_no,
       // Direct purchase fields
       direct_purchase, payment_method, payment_ref, bank_account_id,
+      // Advance payment fields
+      advance_payment, advance_amount, advance_method, advance_ref,
     } = req.body;
     if (!vendor_name || !date) return res.status(400).json({ error: 'vendor_name and date required' });
     if (!items || !items.length) return res.status(400).json({ error: 'at least one item required' });
@@ -98,9 +100,9 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
       date,
       expected_delivery: expected_delivery || null,
       status:       'pending',
-      payment_status: direct_purchase ? 'paid' : 'unpaid',
-      payment_method: payment_method || null,
-      payment_ref:  payment_ref || null,
+      payment_status: direct_purchase ? 'paid' : (advance_payment ? 'advance' : 'unpaid'),
+      payment_method: payment_method || advance_method || null,
+      payment_ref:  payment_ref || advance_ref || null,
       items:        mappedItems,
       subtotal, gst_pct: gstPct, gst_amt: gstAmt, total,
       notes:        notes || '',
@@ -133,6 +135,32 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
           }).eq('id', bank_account_id);
         }
       }
+    }
+
+    // ── Advance payment: create partial vendor bill ────────────────────────────
+    if (!direct_purchase && advance_payment && advance_amount > 0 && data) {
+      setImmediate(async () => {
+        try {
+          const advAmt  = round2(parseFloat(advance_amount)||0);
+          const gstAmt2 = round2(total * (parseFloat(gst_pct)||0) / 100);
+          const { data: payable } = await supabase.from('vendor_bills').insert({
+            vendor_name: vendor_name,
+            bill_no: bill_no || data.po_number,
+            bill_date: date,
+            due_date: date,
+            amount: round2(subtotal),
+            gst_amount: gstAmt2,
+            paid_amount: advAmt,
+            status: 'partial',
+            category: 'Packing Materials',
+            notes: `Advance paid for PO ${data.po_number} | Mode: ${advance_method||'—'}${advance_ref?' | Ref: '+advance_ref:''}`,
+            created_by: req.user?.email || 'system',
+          }).select('id').single();
+          if (payable) {
+            await supabase.from('packing_procurement').update({ payable_id: payable.id }).eq('id', data.id);
+          }
+        } catch(e) { console.error('[AUTO] Packing advance bill error:', e.message); }
+      });
     }
 
     res.status(201).json(data);

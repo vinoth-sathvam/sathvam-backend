@@ -599,6 +599,7 @@ procurement.get('/', auth, async (req, res) => {
 });
 procurement.post('/', auth, requireRole('admin','manager'), async (req, res) => {
   const p = req.body;
+  const payStatus = p.paymentStatus || 'unpaid';
   const { data, error } = await supabase.from('procurements').insert({
     date:p.date, commodity_id:p.commodityId, commodity_name:p.commodityName,
     supplier:p.supplier, vendor_id:p.vendorId||null,
@@ -606,9 +607,52 @@ procurement.post('/', auth, requireRole('admin','manager'), async (req, res) => 
     gst:parseFloat(p.gst)||0,
     received_qty:p.receivedQty||null, cleaned_qty:p.cleanedQty||null,
     status:p.status||'ordered', notes:p.notes||'',
-    purchase_order_id:p.purchase_order_id||null, invoice_no:p.invoice_no||null
+    purchase_order_id:p.purchase_order_id||null, invoice_no:p.invoice_no||null,
+    payment_status: payStatus,
+    payment_method: p.paymentMethod||null,
+    payment_ref:    p.paymentRef||null,
+    advance_paid:   parseFloat(p.advancePaid)||null,
+    final_paid:     parseFloat(p.finalPaid)||null,
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
+
+  // If paid upfront (advance or fully), auto-create vendor bill linked to this PO
+  if (['advance','paid'].includes(payStatus) && data) {
+    setImmediate(async () => {
+      try {
+        const qty    = parseFloat(p.orderedQty) || 0;
+        const rate   = parseFloat(p.orderedPricePerKg) || 0;
+        const amount = Math.round(qty * rate * 100) / 100;
+        const gstPct = parseFloat(p.gst) || 0;
+        const gstAmt = Math.round(amount * gstPct / 100 * 100) / 100;
+        if (amount <= 0) return;
+
+        const advPaid    = parseFloat(p.advancePaid) || 0;
+        const isFullPaid = payStatus === 'paid';
+        const paidAmt    = isFullPaid ? (amount + gstAmt) : advPaid;
+
+        const { data: payable } = await supabase.from('vendor_bills').insert({
+          vendor_name:  p.supplier || 'Unknown Vendor',
+          bill_no:      p.invoice_no || `PROC-${data.id}`,
+          bill_date:    p.date || new Date().toISOString().slice(0,10),
+          due_date:     p.date || new Date().toISOString().slice(0,10),
+          amount,
+          gst_amount:   gstAmt,
+          paid_amount:  paidAmt,
+          status:       isFullPaid ? 'paid' : 'partial',
+          category:     'Raw Materials',
+          notes:        `${isFullPaid?'Paid immediately (upfront)':'Advance paid'}: ${p.commodityName} ${qty}kg @ ₹${rate}/kg${p.paymentRef?' | Ref: '+p.paymentRef:''}`,
+          created_by:   req.user?.email || 'system',
+        }).select('id').single();
+
+        if (payable) {
+          await supabase.from('procurements').update({ payable_id: payable.id }).eq('id', data.id);
+          console.log(`[AUTO] Vendor bill created (upfront payment) for procurement ${data.id}: ₹${amount}, paid ₹${paidAmt}`);
+        }
+      } catch(e) { console.error('[AUTO] Procurement upfront bill error:', e.message); }
+    });
+  }
+
   res.status(201).json(data);
 });
 procurement.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
