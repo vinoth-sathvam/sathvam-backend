@@ -30,6 +30,7 @@
     "node-cron": "^4.2.1",
     "node-gtts": "^2.0.2",
     "nodemailer": "^8.0.4",
+    "pdf-parse": "2.4.5",
     "pdfkit": "^0.18.0",
     "pg": "^8.20.0",
     "qrcode": "^1.5.4",

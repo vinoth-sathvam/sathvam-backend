@@ -1,35 +1,72 @@
 const express  = require('express');
 const router   = express.Router();
 const multer   = require('multer');
+const cheerio  = require('cheerio');
+const pdfParse = require('pdf-parse');
 const { auth } = require('../middleware/auth');
 const supabase  = require('../config/supabase');
 
-// multer — memory storage, max 5MB, CSV/XLS only
+// multer — memory storage, max 10MB, CSV / HTML / PDF
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 },
+  limits: { fileSize: 10 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
-    const ok = /\.(csv|xls|xlsx|txt)$/i.test(file.originalname) || file.mimetype.includes('csv') || file.mimetype.includes('spreadsheet') || file.mimetype.includes('text');
-    cb(ok ? null : new Error('Only CSV/XLS files accepted'), ok);
+    const name = file.originalname.toLowerCase();
+    const ok = /\.(csv|xls|xlsx|txt|html|htm|pdf)$/.test(name)
+      || file.mimetype.includes('csv')
+      || file.mimetype.includes('spreadsheet')
+      || file.mimetype.includes('text')
+      || file.mimetype === 'application/pdf'
+      || file.mimetype.includes('html');
+    cb(ok ? null : new Error('Only CSV, HTML or PDF files accepted'), ok);
   },
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Parse ICICI bank statement CSV
-// Handles formats:
-//   • Plain CSV (header row: Transaction Date, Value Date, Description, ...)
-//   • ICICI export with metadata header rows before the column header
+// Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
-function parseIciciCsv(text) {
-  // Normalise line endings
+function toNum(s) {
+  if (!s) return 0;
+  return parseFloat(String(s).replace(/,/g, '').replace(/[^\d.-]/g, '')) || 0;
+}
+
+// Accepts: DD/MM/YYYY, DD-MM-YYYY, YYYY-MM-DD, DD Mon YYYY, DD/MM/YY
+function parseDate(s) {
+  if (!s) return null;
+  s = String(s).trim();
+
+  // YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  // DD/MM/YYYY or DD-MM-YYYY
+  const slashDash = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  if (slashDash) {
+    let [, d, m, y] = slashDash;
+    if (y.length === 2) y = '20' + y;
+    return `${y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`;
+  }
+
+  // DD Mon YYYY  (e.g.  01 Apr 2026)
+  const MONTHS = {jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+  const longDate = s.match(/^(\d{1,2})\s+([A-Za-z]{3,})\s+(\d{4})$/);
+  if (longDate) {
+    const [, d, mon, y] = longDate;
+    const m = MONTHS[mon.toLowerCase().slice(0,3)];
+    if (m) return `${y}-${m}-${d.padStart(2,'0')}`;
+  }
+
+  return null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CSV parser  (handles ICICI / SBI / HDFC exports with optional metadata rows)
+// ─────────────────────────────────────────────────────────────────────────────
+function parseCsv(text) {
   const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
 
-  // Simple CSV line splitter that respects quoted fields
-  function splitCsvLine(line) {
-    const result = [];
-    let cur = '', inQ = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
+  function splitLine(line) {
+    const result = []; let cur = '', inQ = false;
+    for (const ch of line) {
       if (ch === '"') { inQ = !inQ; }
       else if (ch === ',' && !inQ) { result.push(cur.trim()); cur = ''; }
       else { cur += ch; }
@@ -38,109 +75,253 @@ function parseIciciCsv(text) {
     return result.map(v => v.replace(/^"|"$/g, '').trim());
   }
 
-  // Clean number string → float
-  function toNum(s) {
-    if (!s) return 0;
-    return parseFloat(s.replace(/,/g, '').replace(/[^\d.-]/g, '')) || 0;
-  }
+  let openingBalance = null, closingBalance = null, headerIdx = -1;
 
-  // Parse DD/MM/YYYY → YYYY-MM-DD
-  function parseDate(s) {
-    if (!s) return null;
-    const parts = s.trim().split('/');
-    if (parts.length === 3) {
-      const [d, m, y] = parts;
-      return `${y.length === 2 ? '20' + y : y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`;
-    }
-    // Try YYYY-MM-DD already
-    if (/^\d{4}-\d{2}-\d{2}$/.test(s.trim())) return s.trim();
-    return null;
-  }
-
-  let openingBalance = null, closingBalance = null;
-  let headerIdx = -1;
-
-  // Scan for metadata rows (opening/closing balance) and find the column header row
   for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i];
-    const low = raw.toLowerCase();
+    const raw = lines[i], low = raw.toLowerCase();
     if (low.includes('opening balance') || low.includes('opening bal')) {
-      const cols = splitCsvLine(raw);
+      const cols = splitLine(raw);
       for (const c of cols) { const n = toNum(c); if (n > 0) { openingBalance = n; break; } }
     }
     if (low.includes('closing balance') || low.includes('closing bal')) {
-      const cols = splitCsvLine(raw);
+      const cols = splitLine(raw);
       for (const c of cols) { const n = toNum(c); if (n > 0) { closingBalance = n; break; } }
     }
-    // Detect the transaction header row
     if (low.includes('transaction date') || low.includes('txn date') || low.includes('value date')) {
-      headerIdx = i;
-      break;
+      headerIdx = i; break;
     }
   }
 
-  if (headerIdx === -1) throw new Error('Could not find column header row in CSV. Expected a row with "Transaction Date".');
+  if (headerIdx === -1) throw new Error('CSV: Could not find column header row. Expected a row with "Transaction Date".');
 
-  const headers = splitCsvLine(lines[headerIdx]).map(h => h.toLowerCase().replace(/[^a-z0-9]/g, '_'));
-
-  // Map header names to standard keys
-  function colIdx(candidates) {
-    for (const c of candidates) {
-      const idx = headers.findIndex(h => h.includes(c));
-      if (idx !== -1) return idx;
-    }
+  const headers = splitLine(lines[headerIdx]).map(h => h.toLowerCase().replace(/[^a-z0-9]/g, '_'));
+  function colIdx(...candidates) {
+    for (const c of candidates) { const i = headers.findIndex(h => h.includes(c)); if (i !== -1) return i; }
     return -1;
   }
 
-  const iDate   = colIdx(['transaction_date','txn_date','date']);
-  const iDesc   = colIdx(['description','narration','particulars','remarks']);
-  const iRef    = colIdx(['ref_no','cheque_no','reference','ref','chq']);
-  const iDebit  = colIdx(['debit','dr','withdrawal']);
-  const iCredit = colIdx(['credit','cr','deposit']);
-  const iBalance= colIdx(['balance']);
+  const iDate   = colIdx('transaction_date','txn_date','date');
+  const iDesc   = colIdx('description','narration','particulars','remarks');
+  const iRef    = colIdx('ref_no','cheque_no','reference','ref','chq');
+  const iDebit  = colIdx('debit','dr','withdrawal');
+  const iCredit = colIdx('credit','cr','deposit');
+  const iBal    = colIdx('balance');
 
-  if (iDate === -1) throw new Error('Cannot find Transaction Date column in CSV.');
+  if (iDate === -1) throw new Error('CSV: Cannot find Transaction Date column.');
 
-  const transactions = [];
-  let derivedOpening = null;
-  let derivedClosing = null;
+  const transactions = []; let derivedOpening = null, derivedClosing = null;
 
   for (let i = headerIdx + 1; i < lines.length; i++) {
     const line = lines[i].trim();
-    if (!line || line.replace(/,/g, '').trim() === '') continue;
-
-    const cols = splitCsvLine(line);
-    const dateStr = cols[iDate] || '';
-    const date = parseDate(dateStr);
-    if (!date) continue; // skip non-transaction rows
-
+    if (!line || line.replace(/,/g,'').trim() === '') continue;
+    const cols = splitLine(line);
+    const date = parseDate(cols[iDate]);
+    if (!date) continue;
     const description = (iDesc !== -1 ? cols[iDesc] : '') || '';
     const ref         = (iRef  !== -1 ? cols[iRef]  : '') || '';
-    const debit       = iDebit  !== -1 ? toNum(cols[iDebit])  : 0;
-    const credit      = iCredit !== -1 ? toNum(cols[iCredit]) : 0;
-    const balance     = iBalance !== -1 ? toNum(cols[iBalance]) : null;
+    const debit  = iDebit  !== -1 ? toNum(cols[iDebit])  : 0;
+    const credit = iCredit !== -1 ? toNum(cols[iCredit]) : 0;
+    const bal    = iBal    !== -1 ? toNum(cols[iBal])    : null;
+    if (debit === 0 && credit === 0) continue;
+    const type   = credit > 0 ? 'credit' : 'debit';
+    const amount = credit > 0 ? credit : debit;
+    if (bal !== null) {
+      if (derivedOpening === null) derivedOpening = type === 'credit' ? bal - amount : bal + amount;
+      derivedClosing = bal;
+    }
+    transactions.push({ date, description, reference: ref, type, amount });
+  }
+
+  return { openingBalance: openingBalance ?? derivedOpening, closingBalance: closingBalance ?? derivedClosing, transactions };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTML parser  (ICICI / most banks export as a <table>)
+// ─────────────────────────────────────────────────────────────────────────────
+function parseHtml(html) {
+  const $ = cheerio.load(html);
+  let openingBalance = null, closingBalance = null;
+
+  // Try to find opening / closing balance from any text node
+  $('*').each((_, el) => {
+    const text = $(el).text().toLowerCase();
+    if (text.includes('opening balance') || text.includes('opening bal')) {
+      const nums = $(el).text().match(/[\d,]+\.\d{2}/g);
+      if (nums) openingBalance = toNum(nums[nums.length - 1]);
+    }
+    if (text.includes('closing balance') || text.includes('closing bal')) {
+      const nums = $(el).text().match(/[\d,]+\.\d{2}/g);
+      if (nums) closingBalance = toNum(nums[nums.length - 1]);
+    }
+  });
+
+  const transactions = []; let derivedOpening = null, derivedClosing = null;
+
+  // Find the transaction table: look for a <tr> whose cells contain "date", "debit", "credit"
+  let headerRow = null, table = null;
+  $('table').each((_, tbl) => {
+    $(tbl).find('tr').each((_, row) => {
+      const cells = $(row).find('th,td').map((__, c) => $(c).text().toLowerCase().trim()).get();
+      const hasDate   = cells.some(c => c.includes('date'));
+      const hasAmount = cells.some(c => c.includes('debit') || c.includes('credit') || c.includes('amount') || c.includes('withdrawal') || c.includes('deposit'));
+      if (hasDate && hasAmount) { headerRow = cells; table = tbl; return false; }
+    });
+    if (headerRow) return false;
+  });
+
+  if (!headerRow || !table) throw new Error('HTML: Could not find transaction table. Make sure the file is a bank statement HTML export.');
+
+  function colIdx(...candidates) {
+    for (const c of candidates) { const i = headerRow.findIndex(h => h.includes(c)); if (i !== -1) return i; }
+    return -1;
+  }
+
+  const iDate   = colIdx('transaction date','txn date','date','value date');
+  const iDesc   = colIdx('description','narration','particulars','remarks');
+  const iRef    = colIdx('ref','cheque','reference','chq');
+  const iDebit  = colIdx('debit','dr','withdrawal');
+  const iCredit = colIdx('credit','cr','deposit');
+  const iBal    = colIdx('balance');
+
+  let skipHeader = true;
+  $(table).find('tr').each((_, row) => {
+    if (skipHeader) { skipHeader = false; return; } // skip the header row itself
+    const cells = $(row).find('td').map((__, c) => $(c).text().trim()).get();
+    if (cells.length < 3) return;
+    const date = iDate !== -1 ? parseDate(cells[iDate]) : null;
+    if (!date) return;
+    const description = (iDesc !== -1 ? cells[iDesc] : '') || '';
+    const ref         = (iRef  !== -1 ? cells[iRef]  : '') || '';
+    const debit  = iDebit  !== -1 ? toNum(cells[iDebit])  : 0;
+    const credit = iCredit !== -1 ? toNum(cells[iCredit]) : 0;
+    const bal    = iBal    !== -1 ? toNum(cells[iBal])    : null;
+    if (debit === 0 && credit === 0) return;
+    const type   = credit > 0 ? 'credit' : 'debit';
+    const amount = credit > 0 ? credit : debit;
+    if (bal !== null) {
+      if (derivedOpening === null) derivedOpening = type === 'credit' ? bal - amount : bal + amount;
+      derivedClosing = bal;
+    }
+    transactions.push({ date, description, reference: ref, type, amount });
+  });
+
+  return { openingBalance: openingBalance ?? derivedOpening, closingBalance: closingBalance ?? derivedClosing, transactions };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PDF parser  (extracts text then applies line-based heuristic)
+// ICICI PDF statement layout (per page):
+//   Date        Narration/Description      Ref No   Debit   Credit   Balance
+// Lines are extracted as a flat text blob — we look for lines that start with
+// a date pattern and contain numeric amounts.
+// ─────────────────────────────────────────────────────────────────────────────
+async function parsePdf(buffer) {
+  const data = await pdfParse(buffer, { max: 0 });
+  const raw  = data.text;
+
+  let openingBalance = null, closingBalance = null;
+
+  // Scan for opening / closing balance keywords in the full text
+  const lines = raw.split('\n').map(l => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const low = line.toLowerCase();
+    if (low.includes('opening balance') || low.includes('opening bal')) {
+      const nums = line.match(/[\d,]+\.\d{2}/g);
+      if (nums) openingBalance = toNum(nums[nums.length - 1]);
+    }
+    if (low.includes('closing balance') || low.includes('closing bal')) {
+      const nums = line.match(/[\d,]+\.\d{2}/g);
+      if (nums) closingBalance = toNum(nums[nums.length - 1]);
+    }
+  }
+
+  const transactions = []; let derivedOpening = null, derivedClosing = null;
+
+  // Date pattern at start of a token: DD/MM/YYYY or DD-MM-YYYY or DD/MM/YY
+  const DATE_RE = /^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/;
+
+  // Each transaction line in an ICICI PDF looks like (whitespace-separated tokens):
+  //   01/04/2026  [narration tokens...]  [ref]  [debit]  [credit]  [balance]
+  // or split across two lines. Strategy: look for lines that BEGIN with a date
+  // and contain 2+ numbers after it (debit/credit/balance).
+
+  const NUM_RE = /^[\d,]+\.\d{2}$/;
+
+  // Combine all lines into tokens grouped by lines
+  for (let i = 0; i < lines.length; i++) {
+    const tokens = lines[i].split(/\s+/);
+    if (!DATE_RE.test(tokens[0])) continue;
+
+    const date = parseDate(tokens[0]);
+    if (!date) continue;
+
+    // Collect the rest of this line plus possibly the next line(s)
+    // until we find at least 2 numbers
+    let combined = tokens.slice(1);
+    let j = i + 1;
+    while (combined.filter(t => NUM_RE.test(t)).length < 2 && j < lines.length && j < i + 4) {
+      const nextTokens = lines[j].split(/\s+/);
+      if (DATE_RE.test(nextTokens[0])) break; // next transaction
+      combined = combined.concat(nextTokens);
+      j++;
+    }
+
+    // Extract all numbers from combined
+    const nums = combined.filter(t => NUM_RE.test(t)).map(toNum);
+    if (nums.length < 2) continue;
+
+    // Balance = last number, then work backwards for debit/credit
+    const bal    = nums[nums.length - 1];
+    // Second-to-last is either debit or credit
+    // Third-to-last (if exists) is the other (sometimes only one of debit/credit is non-zero)
+    let debit = 0, credit = 0;
+    if (nums.length >= 3) {
+      debit  = nums[nums.length - 3];
+      credit = nums[nums.length - 2];
+    } else {
+      // Only one amount before balance — determine dr/cr from balance change
+      debit  = nums[0];
+      credit = 0;
+    }
+
+    // Description = all non-number tokens before the numbers
+    const descTokens = [];
+    for (const tok of combined) {
+      if (NUM_RE.test(tok)) break;
+      descTokens.push(tok);
+    }
+    const description = descTokens.join(' ').trim();
+
+    // Reference: look for token matching ICICI ref pattern (S + 8+ digits) or similar
+    const refToken = combined.find(t => /^[A-Z]\d{6,}$/.test(t) || /^[A-Z]{2,}\d{6,}$/.test(t));
+    const ref = refToken || '';
 
     if (debit === 0 && credit === 0) continue;
 
     const type   = credit > 0 ? 'credit' : 'debit';
     const amount = credit > 0 ? credit : debit;
 
-    if (balance !== null) {
-      if (derivedOpening === null) {
-        // First row: derive opening from balance - net
-        derivedOpening = type === 'credit' ? balance - amount : balance + amount;
-      }
-      derivedClosing = balance;
-    }
+    if (derivedOpening === null) derivedOpening = type === 'credit' ? bal - amount : bal + amount;
+    derivedClosing = bal;
 
     transactions.push({ date, description, reference: ref, type, amount });
+    i = j - 1; // skip lines we consumed
   }
 
-  return {
-    openingBalance: openingBalance ?? derivedOpening,
-    closingBalance: closingBalance ?? derivedClosing,
-    transactions,
-  };
+  return { openingBalance: openingBalance ?? derivedOpening, closingBalance: closingBalance ?? derivedClosing, transactions };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Master parser — routes to CSV / HTML / PDF based on file extension + content
+// ─────────────────────────────────────────────────────────────────────────────
+async function parseBankStatement(buffer, originalname, mimetype) {
+  const name = (originalname || '').toLowerCase();
+  const isPdf  = name.endsWith('.pdf') || mimetype === 'application/pdf';
+  const isHtml = name.endsWith('.html') || name.endsWith('.htm') || mimetype.includes('html');
+
+  if (isPdf)  return await parsePdf(buffer);
+  if (isHtml) return parseHtml(buffer.toString('utf-8'));
+  return parseCsv(buffer.toString('utf-8'));         // CSV / XLS / TXT
 }
 
 // monitor-api runs on the host — backend is in Docker, cannot exec scripts directly
@@ -451,13 +632,12 @@ router.post('/reconcile', auth, roleGuard, upload.single('statement'), async (re
     const bankAccountId  = parseInt(req.query.bank_account_id || req.body.bank_account_id || 1);
     const importMissing  = (req.query.import_missing || req.body.import_missing) === 'true';
 
-    // Parse the uploaded CSV
-    const csvText = req.file.buffer.toString('utf-8');
+    // Parse the uploaded file (CSV / HTML / PDF)
     let parsed;
     try {
-      parsed = parseIciciCsv(csvText);
+      parsed = await parseBankStatement(req.file.buffer, req.file.originalname, req.file.mimetype || '');
     } catch (parseErr) {
-      return res.status(422).json({ error: `CSV parse error: ${parseErr.message}` });
+      return res.status(422).json({ error: `Parse error: ${parseErr.message}` });
     }
 
     const { openingBalance, closingBalance, transactions: bankTxns } = parsed;
