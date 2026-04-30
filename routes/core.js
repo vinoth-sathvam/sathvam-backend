@@ -607,7 +607,7 @@ procurement.get('/commodity-costs', auth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('procurements')
-      .select('commodity_id, commodity_name, ordered_price_per_kg, logistics_cost_per_kg, date, supplier, status')
+      .select('commodity_id, commodity_name, ordered_price_per_kg, logistics_cost_per_kg, gst, date, supplier, status')
       .in('status', ['stocked', 'cleaned', 'received'])
       .not('commodity_id', 'is', null)
       .order('date', { ascending: false });
@@ -617,11 +617,18 @@ procurement.get('/commodity-costs', auth, async (req, res) => {
     const costMap = {};
     (data || []).forEach(p => {
       if (!costMap[p.commodity_id]) {
+        const baseAndLogistics = parseFloat(p.ordered_price_per_kg) || 0;
+        const gstPct           = parseFloat(p.gst) || 0;
+        const logisticsCostPerKg = parseFloat(p.logistics_cost_per_kg) || 0;
+        // Full landed cost = (base + logistics) × (1 + GST%)
+        const costPerKg = Math.round(baseAndLogistics * (1 + gstPct / 100) * 100) / 100;
         costMap[p.commodity_id] = {
           commodityId: p.commodity_id,
           commodityName: p.commodity_name,
-          costPerKg: parseFloat(p.ordered_price_per_kg) || 0,
-          logisticsCostPerKg: parseFloat(p.logistics_cost_per_kg) || 0,
+          costPerKg,                        // full landed cost incl. GST + logistics
+          basePerKg: Math.round((baseAndLogistics - logisticsCostPerKg) * 100) / 100,
+          logisticsCostPerKg,
+          gstPct,
           date: p.date,
           supplier: p.supplier,
         };
