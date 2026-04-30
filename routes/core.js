@@ -813,53 +813,57 @@ procurement.post('/mark-paid', auth, requireRole('admin','manager'), async (req,
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── POST /procurement/add-logistics — split transport cost across a PO group by weight ──
+// ── POST /procurement/add-logistics — split transport cost across one or multiple PO groups by weight ──
 procurement.post('/add-logistics', auth, requireRole('admin','manager'), async (req, res) => {
   try {
-    const { purchase_order_id, logistics_cost, logistics_ref, bank_account_id, paid_date } = req.body;
+    const { purchase_order_id, purchase_order_ids, logistics_cost, logistics_ref, bank_account_id, paid_date } = req.body;
     const amount = parseFloat(logistics_cost);
-    if (!purchase_order_id) return res.status(400).json({ error: 'purchase_order_id required' });
     if (!amount || amount <= 0) return res.status(400).json({ error: 'logistics_cost required' });
 
-    // Load all entries in this PO group
+    // Support single PO (purchase_order_id) or multiple POs (purchase_order_ids array)
+    const poIds = purchase_order_ids?.length ? purchase_order_ids : (purchase_order_id ? [purchase_order_id] : []);
+    if (!poIds.length) return res.status(400).json({ error: 'purchase_order_id or purchase_order_ids required' });
+
+    // Load all entries across all specified PO groups
     const { data: entries, error: fetchErr } = await supabase.from('procurements')
-      .select('id,commodity_name,ordered_qty,ordered_price_per_kg,logistics_cost_per_kg')
-      .eq('purchase_order_id', purchase_order_id);
-    if (fetchErr || !entries?.length) return res.status(404).json({ error: 'No procurements found for this purchase_order_id' });
+      .select('id,commodity_name,supplier,ordered_qty,ordered_price_per_kg,logistics_cost_per_kg,logistics_cost')
+      .in('purchase_order_id', poIds);
+    if (fetchErr || !entries?.length) return res.status(404).json({ error: 'No procurements found for specified POs' });
 
     const totalQty = entries.reduce((s, e) => s + (parseFloat(e.ordered_qty) || 0), 0);
     if (!totalQty) return res.status(400).json({ error: 'Total qty is zero' });
 
-    const costPerKg = Math.round((amount / totalQty) * 100) / 100;
+    const costPerKg = amount / totalQty; // exact — round per-entry
 
-    // Update each entry: add logistics share to ordered_price_per_kg
+    // Update each entry: add proportional logistics share
     for (const entry of entries) {
       const qty = parseFloat(entry.ordered_qty) || 0;
-      const prevLogPerKg = parseFloat(entry.logistics_cost_per_kg) || 0;
-      const newLogPerKg  = Math.round((prevLogPerKg + costPerKg) * 100) / 100;
+      const prevLogPerKg  = parseFloat(entry.logistics_cost_per_kg) || 0;
+      const newLogPerKg   = Math.round((prevLogPerKg + costPerKg) * 100) / 100;
       const newPricePerKg = Math.round(((parseFloat(entry.ordered_price_per_kg) || 0) + costPerKg) * 100) / 100;
-      const newLandedCost = newPricePerKg;
 
       await supabase.from('procurements').update({
         logistics_cost_per_kg: newLogPerKg,
-        landed_cost_per_kg:    newLandedCost,
+        landed_cost_per_kg:    newPricePerKg,
         ordered_price_per_kg:  newPricePerKg,
         logistics_ref:         logistics_ref || null,
         logistics_cost:        Math.round(((parseFloat(entry.logistics_cost) || 0) + (costPerKg * qty)) * 100) / 100,
       }).eq('id', entry.id);
     }
 
-    // Record bank debit if bank account given
+    // Record single bank debit for the full freight amount
     if (bank_account_id) {
       const txDate = paid_date || new Date().toISOString().slice(0, 10);
+      const poLabel = poIds.length > 1 ? `${poIds.length} POs (${poIds.join(', ')})` : poIds[0];
+      const suppliers = [...new Set(entries.map(e => e.supplier).filter(Boolean))].join(', ');
       const { data: bank } = await supabase.from('bank_accounts').select('current_balance').eq('id', bank_account_id).single();
       await supabase.from('bank_transactions').insert({
         bank_account_id,
         date: txDate,
         type: 'debit',
         amount,
-        description: `Logistics — PO ${purchase_order_id} (${entries[0]?.supplier || ''})`,
-        reference: logistics_ref || purchase_order_id,
+        description: `Logistics — ${poLabel} (${suppliers})`,
+        reference: logistics_ref || poIds.join(', '),
         category: 'Logistics',
         created_by: req.user?.email || '',
         created_at: new Date().toISOString(),
@@ -871,7 +875,7 @@ procurement.post('/add-logistics', auth, requireRole('admin','manager'), async (
       }
     }
 
-    res.json({ ok: true, purchase_order_id, logistics_cost: amount, cost_per_kg: costPerKg, entries_updated: entries.length });
+    res.json({ ok: true, purchase_order_ids: poIds, logistics_cost: amount, cost_per_kg: Math.round(costPerKg * 100) / 100, entries_updated: entries.length, total_qty: Math.round(totalQty * 100) / 100 });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
