@@ -1179,35 +1179,69 @@ router.get('/track-order/:orderNo', async (req, res) => {
   try {
     const orderNo = (req.params.orderNo || '').trim().toUpperCase();
     if (!orderNo) return res.status(400).json({ error: 'Order number required' });
-    const { data, error } = await supabase
+
+    const STATUS_LABELS = {
+      new:        { label: 'Order Placed', color: '#6b7280', icon: '📋' },
+      confirmed:  { label: 'Confirmed',    color: '#2563eb', icon: '✅' },
+      packed:     { label: 'Packed',       color: '#7c3aed', icon: '📦' },
+      shipped:    { label: 'Shipped',      color: '#d97706', icon: '🚚' },
+      delivered:  { label: 'Delivered',    color: '#16a34a', icon: '🎉' },
+      dispatched: { label: 'Dispatched',   color: '#d97706', icon: '🚚' },
+      cancelled:  { label: 'Cancelled',    color: '#dc2626', icon: '❌' },
+      pending:    { label: 'Processing',   color: '#6b7280', icon: '📋' },
+    };
+
+    // 1. Try webstore_orders first
+    const { data: wsData } = await supabase
       .from('webstore_orders')
-      .select('order_no,date,status,payment_status,courier,tracking_no,items,shipping,total,created_at')
+      .select('order_no,date,status,payment_status,courier,tracking_no,items,shipping,total')
       .eq('order_no', orderNo)
       .maybeSingle();
-    if (error || !data) return res.status(404).json({ error: 'Order not found' });
-    const STATUS_LABELS = {
-      new:       { label: 'Order Placed',    color: '#6b7280', icon: '📋' },
-      confirmed: { label: 'Confirmed',       color: '#2563eb', icon: '✅' },
-      packed:    { label: 'Packed',          color: '#7c3aed', icon: '📦' },
-      shipped:   { label: 'Shipped',         color: '#d97706', icon: '🚚' },
-      delivered: { label: 'Delivered',       color: '#16a34a', icon: '🎉' },
-      cancelled: { label: 'Cancelled',       color: '#dc2626', icon: '❌' },
-    };
-    const st = STATUS_LABELS[data.status] || { label: data.status, color: '#6b7280', icon: '📋' };
-    res.json({
-      order_no:       data.order_no,
-      date:           data.date,
-      status:         data.status,
-      status_label:   st.label,
-      status_color:   st.color,
-      status_icon:    st.icon,
-      payment_status: data.payment_status,
-      courier:        data.courier || null,
-      tracking_no:    data.tracking_no || null,
-      item_count:     Array.isArray(data.items) ? data.items.length : 0,
-      total:          data.total,
-      shipping:       data.shipping,
-    });
+
+    if (wsData) {
+      const st = STATUS_LABELS[wsData.status] || { label: wsData.status, color: '#6b7280', icon: '📋' };
+      return res.json({
+        order_no:       wsData.order_no,
+        date:           wsData.date,
+        status:         wsData.status,
+        status_label:   st.label,
+        status_color:   st.color,
+        status_icon:    st.icon,
+        payment_status: wsData.payment_status,
+        courier:        wsData.courier || null,
+        tracking_no:    wsData.tracking_no || null,
+        item_count:     Array.isArray(wsData.items) ? wsData.items.length : 0,
+        total:          wsData.total,
+        shipping:       wsData.shipping,
+      });
+    }
+
+    // 2. Fallback: try sales table (internal/retail orders use same order number format)
+    const { data: saleData } = await supabase
+      .from('sales')
+      .select('order_no,date,status,payment_method,items,final_amount')
+      .eq('order_no', orderNo)
+      .maybeSingle();
+
+    if (saleData) {
+      const st = STATUS_LABELS[saleData.status] || { label: saleData.status, color: '#6b7280', icon: '📋' };
+      return res.json({
+        order_no:       saleData.order_no,
+        date:           saleData.date,
+        status:         saleData.status,
+        status_label:   st.label,
+        status_color:   st.color,
+        status_icon:    st.icon,
+        payment_status: saleData.status === 'delivered' || saleData.status === 'dispatched' ? 'paid' : 'pending',
+        courier:        null,
+        tracking_no:    null,
+        item_count:     Array.isArray(saleData.items) ? saleData.items.length : 0,
+        total:          saleData.final_amount,
+        shipping:       0,
+      });
+    }
+
+    return res.status(404).json({ error: 'Order not found' });
   } catch (e) {
     console.error('track-order error:', e);
     res.status(500).json({ error: 'Server error' });
