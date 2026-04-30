@@ -1,0 +1,465 @@
+{
+  "version": "7.3",
+  "screens": [
+    {
+      "id": "WELCOME",
+      "title": "Sathvam Natural Products",
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "Image",
+            "src": "data:image/jpeg;base64,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Ocd18AoqeqmqXZleSOgdAW1hxdvNmlnz93218PEcb5X7EbS5x6ApejtLYyH1GHO6G9A/is5snbGo8o9Ph753PhJAYVVouoIgIgIgIgIgIgIgIgIgIgIgIgIgIgIgIgIgIgIg8ue1ntODe84Xg1MA4zM/zBZiJnwjNojzK26vpWcZ2eByrEl5p2+yHvPYMKyuG9vZVbqKV99sOW8zvyI2NjHWd5WFLNLM7MkjnHtK28eKtOWhlz2ycez3FSVE/wCDicR1kYCz4LNwM8n+Fn8VHJmivEeU8XTzfm3EJKKnigbsxMDR2K6tKZmZ3LpViKxqBFhkRARARARARARARARARARARARARARARARARARARBQgEYIyO1WH0NLJ7UDPAYWYtNfEo2pW3mFp1ppD9AjucV5+R6Xqf/mVsZ7/ACo/psfw9ttVG38VnvcVejpYIvYhY3uChbJa3mVlcNK+IXVVQWiICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICICIKZA6eCBwcMggjrCCqIKJlBVUQMplAyiCqogIgqiCiIKqiAqoCplAVUFFR7RIxzCXDIxkHB80Gl1cEtNQajfFcrg19I4RQOdVvdzYdEwkjJ45cSCVcgu1dVXazwGoez0WZ1PWta7dLLsSDB7MR7X+IKKTcVVSREQEQEQEQEQEQEQFh3a5QWe01VxqSeapojI7HE46B2ngg+fbzqS/auuWzJJPJzjsQ0cGS1vYGjie0rHiqL/pWvaWurbbUD1gx4c3aHa07nBUbny2YiIjTuGhNTVOqLCKuro3QSxu2HPDcRzfpM+8dBWzK6J3DXmNTppXKjqCSyaZ5ilmdFVV0gjjcx2HNaN7iD3YHiuTWnWF5t12paya6Vs8UMrXSRSTuc17c+sCCerKrtOpW0rur6KhmjqIGTROD45GhzXDpBGQVr/KDPPTaHuc1NLJFMxjSx8Ti1w9dvAjerJ8Ko8uFnUN/HG8XId9TIPvVBqK/O4Xm4nuqZD96o3LY1DqPJVX11bYbs+tq6id7JQGumkc4gbHRlc7seoL1LfbdHJeK97H1UTXNdUvIILxkHepzM6hCIjcvosLmvLFca63xWg0VbUUxe6Xa5mVzNrAbjODvU7eFdPK7yP3Ctr7bc3VtZPUuZOwNM0heQNnoy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",
+            "scale-type": "contain",
+            "aspect-ratio": 1,
+            "width": 400,
+            "height": 400
+          },
+          {
+            "type": "TextHeading",
+            "text": "Welcome to Sathvam 🌿"
+          },
+          {
+            "type": "TextSubheading",
+            "text": "Natural • Pure • Authentic"
+          },
+          {
+            "type": "TextBody",
+            "text": "Order our 100% natural cold-pressed oils, millets, pulses & spices — directly from our mill to your home.\n\nFree shipping on orders above ₹499. Secure payment via UPI, Card or Netbanking."
+          },
+          {
+            "type": "TextCaption",
+            "text": "🏭 Cold-pressed in our own mill | 🌱 No chemicals | 🚚 Delivered across India"
+          },
+          {
+            "type": "Footer",
+            "label": "Start Ordering →",
+            "on-click-action": {
+              "name": "navigate",
+              "next": {
+                "type": "screen",
+                "name": "PRODUCTS"
+              },
+              "payload": {}
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "PRODUCTS",
+      "title": "Select Products",
+      "data": {},
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextBody",
+            "text": "Select up to 2 products. Free shipping above ₹499."
+          },
+          {
+            "type": "Form",
+            "name": "product_form",
+            "children": [
+              {
+                "type": "Dropdown",
+                "label": "Product 1 *",
+                "name": "product1",
+                "required": true,
+                "data-source": [
+                  {
+                    "id": "b3427614-1161-4f05-b2d2-a2e75cd62c20",
+                    "title": "Herbal Hair Oil 500ML — ₹1221"
+                  },
+                  {
+                    "id": "7773bd39-211e-4336-a33c-180ffa7ca812",
+                    "title": "Castor Oil 250ML — ₹275"
+                  },
+                  {
+                    "id": "e8ff3b45-7c13-499f-8b21-4f7c15ef156d",
+                    "title": "Deepam Oil 250ML — ₹138"
+                  },
+                  {
+                    "id": "2a22415f-3f9e-427a-8ea4-1aeecdcb50e4",
+                    "title": "Groundnut Oil 250ML — ₹90"
+                  },
+                  {
+                    "id": "71cb417b-b419-41ad-a514-7d2ac1cb58ea",
+                    "title": "Neem Oil 500ML — ₹342"
+                  },
+                  {
+                    "id": "25358cc0-f679-459d-9a16-f55c99c763b7",
+                    "title": "Sesame Oil 500ML — ₹198"
+                  },
+                  {
+                    "id": "51e63de8-af00-481d-91fa-a7c82c394c72",
+                    "title": "Mustard Oil 500ML — ₹425"
+                  },
+                  {
+                    "id": "a06d5396-2666-4745-b371-47be34880532",
+                    "title": "Coconut Oil 500ML — ₹183"
+                  },
+                  {
+                    "id": "e8801fa3-4ba8-49bb-9cd3-192009448f23",
+                    "title": "Kodo Millet 500G — ₹122"
+                  },
+                  {
+                    "id": "8d59cef4-841d-4198-ae9a-26dd6e755791",
+                    "title": "Barnyard Millet 500G — ₹122"
+                  },
+                  {
+                    "id": "d0b94ff8-39aa-43c9-a2f0-a867a080ed1b",
+                    "title": "Barnyard Flour 500G — ₹186"
+                  },
+                  {
+                    "id": "140070ed-c5e3-454e-b9db-9a32a75dfc7a",
+                    "title": "Rava 500G — ₹90"
+                  },
+                  {
+                    "id": "942bd8b8-3510-49f4-b6b6-7dc33559ad67",
+                    "title": "Besan Flour 500G — ₹129"
+                  },
+                  {
+                    "id": "1f00c3cb-eb51-4edb-85b2-f8ee5511e250",
+                    "title": "Little Millet Flakes 250G — ₹71"
+                  },
+                  {
+                    "id": "43a4e0ff-2d1b-45c9-abdf-0b48307a34aa",
+                    "title": "Sprouted Ragi Flour 500G — ₹197"
+                  },
+                  {
+                    "id": "f2244b47-f7fc-48ae-89c7-819cfeed2e79",
+                    "title": "Wheat Rava 500G — ₹101"
+                  },
+                  {
+                    "id": "df8411eb-c03f-4d29-8955-009e206c8874",
+                    "title": "Bengal Gram 1KG — ₹267"
+                  },
+                  {
+                    "id": "f9293057-e7eb-4bab-8a66-c55ea6c03573",
+                    "title": "Soya Beans 500G — ₹148"
+                  },
+                  {
+                    "id": "56ae82d9-b004-4b2f-8d65-6bc0da5e7136",
+                    "title": "Toor Dal Red Soiled 500G — ₹198"
+                  },
+                  {
+                    "id": "edd57058-a755-4d51-81fa-0391161d62da",
+                    "title": "Urad Dal 500G — ₹134"
+                  },
+                  {
+                    "id": "656f931b-a76c-45d3-a163-0f40669eb8b7",
+                    "title": "Toor Dal 1KG — ₹251"
+                  },
+                  {
+                    "id": "c624579f-3049-4167-953a-1f0ce395f73e",
+                    "title": "Fennel 200G — ₹107"
+                  },
+                  {
+                    "id": "9a11801c-7b52-4659-8e9e-e1446b635859",
+                    "title": "Black Pepper 500G — ₹340"
+                  },
+                  {
+                    "id": "732dd3fa-e5d0-4b2e-a92e-07e55e4f7b5f",
+                    "title": "Chilli Powder 500G — ₹247"
+                  },
+                  {
+                    "id": "f6995bd1-e4e3-473b-8465-0e4cb5c0e2dd",
+                    "title": "Rasam Powder 200G — ₹163"
+                  }
+                ]
+              },
+              {
+                "type": "Dropdown",
+                "label": "Quantity *",
+                "name": "qty1",
+                "required": true,
+                "data-source": [
+                  {
+                    "id": "1",
+                    "title": "1"
+                  },
+                  {
+                    "id": "2",
+                    "title": "2"
+                  },
+                  {
+                    "id": "3",
+                    "title": "3"
+                  },
+                  {
+                    "id": "4",
+                    "title": "4"
+                  },
+                  {
+                    "id": "5",
+                    "title": "5"
+                  }
+                ]
+              },
+              {
+                "type": "Dropdown",
+                "label": "Product 2 (Optional)",
+                "name": "product2",
+                "required": false,
+                "data-source": [
+                  {
+                    "id": "none",
+                    "title": "— Skip —"
+                  },
+                  {
+                    "id": "b3427614-1161-4f05-b2d2-a2e75cd62c20",
+                    "title": "Herbal Hair Oil 500ML — ₹1221"
+                  },
+                  {
+                    "id": "7773bd39-211e-4336-a33c-180ffa7ca812",
+                    "title": "Castor Oil 250ML — ₹275"
+                  },
+                  {
+                    "id": "e8ff3b45-7c13-499f-8b21-4f7c15ef156d",
+                    "title": "Deepam Oil 250ML — ₹138"
+                  },
+                  {
+                    "id": "2a22415f-3f9e-427a-8ea4-1aeecdcb50e4",
+                    "title": "Groundnut Oil 250ML — ₹90"
+                  },
+                  {
+                    "id": "71cb417b-b419-41ad-a514-7d2ac1cb58ea",
+                    "title": "Neem Oil 500ML — ₹342"
+                  },
+                  {
+                    "id": "25358cc0-f679-459d-9a16-f55c99c763b7",
+                    "title": "Sesame Oil 500ML — ₹198"
+                  },
+                  {
+                    "id": "51e63de8-af00-481d-91fa-a7c82c394c72",
+                    "title": "Mustard Oil 500ML — ₹425"
+                  },
+                  {
+                    "id": "a06d5396-2666-4745-b371-47be34880532",
+                    "title": "Coconut Oil 500ML — ₹183"
+                  },
+                  {
+                    "id": "e8801fa3-4ba8-49bb-9cd3-192009448f23",
+                    "title": "Kodo Millet 500G — ₹122"
+                  },
+                  {
+                    "id": "8d59cef4-841d-4198-ae9a-26dd6e755791",
+                    "title": "Barnyard Millet 500G — ₹122"
+                  },
+                  {
+                    "id": "d0b94ff8-39aa-43c9-a2f0-a867a080ed1b",
+                    "title": "Barnyard Flour 500G — ₹186"
+                  },
+                  {
+                    "id": "140070ed-c5e3-454e-b9db-9a32a75dfc7a",
+                    "title": "Rava 500G — ₹90"
+                  },
+                  {
+                    "id": "942bd8b8-3510-49f4-b6b6-7dc33559ad67",
+                    "title": "Besan Flour 500G — ₹129"
+                  },
+                  {
+                    "id": "1f00c3cb-eb51-4edb-85b2-f8ee5511e250",
+                    "title": "Little Millet Flakes 250G — ₹71"
+                  },
+                  {
+                    "id": "43a4e0ff-2d1b-45c9-abdf-0b48307a34aa",
+                    "title": "Sprouted Ragi Flour 500G — ₹197"
+                  },
+                  {
+                    "id": "f2244b47-f7fc-48ae-89c7-819cfeed2e79",
+                    "title": "Wheat Rava 500G — ₹101"
+                  },
+                  {
+                    "id": "df8411eb-c03f-4d29-8955-009e206c8874",
+                    "title": "Bengal Gram 1KG — ₹267"
+                  },
+                  {
+                    "id": "f9293057-e7eb-4bab-8a66-c55ea6c03573",
+                    "title": "Soya Beans 500G — ₹148"
+                  },
+                  {
+                    "id": "56ae82d9-b004-4b2f-8d65-6bc0da5e7136",
+                    "title": "Toor Dal Red Soiled 500G — ₹198"
+                  },
+                  {
+                    "id": "edd57058-a755-4d51-81fa-0391161d62da",
+                    "title": "Urad Dal 500G — ₹134"
+                  },
+                  {
+                    "id": "656f931b-a76c-45d3-a163-0f40669eb8b7",
+                    "title": "Toor Dal 1KG — ₹251"
+                  },
+                  {
+                    "id": "c624579f-3049-4167-953a-1f0ce395f73e",
+                    "title": "Fennel 200G — ₹107"
+                  },
+                  {
+                    "id": "9a11801c-7b52-4659-8e9e-e1446b635859",
+                    "title": "Black Pepper 500G — ₹340"
+                  },
+                  {
+                    "id": "732dd3fa-e5d0-4b2e-a92e-07e55e4f7b5f",
+                    "title": "Chilli Powder 500G — ₹247"
+                  },
+                  {
+                    "id": "f6995bd1-e4e3-473b-8465-0e4cb5c0e2dd",
+                    "title": "Rasam Powder 200G — ₹163"
+                  }
+                ]
+              },
+              {
+                "type": "Dropdown",
+                "label": "Quantity (Product 2)",
+                "name": "qty2",
+                "required": false,
+                "data-source": [
+                  {
+                    "id": "0",
+                    "title": "0"
+                  },
+                  {
+                    "id": "1",
+                    "title": "1"
+                  },
+                  {
+                    "id": "2",
+                    "title": "2"
+                  },
+                  {
+                    "id": "3",
+                    "title": "3"
+                  },
+                  {
+                    "id": "4",
+                    "title": "4"
+                  },
+                  {
+                    "id": "5",
+                    "title": "5"
+                  }
+                ]
+              },
+              {
+                "type": "Footer",
+                "label": "Next: Delivery Address →",
+                "on-click-action": {
+                  "name": "navigate",
+                  "next": {
+                    "type": "screen",
+                    "name": "ADDRESS"
+                  },
+                  "payload": {
+                    "product1": "${form.product1}",
+                    "qty1": "${form.qty1}",
+                    "product2": "${form.product2}",
+                    "qty2": "${form.qty2}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "id": "ADDRESS",
+      "title": "Delivery Details",
+      "terminal": true,
+      "data": {
+        "product1": {
+          "type": "string",
+          "__example__": "prod-id-1"
+        },
+        "qty1": {
+          "type": "string",
+          "__example__": "1"
+        },
+        "product2": {
+          "type": "string",
+          "__example__": "none"
+        },
+        "qty2": {
+          "type": "string",
+          "__example__": "0"
+        }
+      },
+      "layout": {
+        "type": "SingleColumnLayout",
+        "children": [
+          {
+            "type": "TextBody",
+            "text": "Enter your delivery address. You will receive a payment link on WhatsApp after submitting."
+          },
+          {
+            "type": "Form",
+            "name": "address_form",
+            "children": [
+              {
+                "type": "TextInput",
+                "label": "Full Name",
+                "name": "cust_name",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "Phone Number",
+                "name": "cust_phone",
+                "required": true,
+                "input-type": "phone"
+              },
+              {
+                "type": "TextArea",
+                "label": "House No, Street, Area",
+                "name": "address",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "City",
+                "name": "city",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "State",
+                "name": "state",
+                "required": true
+              },
+              {
+                "type": "TextInput",
+                "label": "Pincode",
+                "name": "pincode",
+                "required": true,
+                "input-type": "number",
+                "min-chars": 6,
+                "max-chars": 6
+              },
+              {
+                "type": "Footer",
+                "label": "Place Order & Get Payment Link →",
+                "on-click-action": {
+                  "name": "complete",
+                  "payload": {
+                    "product1": "${data.product1}",
+                    "qty1": "${data.qty1}",
+                    "product2": "${data.product2}",
+                    "qty2": "${data.qty2}",
+                    "cust_name": "${form.cust_name}",
+                    "cust_phone": "${form.cust_phone}",
+                    "address": "${form.address}",
+                    "city": "${form.city}",
+                    "state": "${form.state}",
+                    "pincode": "${form.pincode}"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

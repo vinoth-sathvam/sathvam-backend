@@ -1342,5 +1342,85 @@ async function sendCustomerInvoice(order, paymentId) {
   } catch (e) { console.error('Customer invoice email error:', e.message); }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// sendInvoiceWhatsApp(order) — generate PDF invoice and send to customer via BotSailor
+// Called automatically after payment verification (payments.js)
+// ─────────────────────────────────────────────────────────────────────────────
+async function sendInvoiceWhatsApp(order) {
+  try {
+    const cust   = order.customer || {};
+    const digits = (cust.phone || '').replace(/\D/g, '');
+    if (!digits) return;
+    const phone = digits.length === 10 ? `91${digits}` : digits;
+
+    const token   = process.env.BOTSAILOR_API_TOKEN;
+    const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
+    if (!token || !phoneId) return;
+
+    // Generate PDF
+    const html   = buildInvoiceHtml(order, false);
+    const pdfBuf = await htmlPdf.generatePdf(
+      { content: html },
+      { format: 'A4', printBackground: true, margin: { top: '15mm', bottom: '15mm', left: '12mm', right: '12mm' } }
+    );
+
+    // Upload to Supabase storage
+    const fileName = `invoice-${order.order_no}-${Date.now()}.pdf`;
+    const { error: upErr } = await supabase.storage
+      .from('invoices')
+      .upload(fileName, pdfBuf, { contentType: 'application/pdf', upsert: true });
+    if (upErr) { console.error('Invoice PDF upload error:', upErr.message); return; }
+
+    const { data: urlData } = supabase.storage.from('invoices').getPublicUrl(fileName);
+    const pdfUrl = urlData.publicUrl;
+
+    const total   = parseFloat(order.total || 0);
+    const message =
+      `🧾 *Tax Invoice — ${order.order_no}*\n\n` +
+      `Hi ${cust.name || 'there'}, your invoice from *Sathvam Natural Products* is ready 🌿\n\n` +
+      `💰 Total: ₹${total.toFixed(2)}  |  ✅ Paid\n` +
+      `📅 Date: ${order.date || new Date().toISOString().slice(0, 10)}\n\n` +
+      `📄 *Download Invoice PDF:*\n${pdfUrl}\n\n` +
+      `For any queries: *+91 70921 77092*`;
+
+    const params = new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message });
+    const bsRes  = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+    const bsData = await bsRes.json();
+
+    if (bsData.status !== '1' && bsData.status !== 1) {
+      // Fallback to template if 24h window expired
+      const tplId = process.env.BOTSAILOR_INVOICE_TEMPLATE_ID;
+      if (tplId) {
+        const tplParams = new URLSearchParams({
+          apiToken:          token,
+          phoneNumberID:     phoneId,
+          botTemplateID:     tplId,
+          sendToPhoneNumber: phone,
+          'templateVariable-order_no': order.order_no || '',
+          'templateVariable-name':     cust.name  || 'Customer',
+          'templateVariable-total':    `₹${total.toFixed(2)}`,
+          'templateVariable-pdf_url':  pdfUrl,
+        });
+        await fetch(`https://botsailor.com/api/v1/whatsapp/send/template?${tplParams.toString()}`, { method: 'POST' });
+      }
+      return;
+    }
+
+    await supabase.from('whatsapp_messages').insert({
+      phone, contact_name: `${cust.name || ''} | ${order.order_no}`,
+      direction: 'outbound', type: 'document', content: message,
+      status: 'sent', sent_by: `auto-invoice:${order.order_no}`,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error('sendInvoiceWhatsApp error:', e.message);
+  }
+}
+
 module.exports = router;
 module.exports.sendCustomerInvoice = sendCustomerInvoice;
+module.exports.sendInvoiceWhatsApp = sendInvoiceWhatsApp;

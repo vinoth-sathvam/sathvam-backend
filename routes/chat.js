@@ -3,6 +3,35 @@ const router    = express.Router();
 const supabase  = require('../config/supabase');
 const rateLimit = require('express-rate-limit');
 
+// ── Admin WhatsApp notifier ───────────────────────────────────────────────────
+const chatNotifyThrottle = new Map(); // sessionId → timestamp, once per session
+async function notifyAdmins(message) {
+  const token   = process.env.BOTSAILOR_API_TOKEN;
+  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
+  if (!token || !phoneId) return;
+  const numbers = [process.env.WA_ADMIN_PHONE1, process.env.WA_ADMIN_PHONE2]
+    .filter(Boolean).map(n => n.replace(/\D/g, '')).filter((v,i,a) => v && a.indexOf(v)===i);
+  for (const phone of numbers) {
+    try {
+      const params = new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message });
+      const r = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString(),
+      });
+      const d = await r.json();
+      if (d.status === '1' || d.status === 1) continue;
+      // Fallback to template (strip newlines for Meta compliance)
+      const tp = new URLSearchParams({
+        apiToken: token, phoneNumberID: phoneId, botTemplateID: '356870',
+        sendToPhoneNumber: phone,
+        'templateVariable-1': 'Admin',
+        'templateVariable-2': message.replace(/\n/g, ' | ').replace(/\*|_/g, '').slice(0, 150),
+        'templateVariable-3': '—', 'templateVariable-4': 'admin.sathvam.in', 'templateVariable-5': '—',
+      });
+      await fetch(`https://botsailor.com/api/v1/whatsapp/send/template?${tp.toString()}`, { method: 'POST' });
+    } catch (e) { console.error('chat notifyAdmins error:', e.message); }
+  }
+}
+
 // Strict rate limit: 20 messages per 10 minutes per IP
 const chatLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
@@ -326,6 +355,22 @@ router.post('/', chatLimiter, async (req, res) => {
   // Save lead on first message
   if (lead?.name && lead?.phone) {
     await saveLead(lead.name, lead.phone, lead.email);
+  }
+
+  // Notify admins on first message of each chat session
+  if (messages.length === 1 && sessionId) {
+    const lastNotify = chatNotifyThrottle.get(sessionId) || 0;
+    if (Date.now() - lastNotify > 30 * 60 * 1000) {
+      chatNotifyThrottle.set(sessionId, Date.now());
+      const userMsg = lastUserText.slice(0, 200);
+      notifyAdmins(
+        `💬 *Customer Chatbot Activity*\n\n` +
+        `👤 ${lead?.name || 'Visitor'}\n` +
+        `📞 ${lead?.phone || '—'}\n\n` +
+        `💬 "${userMsg}"\n\n` +
+        `🔗 admin.sathvam.in → AI Chat`
+      ).catch(() => {});
+    }
   }
 
   // Build system prompt with live data

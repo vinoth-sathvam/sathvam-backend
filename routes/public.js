@@ -820,7 +820,7 @@ router.get('/shopping-feed', async (req, res) => {
       const name = p.name || '';
       const packInfo = p.pack_size ? ` ${p.pack_size}${p.pack_unit || ''}` : '';
       const desc = (p.description || `${name} — Pure natural product from Sathvam Natural Products, Karur, Tamil Nadu. No chemicals, no preservatives.`).slice(0, 5000);
-      const imgUrl = p.image_url || 'https://www.sathvam.in/logo.jpg';
+      const imgUrl = getProductImage(p);
       const catMap = { oil: 'Food, Beverages &amp; Tobacco > Food Items > Cooking Oils', grain: 'Food, Beverages &amp; Tobacco > Food Items > Grains &amp; Rice', spice: 'Food, Beverages &amp; Tobacco > Food Items > Seasonings', sweetener: 'Food, Beverages &amp; Tobacco > Food Items > Sweeteners', other: 'Food, Beverages &amp; Tobacco > Food Items' };
       const gCategory = catMap[p.cat] || catMap.other;
       return `
@@ -1257,6 +1257,198 @@ router.get('/track-order/:orderNo', async (req, res) => {
   } catch (e) {
     console.error('track-order error:', e);
     res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Product image map (Zoho CDN) — mirrors SW_PROD_IMAGES in frontend App.jsx
+// Used as fallback when products.image_url is null
+// ─────────────────────────────────────────────────────────────────────────────
+const _CDN = 'https://cdn2.zohoecommerce.com/product-images/';
+const PROD_IMAGES = {
+  'Groundnut Oil':_CDN+'WhatsApp+Image+2023-03-23+at+12.55.07+AM+-2-.jpeg/1247318000002110015/600x600?storefront_domain=www.sathvam.in',
+  'Sesame Oil':_CDN+'WhatsApp+Image+2023-11-16+at+04.32.50.jpeg/1247318000002479178/600x600?storefront_domain=www.sathvam.in',
+  'Coconut Oil':_CDN+'coconut+oil.jpeg/1247318000002210638/600x600?storefront_domain=www.sathvam.in',
+  'Castor Oil':_CDN+'castor+oil.jpeg/1247318000002110024/600x600?storefront_domain=www.sathvam.in',
+  'Deepam Oil':_CDN+'deepam+oil.jpeg/1247318000002210798/600x600?storefront_domain=www.sathvam.in',
+  'Neem Oil':_CDN+'neem+oil.jpeg/1247318000002276034/600x600?storefront_domain=www.sathvam.in',
+  'Mustard Oil':_CDN+'WhatsApp+Image+2024-02-12+at+07.55.21.jpeg/1247318000003695940/600x600?storefront_domain=www.sathvam.in',
+  'Pearl Millet':_CDN+'sathvam+pouch+sticker+tamil-04.jpg/1247318000003108026/600x600?storefront_domain=www.sathvam.in',
+  'Barnyard Millet':_CDN+'sathvam+pouch+sticker+tamil-07+-1-.jpg/1247318000003107485/600x600?storefront_domain=www.sathvam.in',
+  'Finger Millet':_CDN+'sathvam+pouch+sticker+tamil-05.jpg/1247318000003107513/600x600?storefront_domain=www.sathvam.in',
+  'Little Millet':_CDN+'sathvam+pouch+sticker+tamil-02.jpg/1247318000003107531/600x600?storefront_domain=www.sathvam.in',
+  'Foxtail Millet':_CDN+'sathvam+pouch+sticker+tamil-01.jpg/1247318000003108050/600x600?storefront_domain=www.sathvam.in',
+  'Kodo Millet':_CDN+'sathvam+pouch+sticker+tamil-03.jpg/1247318000003108038/600x600?storefront_domain=www.sathvam.in',
+  'Sorghum Millet':_CDN+'sathvam+pouch+sticker+tamil-06.jpg/1247318000003107499/600x600?storefront_domain=www.sathvam.in',
+  'Barnyard Millet Flakes':_CDN+'barnyard-millet-flakes-bowl.jpg/1247318000008805566/600x600?storefront_domain=www.sathvam.in',
+  'Finger/Ragi Millet Flakes':_CDN+'WhatsApp+Image+2025-04-17+at+9.34.49+PM.jpeg/1247318000008805282/600x600?storefront_domain=www.sathvam.in',
+  'Foxtail Millet Flakes':_CDN+'35149320-7dfd-4fd8-b93d-cd5c045e24c9.jpeg/1247318000008805092/600x600?storefront_domain=www.sathvam.in',
+  'Kodo Millet Flakes':_CDN+'WhatsApp+Image+2025-04-17+at+9.34.11+PM.jpeg/1247318000008805188/600x600?storefront_domain=www.sathvam.in',
+  'Little Millet Flakes':_CDN+'WhatsApp+Image+2025-04-17+at+9.34.49+PM+%282%29.jpeg/1247318000008805470/600x600?storefront_domain=www.sathvam.in',
+  'Pearl Millet Flakes':_CDN+'WhatsApp+Image+2025-04-17+at+9.34.49+PM+%281%29.jpeg/1247318000008805376/600x600?storefront_domain=www.sathvam.in',
+  'White Sorghum Millet Flakes':_CDN+'sorghum-millet-flakes-1000x1000.jpg/1247318000008805660/600x600?storefront_domain=www.sathvam.in',
+  'Puffed Rice':_CDN+'78af36df5c600fa1aa21afca53f455b0.jpg/1247318000009127459/600x600?storefront_domain=www.sathvam.in',
+  'Bengal Gram':_CDN+'kadalai+parupu.jpeg/1247318000002613179/600x600?storefront_domain=www.sathvam.in',
+  'Urad Dal':_CDN+'up.jpeg/1247318000002613383/600x600?storefront_domain=www.sathvam.in',
+  'Toor Dal Red Soiled':_CDN+'sathvam+pouch+sticker+tamil-08.jpg/1247318000003108016/600x600?storefront_domain=www.sathvam.in',
+  'Groundnut':_CDN+'WhatsApp+Image+2024-01-19+at+19.05.16+-1-.jpeg/1247318000003391023/600x600?storefront_domain=www.sathvam.in',
+  'Moong Dhal':_CDN+'Moong-Dal-870x635.jpg/1247318000006389113/600x600?storefront_domain=www.sathvam.in',
+  'Moong Dal':_CDN+'Moong-Dal-870x635.jpg/1247318000006389113/600x600?storefront_domain=www.sathvam.in',
+  'Roasted Bengal Gram':_CDN+'cold-pressed-16--500x500.webp/1247318000006402663/600x600?storefront_domain=www.sathvam.in',
+  'Toor Dhal':_CDN+'dal-1740205_1280.webp/1247318000006402416/600x600?storefront_domain=www.sathvam.in',
+  'Toor Dal':_CDN+'dal-1740205_1280.webp/1247318000006402416/600x600?storefront_domain=www.sathvam.in',
+  'Whole Black Urad Dal':_CDN+'WhatsApp+Image+2025-04-17+at+12.05.44+PM.jpeg/1247318000008792072/600x600?storefront_domain=www.sathvam.in',
+  'Masoor Dal':_CDN+'WhatsApp+Image+2025-04-18+at+12.48.07+PM.jpeg/1247318000008805908/600x600?storefront_domain=www.sathvam.in',
+  'Organic Nattu Sakkarai':_CDN+'nattusakarai.jpeg/1247318000002253834/600x600?storefront_domain=www.sathvam.in',
+  'Jaggery':_CDN+'Untitled.jpeg/1247318000004695020/600x600?storefront_domain=www.sathvam.in',
+  'Palm Sugar Candy':_CDN+'palm+candy.jpeg/1247318000004715136/600x600?storefront_domain=www.sathvam.in',
+  'Wheat':_CDN+'wheat+mavu.jpg/1247318000003551595/600x600?storefront_domain=www.sathvam.in',
+  'Barnyard Flour':_CDN+'WhatsApp+Image+2024-04-16+at+11.05.04+PM.jpeg/1247318000004456292/600x600?storefront_domain=www.sathvam.in',
+  'Sprouted Ragi Flour':_CDN+'WhatsApp+Image+2024-04-16+at+11.05.04+PM-1-.jpeg/1247318000004456436/600x600?storefront_domain=www.sathvam.in',
+  'White Sorghum Flour':_CDN+'WhatsApp+Image+2024-04-16+at+11.05.05+PM-1-.jpeg/1247318000004455008/600x600?storefront_domain=www.sathvam.in',
+  'Foxtail Flour':_CDN+'WhatsApp+Image+2024-04-16+at+11.05.05+PM.jpeg/1247318000004522061/600x600?storefront_domain=www.sathvam.in',
+  'Black Rice Flour':_CDN+'WhatsApp+Image+2024-04-23+at+7.06.10+AM.jpeg/1247318000004546177/600x600?storefront_domain=www.sathvam.in',
+  'Red Rice Flour':_CDN+'WhatsApp+Image+2024-04-23+at+7.06.09+AM-2-.jpeg/1247318000004550416/600x600?storefront_domain=www.sathvam.in',
+  'Besan Flour':_CDN+'Untitled.jpeg/1247318000004617318/600x600?storefront_domain=www.sathvam.in',
+  'Navathaniya Dosa Mix':_CDN+'WhatsApp+Image+2025-04-29+at+12.16.34+PM.jpeg/1247318000008921442/600x600?storefront_domain=www.sathvam.in',
+  'Sambar Powder':_CDN+'WhatsApp+Image+2023-10-27+at+8.19.10+PM.jpeg/1247318000002210946/600x600?storefront_domain=www.sathvam.in',
+  'Chilli Powder':_CDN+'chilli+powder.jpeg/1247318000002253558/600x600?storefront_domain=www.sathvam.in',
+  'Idly Powder':_CDN+'idli+podi.jpeg/1247318000002253698/600x600?storefront_domain=www.sathvam.in',
+  'Turmeric Powder':_CDN+'WhatsApp+Image+2024-01-19+at+19.05.19+-2-.jpeg/1247318000003407505/600x600?storefront_domain=www.sathvam.in',
+  'Rasa Powder':_CDN+'RASAM+POWDR.jpeg/1247318000004713733/600x600?storefront_domain=www.sathvam.in',
+  'Country Coriander Powder':_CDN+'CORRIANDER+POWDER.jpeg/1247318000004715149/600x600?storefront_domain=www.sathvam.in',
+  'Black Pepper':_CDN+'milagu.jpeg/1247318000002613311/600x600?storefront_domain=www.sathvam.in',
+  'Coriander':_CDN+'WhatsApp+Image+2024-01-19+at+19.05.16+-2-.jpeg/1247318000003391035/600x600?storefront_domain=www.sathvam.in',
+  'Cardamom':_CDN+'elagai.jpg/1247318000003551561/600x600?storefront_domain=www.sathvam.in',
+  'Mustard':_CDN+'WhatsApp+Image+2024-01-19+at+19.05.17.jpeg/1247318000003391062/600x600?storefront_domain=www.sathvam.in',
+  'Dry Red Chilli':_CDN+'WhatsApp+Image+2024-01-19+at+19.05.15.jpeg/1247318000003407095/600x600?storefront_domain=www.sathvam.in',
+  'Cumin':_CDN+'WhatsApp+Image+2024-01-19+at+19.05.18+-1-.jpeg/1247318000003407401/600x600?storefront_domain=www.sathvam.in',
+  'Fennel':_CDN+'WhatsApp+Image+2024-01-19+at+19.05.18.jpeg/1247318000003391074/600x600?storefront_domain=www.sathvam.in',
+  'Fenugreek':_CDN+'WhatsApp+Image+2024-01-19+at+19.05.17+-1-.jpeg/1247318000003407293/600x600?storefront_domain=www.sathvam.in',
+  'Tamarind':_CDN+'puli.jpeg/1247318000002613543/600x600?storefront_domain=www.sathvam.in',
+  'Black Chickpeas':_CDN+'karupukonda+kadal.jpg/1247318000003551569/600x600?storefront_domain=www.sathvam.in',
+  'Horse Gram':_CDN+'organic-kulthi-dal.jpg/1247318000004163092/600x600?storefront_domain=www.sathvam.in',
+  'Soya Beans':_CDN+'WhatsApp-Image-2022-05-12-at-12.01.24-PM.jpeg/1247318000004644058/600x600?storefront_domain=www.sathvam.in',
+  'Green Peas':_CDN+'pacha+pattani.jpg/1247318000003551585/600x600?storefront_domain=www.sathvam.in',
+  'Whole Mung Beans':_CDN+'images.jpeg/1247318000004616011/600x600?storefront_domain=www.sathvam.in',
+  'White Chickpeas':_CDN+'vellakonda+kadal.jpg/1247318000003551577/600x600?storefront_domain=www.sathvam.in',
+  'Black Eyed Bean':_CDN+'thatta-payaru-benefits-for-health.jpg/1247318000006402500/600x600?storefront_domain=www.sathvam.in',
+  'White Lima Beans':_CDN+'0Vellaimochaia.jpg/1247318000006402580/600x600?storefront_domain=www.sathvam.in',
+  'Chitra Rajma':_CDN+'WhatsApp+Image+2025-04-17+at+12.08.14+PM.jpeg/1247318000008793015/600x600?storefront_domain=www.sathvam.in',
+  'Red Rajma':_CDN+'WhatsApp+Image+2025-04-17+at+12.06.01+PM.jpeg/1247318000008792190/600x600?storefront_domain=www.sathvam.in',
+  'Cow Ghee':_CDN+'41diIEPUlnL._AC_UF1000%2C1000_QL80_.jpg/1247318000006389409/600x600?storefront_domain=www.sathvam.in',
+  'Country Cow Ghee':_CDN+'cow-ghee-1-800x800.webp/1247318000006389345/600x600?storefront_domain=www.sathvam.in',
+  'Hand Churned Ghee':_CDN+'ghee.jpeg/1247318000003156963/600x600?storefront_domain=www.sathvam.in',
+  'Organic Karupu Kavuni Rice':_CDN+'1-500x500.webp/1247318000006402178/600x600?storefront_domain=www.sathvam.in',
+  'Organic Thooyamalli Rice':_CDN+'Thooyamalli.jpg/1247318000006402244/600x600?storefront_domain=www.sathvam.in',
+  'Organic Parboiled Idly Rice ADT 37':_CDN+'istockphoto-1171772037-612x612.jpg/1247318000006402328/600x600?storefront_domain=www.sathvam.in',
+  'Black Dry Grapes':_CDN+'WhatsApp+Image+2024-02-11+at+23.21.08.jpeg/1247318000003695555/600x600?storefront_domain=www.sathvam.in',
+  'Badam':_CDN+'WhatsApp+Image+2024-02-11+at+23.04.17.jpeg/1247318000003695229/600x600?storefront_domain=www.sathvam.in',
+  'Pumpkin Seeds':_CDN+'WhatsApp+Image+2024-02-11+at+23.16.00.jpeg/1247318000003695481/600x600?storefront_domain=www.sathvam.in',
+  'Flaxseed':_CDN+'WhatsApp+Image+2024-02-11+at+23.06.07.jpeg/1247318000003693372/600x600?storefront_domain=www.sathvam.in',
+  'Flax Seeds':_CDN+'WhatsApp+Image+2024-02-11+at+23.06.07.jpeg/1247318000003693372/600x600?storefront_domain=www.sathvam.in',
+  'Sunflower Seeds':_CDN+'SUNFLOWER+SEEDS.jpeg/1247318000003938292/600x600?storefront_domain=www.sathvam.in',
+  'Chironji Seeds':_CDN+'chironji+3.jpg/1247318000003938199/600x600?storefront_domain=www.sathvam.in',
+  'Tapioca Vathal Ajwain':_CDN+'WhatsApp+Image+2024-04-23+at+7.06.07+AM.jpeg/1247318000004546153/600x600?storefront_domain=www.sathvam.in',
+  'Tapioca Vathal Cumin':_CDN+'WhatsApp+Image+2024-04-23+at+7.06.07+AM-1-.jpeg/1247318000004550127/600x600?storefront_domain=www.sathvam.in',
+  'Tapioca Papad Red Chilli':_CDN+'WhatsApp+Image+2024-04-23+at+7.06.08+AM-1-.jpeg/1247318000004550301/600x600?storefront_domain=www.sathvam.in',
+  'Tapioca Papad Tomato':_CDN+'WhatsApp+Image+2024-04-23+at+7.06.09+AM-1-.jpeg/1247318000004550239/600x600?storefront_domain=www.sathvam.in',
+  'Tapioca Vathal Green Chilli':_CDN+'WhatsApp+Image+2024-04-23+at+7.06.08+AM.jpeg/1247318000004546165/600x600?storefront_domain=www.sathvam.in',
+  'Tapioca Papad Garlic':_CDN+'WhatsApp+Image+2024-04-23+at+7.06.09+AM-2-.jpeg/1247318000004550416/600x600?storefront_domain=www.sathvam.in',
+  'Onion Vadagam':_CDN+'WhatsApp+Image+2025-04-18+at+12.51.45+PM.jpeg/1247318000008805985/600x600?storefront_domain=www.sathvam.in',
+  'Long Rice Vadagam':_CDN+'WhatsApp+Image+2025-04-18+at+12.51.55+PM.jpeg/1247318000008816060/600x600?storefront_domain=www.sathvam.in',
+  'Rava':_CDN+'WhatsApp+Image+2024-01-19+at+19.05.16.jpeg/1247318000003391048/600x600?storefront_domain=www.sathvam.in',
+  'Wheat Rava':_CDN+'WhatsApp+Image+2024-01-19+at+19.05.16.jpeg/1247318000003391048/600x600?storefront_domain=www.sathvam.in',
+  'Incense Sticks - Sembagapoo':_CDN+'CHAMPAKA+FLOWER.jpg/1247318000008022118/600x600?storefront_domain=www.sathvam.in',
+  'Incense Sticks - Javadhu':_CDN+'JAVADHU.jpg/1247318000008022293/600x600?storefront_domain=www.sathvam.in',
+  'Incense Sticks - Sandal':_CDN+'SANDAL.jpg/1247318000008022450/600x600?storefront_domain=www.sathvam.in',
+  'Incense Sticks - Tulasi':_CDN+'TULASI.jpg/1247318000007933089/600x600?storefront_domain=www.sathvam.in',
+  'Incense Sticks - Kungaliyam':_CDN+'kungaliyam+incen.jpg/1247318000008022531/600x600?storefront_domain=www.sathvam.in',
+  'Incense Sticks - Dasangam':_CDN+'stunning-floral-brass-agarbatti-stand-incense-holder-576_1024x.jpg/1247318000008792251/600x600?storefront_domain=www.sathvam.in',
+  'Shikakai Powder':_CDN+'WhatsApp+Image+2024-02-12+at+07.55.21.jpeg/1247318000003695940/600x600?storefront_domain=www.sathvam.in',
+  'Vegetarian Soyamate':_CDN+'WhatsApp+Image+2025-04-16+at+11.42.24+AM.jpeg/1247318000008774012/600x600?storefront_domain=www.sathvam.in',
+  'Groundnut Seeds':_CDN+'WhatsApp+Image+2024-01-19+at+19.05.16+-1-.jpeg/1247318000003391023/600x600?storefront_domain=www.sathvam.in',
+};
+
+// Helper: get image for a product (db url → name match → base name match → fallback)
+function getProductImage(p) {
+  if (p.image_url) return p.image_url;
+  const baseName = (p.name || '').replace(/\s+\d+.*$/,'').trim();
+  return PROD_IMAGES[p.name] || PROD_IMAGES[baseName] || 'https://www.sathvam.in/logo.jpg';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/public/catalog-feed  — WhatsApp Commerce Manager product catalog (CSV)
+// Meta fetches this URL automatically every 24 hours to sync your catalog.
+// Paste this URL in: WhatsApp Manager → Catalog → Data Sources → Data File → Scheduled Feed
+// URL: https://api.sathvam.in/api/public/catalog-feed
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/catalog-feed', async (req, res) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="sathvam-catalog.csv"');
+  try {
+    // Fetch products + stock in parallel
+    const [{ data: products }, { data: stockRows }, { data: enabledSetting }] = await Promise.all([
+      supabase.from('products')
+        .select('id,name,sku,cat,pack_size,pack_unit,unit,gst,price,website_price,retail_price,description,image_url,active')
+        .eq('active', true).neq('cat', 'raw').order('name'),
+      supabase.from('stock_ledger').select('product_id,type,qty'),
+      supabase.from('settings').select('value').eq('key', 'website_enabled_products').single(),
+    ]);
+
+    // Calculate stock per product
+    const stock = {};
+    for (const row of stockRows || []) {
+      if (!stock[row.product_id]) stock[row.product_id] = 0;
+      stock[row.product_id] += row.type === 'in' ? (+row.qty || 0) : -(+row.qty || 0);
+    }
+
+    const enabledArr = Array.isArray(enabledSetting?.value) ? enabledSetting.value
+      : Array.isArray(enabledSetting?.value?.value) ? enabledSetting.value.value : [];
+    const enabledSet = new Set(enabledArr);
+
+    const websiteProducts = enabledSet.size > 0
+      ? (products || []).filter(p => enabledSet.has(p.id))
+      : (products || []).filter(p => (p.website_price || p.price) > 0);
+
+    // CSV escape helper
+    const esc = (v) => `"${String(v || '').replace(/"/g, '""').replace(/\r?\n/g, ' ')}"`;
+
+    // Meta required CSV columns
+    const headers = ['id','title','description','availability','condition','price','link','image_link','brand','retailer_id','google_product_category'];
+    const rows = websiteProducts.map(p => {
+      const basePrice  = parseFloat(p.website_price || p.price || 0);
+      const gstAmt     = basePrice * ((p.gst || 0) / 100);
+      const finalPrice = (basePrice + gstAmt).toFixed(2);
+      const packInfo   = p.pack_size ? ` ${p.pack_size}${p.pack_unit || p.unit || ''}` : '';
+      const title      = `${p.name}${packInfo}`;
+      const desc       = (p.description || `${p.name} — Pure cold-pressed natural product by Sathvam Natural Products, Karur, Tamil Nadu. No chemicals, no preservatives. Factory direct pricing.`).slice(0, 9999);
+      const link       = `https://www.sathvam.in/product/${toSlug(p.name)}`;
+      const imageLink  = getProductImage(p);
+      const qty        = stock[p.id] || 0;
+      const avail      = qty > 0 ? 'in stock' : 'out of stock';
+      const catMap     = { oil: 'Food, Beverages & Tobacco > Food Items > Cooking Oils', grain: 'Food, Beverages & Tobacco > Food Items > Grains & Rice', spice: 'Food, Beverages & Tobacco > Food Items > Seasonings', other: 'Food, Beverages & Tobacco > Food Items' };
+      const gCat       = catMap[p.cat] || catMap.other;
+
+      return [
+        esc(p.id),
+        esc(title),
+        esc(desc),
+        esc(avail),
+        esc('new'),
+        esc(`${finalPrice} INR`),
+        esc(link),
+        esc(imageLink),
+        esc('Sathvam Natural Products'),
+        esc(p.sku || p.id),
+        esc(gCat),
+      ].join(',');
+    });
+
+    res.send([headers.join(','), ...rows].join('\r\n'));
+  } catch (e) {
+    res.status(500).send(`"error"\r\n"${e.message}"`);
   }
 });
 

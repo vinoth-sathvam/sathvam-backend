@@ -1085,6 +1085,138 @@ router.get('/cashflow', auth, roleGuard, async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/ca-agent/simple-dashboard
+// Simple Finance Dashboard — one endpoint, all the numbers anyone needs:
+//   Cash in bank · Cash in factory · Sales (local/website/B2B) · Expenses
+//   Salary · Forecast · Bottom line
+// POST /api/ca-agent/simple-dashboard  { cash_in_factory: number }  — update petty cash
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/simple-dashboard', auth, roleGuard, async (req, res) => {
+  try {
+    const { cash_in_factory } = req.body;
+    if (cash_in_factory == null) return res.status(400).json({ error: 'cash_in_factory required' });
+    const amount = parseFloat(cash_in_factory) || 0;
+    const { error } = await supabase.from('settings').upsert({ key: 'cash_in_factory', value: { amount, updated_at: new Date().toISOString(), updated_by: req.user?.name || 'admin' }, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true, cash_in_factory: amount });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+router.get('/simple-dashboard', auth, roleGuard, async (req, res) => {
+  try {
+    const r2     = n => Math.round((parseFloat(n) || 0) * 100) / 100;
+    const today  = new Date();
+    const ist    = new Date(today.getTime() + 5.5 * 3600000);
+    const yr     = ist.getUTCFullYear();
+    const mo     = ist.getUTCMonth();
+    const mStr   = `${yr}-${String(mo+1).padStart(2,'0')}`;
+    const mStart = `${mStr}-01`;
+    const mEnd   = new Date(yr, mo+1, 0).toISOString().slice(0,10);
+    const prevM  = `${yr}-${String(mo).padStart(2,'0')}`;
+    const prevStart = `${yr}-${String(mo).padStart(2,'0')}-01`;
+    const prevEnd   = new Date(yr, mo, 0).toISOString().slice(0,10);
+    const next30 = new Date(today.getTime() + 30*86400000).toISOString().slice(0,10);
+    const fyStart = `${mo >= 3 ? yr : yr-1}-04-01`;
+
+    const [
+      bankAccs, cifSetting,
+      salesThis, salesPrev,
+      webThis, webPrev,
+      b2bThis,
+      expThis, expPrev,
+      employees, attendance,
+      recurringExp,
+      bills,
+    ] = await Promise.all([
+      supabase.from('bank_accounts').select('name,current_balance').eq('is_active', true),
+      supabase.from('settings').select('value').eq('key','cash_in_factory').single(),
+      supabase.from('sales').select('final_amount').gte('date',mStart).lte('date',mEnd).in('status',['delivered','dispatched']),
+      supabase.from('sales').select('final_amount').gte('date',prevStart).lte('date',prevEnd).in('status',['delivered','dispatched']),
+      supabase.from('webstore_orders').select('total').gte('date',mStart).lte('date',mEnd).in('status',['confirmed','packed','shipped','delivered']),
+      supabase.from('webstore_orders').select('total').gte('date',prevStart).lte('date',prevEnd).in('status',['confirmed','packed','shipped','delivered']),
+      supabase.from('bank_transactions').select('amount,description,date').eq('type','credit').gte('date',mStart).lte('date',mEnd).ilike('description','%TUTR%'), // foreign inward / B2B wire
+      supabase.from('company_expenses').select('amount,category,date,description').gte('date',mStart).lte('date',mEnd).is('deleted_at',null),
+      supabase.from('company_expenses').select('amount').gte('date',prevStart).lte('date',prevEnd).is('deleted_at',null),
+      supabase.from('employees').select('id,name,role,pay_type,daily_rate,monthly_salary').eq('active',true),
+      supabase.from('attendance').select('employee_id,status').gte('date',mStart).lte('date',mEnd),
+      supabase.from('recurring_expenses').select('name,amount,due_day,category').eq('active',true),
+      supabase.from('vendor_bills').select('amount,gst_amount,paid_amount,due_date,vendor_name').in('status',['unpaid','partial','overdue']).lte('due_date',next30),
+    ]);
+
+    // ── Cash ──────────────────────────────────────────────────────────────────
+    const bankBalance = r2((bankAccs.data||[]).reduce((s,a)=>s+(a.current_balance||0),0));
+    const cashInFactory = r2(cifSetting.data?.value?.amount || 0);
+    const totalCash = r2(bankBalance + cashInFactory);
+
+    // ── Sales ─────────────────────────────────────────────────────────────────
+    const localSales   = r2((salesThis.data||[]).reduce((s,x)=>s+parseFloat(x.final_amount||0),0));
+    const webSales     = r2((webThis.data||[]).reduce((s,x)=>s+parseFloat(x.total||0),0));
+    // B2B: use bank credits tagged as foreign inward + b2b_orders total_value
+    const b2bWire      = r2((b2bThis.data||[]).reduce((s,x)=>s+parseFloat(x.amount||0),0));
+    const { data: b2bOrds } = await supabase.from('b2b_orders').select('total_value').gte('date', mStart).not('stage','eq','cancelled');
+    const b2bOrdsVal   = r2((b2bOrds||[]).reduce((s,x)=>s+parseFloat(x.total_value||0),0));
+    const b2bSales     = r2(Math.max(b2bWire, b2bOrdsVal));
+    const totalSales   = r2(localSales + webSales + b2bSales);
+
+    // Previous month sales for growth
+    const prevLocalSales = r2((salesPrev.data||[]).reduce((s,x)=>s+parseFloat(x.final_amount||0),0));
+    const prevWebSales   = r2((webPrev.data||[]).reduce((s,x)=>s+parseFloat(x.total||0),0));
+    const prevTotalSales = r2(prevLocalSales + prevWebSales);
+    const salesGrowth    = prevTotalSales > 0 ? r2((totalSales - prevTotalSales) / prevTotalSales * 100) : null;
+
+    // ── Expenses ──────────────────────────────────────────────────────────────
+    const actualExpenses = r2((expThis.data||[]).reduce((s,x)=>s+parseFloat(x.amount||0),0));
+    const prevExpenses   = r2((expPrev.data||[]).reduce((s,x)=>s+parseFloat(x.amount||0),0));
+    const expByCat       = {};
+    for (const e of (expThis.data||[])) expByCat[e.category] = r2((expByCat[e.category]||0)+parseFloat(e.amount||0));
+
+    // ── Salary (auto from attendance) ────────────────────────────────────────
+    const workDays = {};
+    for (const a of (attendance.data||[])) {
+      if (a.status==='present')  workDays[a.employee_id] = (workDays[a.employee_id]||0)+1;
+      if (a.status==='half-day') workDays[a.employee_id] = (workDays[a.employee_id]||0)+0.5;
+    }
+    const salaryBreakdown = (employees.data||[]).map(e => {
+      const days   = workDays[e.id] || 0;
+      const earned = e.pay_type==='daily' ? r2(days*(e.daily_rate||0)) : r2(e.monthly_salary||0);
+      return { name: e.name, role: e.role, days, earned };
+    });
+    const totalSalary = r2(salaryBreakdown.reduce((s,e)=>s+e.earned,0));
+
+    // ── Forecast / upcoming ───────────────────────────────────────────────────
+    const recurringTotal = r2((recurringExp.data||[]).reduce((s,r)=>s+(r.amount||0),0));
+    const billsDue30     = r2((bills.data||[]).reduce((s,b)=>s+Math.max(0,r2((b.amount||0)+(b.gst_amount||0)-(b.paid_amount||0))),0));
+    const projectedTotal = r2(totalSalary + recurringTotal + actualExpenses + billsDue30);
+    const netPosition    = r2(totalCash - projectedTotal);
+    const profitLoss     = r2(totalSales - actualExpenses - totalSalary);
+
+    const cashStatus = netPosition >= 50000 ? 'healthy' : netPosition >= 0 ? 'tight' : 'shortage';
+
+    res.json({
+      month: mStr, as_of: today.toISOString().slice(0,10),
+      cash: { bank: bankBalance, factory: cashInFactory, total: totalCash },
+      sales: {
+        local: localSales, website: webSales, b2b: b2bSales, total: totalSales,
+        prev_total: prevTotalSales, growth_pct: salesGrowth,
+        local_count: (salesThis.data||[]).length,
+        web_count: (webThis.data||[]).length,
+      },
+      expenses: {
+        actual: actualExpenses, prev_month: prevExpenses, by_category: expByCat,
+        salary: totalSalary, salary_breakdown: salaryBreakdown,
+        recurring: recurringTotal,
+        bills_due_30: billsDue30,
+        projected_total: projectedTotal,
+      },
+      bottom_line: { profit_loss: profitLoss, net_cash_after_expenses: netPosition, status: cashStatus },
+    });
+  } catch (e) {
+    console.error('[SimpleDashboard]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/ca-agent/run — trigger a manual run via monitor-api on the host
 // (backend runs in Docker; ca-agent.js needs host node + node_modules)
 router.post('/run', auth, roleGuard, async (req, res) => {

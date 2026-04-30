@@ -37,7 +37,12 @@ router.get('/', auth, async (req, res) => {
 // ── POST create PO ────────────────────────────────────────────────────────────
 router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
   try {
-    const { vendor_id, vendor_name, vendor_gst, date, expected_delivery, items, gst_pct, notes, bill_no } = req.body;
+    const {
+      vendor_id, vendor_name, vendor_gst, date, expected_delivery,
+      items, gst_pct, notes, bill_no,
+      // Direct purchase fields
+      direct_purchase, payment_method, payment_ref, bank_account_id,
+    } = req.body;
     if (!vendor_name || !date) return res.status(400).json({ error: 'vendor_name and date required' });
     if (!items || !items.length) return res.status(400).json({ error: 'at least one item required' });
 
@@ -46,39 +51,90 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
     const gstAmt   = round2(subtotal * gstPct / 100);
     const total    = round2(subtotal + gstAmt);
 
-    // Auto-generate PO number: POSA{YYYYMMMDD}-{seq} e.g. POSA2026APR18-01
-    const now = new Date();
-    const yr  = now.getFullYear();
-    const mon = now.toLocaleString('en-US',{month:'short'}).toUpperCase();
-    const day = String(now.getDate()).padStart(2,'0');
+    // Auto-generate PO number — use the selected date, not today
+    const poDate = new Date(date + 'T00:00:00');
+    const yr  = poDate.getFullYear();
+    const mon = poDate.toLocaleString('en-US',{month:'short'}).toUpperCase();
+    const day = String(poDate.getDate()).padStart(2,'0');
     const dateTag = `${yr}${mon}${day}`;
     const { count } = await supabase.from('packing_procurement').select('*', { count: 'exact', head: true });
     const poNumber  = `POSA${dateTag}-${String((count||0)+1).padStart(2,'0')}`;
 
+    const mappedItems = items.map(i => ({
+      material_id:  i.material_id,
+      name:         i.name,
+      spec:         i.spec || '',
+      unit:         i.unit || 'pcs',
+      qty:          parseFloat(i.qty)||0,
+      unit_price:   parseFloat(i.unit_price)||0,
+      received_qty: 0,
+    }));
+
+    // Auto-create vendor in vendor master if not linked
+    let resolvedVendorId = vendor_id || null;
+    if (!resolvedVendorId && vendor_name) {
+      const { data: existing } = await supabase.from('vendors')
+        .select('id').ilike('display_name', vendor_name.trim()).limit(1).single();
+      if (existing) {
+        resolvedVendorId = existing.id;
+      } else {
+        const { data: newVendor } = await supabase.from('vendors').insert({
+          display_name: vendor_name.trim(),
+          company_name: vendor_name.trim(),
+          gstin: vendor_gst || '',
+          category: 'Packing Materials',
+          active: true,
+          created_at: new Date().toISOString(),
+        }).select('id').single();
+        if (newVendor) resolvedVendorId = newVendor.id;
+      }
+    }
+
     const { data, error } = await supabase.from('packing_procurement').insert({
-      po_number: poNumber,
-      vendor_id: vendor_id || null,
-      vendor_name: vendor_name.trim(),
-      vendor_gst: vendor_gst || '',
-      date, expected_delivery: expected_delivery || null,
-      status: 'pending',
-      items: items.map(i => ({
-        material_id: i.material_id,
-        name: i.name,
-        spec: i.spec || '',
-        unit: i.unit || 'pcs',
-        qty: parseFloat(i.qty)||0,
-        unit_price: parseFloat(i.unit_price)||0,
-        received_qty: 0,
-      })),
+      po_number:    poNumber,
+      vendor_id:    resolvedVendorId,
+      vendor_name:  vendor_name.trim(),
+      vendor_gst:   vendor_gst || '',
+      date,
+      expected_delivery: expected_delivery || null,
+      status:       'pending',
+      payment_status: direct_purchase ? 'paid' : 'unpaid',
+      payment_method: payment_method || null,
+      payment_ref:  payment_ref || null,
+      items:        mappedItems,
       subtotal, gst_pct: gstPct, gst_amt: gstAmt, total,
-      notes: notes || '',
-      bill_no: bill_no || '',
-      payable_id: null,
-      created_by: req.user?.email || '',
+      notes:        notes || '',
+      bill_no:      bill_no || '',
+      payable_id:   null,
+      created_by:   req.user?.email || '',
     }).select().single();
 
     if (error) return res.status(400).json({ error: error.message });
+
+    // ── Direct purchase: record bank debit only (stock updates on Receive) ────
+    if (direct_purchase && data) {
+      if (bank_account_id) {
+        await supabase.from('bank_transactions').insert({
+          account_id:  bank_account_id,
+          date,
+          type:        'debit',
+          amount:      total,
+          description: `Packing purchase — ${vendor_name} (${poNumber})`,
+          reference:   payment_ref || poNumber,
+          category:    'Packing Materials',
+          reconciled:  false,
+        });
+        // Update bank account balance
+        const { data: acct } = await supabase.from('bank_accounts')
+          .select('current_balance').eq('id', bank_account_id).single();
+        if (acct) {
+          await supabase.from('bank_accounts').update({
+            current_balance: round2((parseFloat(acct.current_balance)||0) - total),
+          }).eq('id', bank_account_id);
+        }
+      }
+    }
+
     res.status(201).json(data);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -89,7 +145,7 @@ router.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
     const { vendor_id, vendor_name, vendor_gst, date, expected_delivery, items, gst_pct, notes, bill_no, status, vendor_bill_no, bill_scan_url } = req.body;
     const updates = { updated_at: new Date().toISOString() };
 
-    if (vendor_id   !== undefined) updates.vendor_id = vendor_id;
+    if (vendor_id   !== undefined) updates.vendor_id = vendor_id || null;
     if (vendor_name !== undefined) updates.vendor_name = vendor_name;
     if (vendor_gst  !== undefined) updates.vendor_gst = vendor_gst;
     if (date        !== undefined) updates.date = date;
@@ -245,6 +301,89 @@ router.post('/:id/attach-bill', auth, requireRole('admin','manager'), upload.sin
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── POST /:id/mark-paid — retroactively mark existing PO as directly paid ───────
+router.post('/:id/mark-paid', auth, requireRole('admin','manager'), async (req, res) => {
+  try {
+    const { payment_method, payment_ref, bank_account_id, paid_date } = req.body;
+    if (!payment_method) return res.status(400).json({ error: 'payment_method required' });
+
+    // Load PO
+    const { data: po, error: poErr } = await supabase.from('packing_procurement').select('*').eq('id', req.params.id).single();
+    if (poErr || !po) return res.status(404).json({ error: 'PO not found' });
+    if (po.payment_status === 'paid') return res.status(400).json({ error: 'PO is already marked as paid' });
+
+    const txDate = paid_date || new Date().toISOString().slice(0,10);
+
+    // If PO items not yet received, mark them received and update stock
+    if (po.status !== 'received') {
+      for (const item of (po.items || [])) {
+        const matId = item.material_id;
+        const qty   = parseFloat(item.qty) || 0;
+        if (!matId || qty <= 0) continue;
+
+        const { data: mat } = await supabase.from('packing_materials').select('current_stock,avg_cost').eq('id', matId).single();
+        if (!mat) continue;
+
+        const curStock = parseFloat(mat.current_stock) || 0;
+        const curAvg   = parseFloat(mat.avg_cost) || 0;
+        const unitPrice = parseFloat(item.unit_price) || 0;
+        const newAvg = curStock + qty > 0
+          ? round2((curStock * curAvg + qty * unitPrice) / (curStock + qty))
+          : unitPrice;
+
+        await supabase.from('packing_materials').update({
+          current_stock: curStock + qty,
+          avg_cost: newAvg,
+          unit_price: newAvg,
+          updated_at: new Date().toISOString(),
+        }).eq('id', matId);
+
+        // Update received_qty on item
+        item.received_qty = qty;
+      }
+    }
+
+    // Optionally create bank debit
+    if (bank_account_id) {
+      const { data: bank } = await supabase.from('bank_accounts').select('current_balance,name').eq('id', bank_account_id).single();
+      if (bank) {
+        const total = parseFloat(po.total) || 0;
+        const newBal = round2((parseFloat(bank.current_balance) || 0) - total);
+        await supabase.from('bank_transactions').insert({
+          bank_account_id,
+          date: txDate,
+          type: 'debit',
+          amount: total,
+          description: `Packing Materials — PO ${po.po_number}`,
+          reference: payment_ref || '',
+          category: 'Packing Materials',
+          created_by: req.user?.email || '',
+          created_at: new Date().toISOString(),
+        });
+        await supabase.from('bank_accounts').update({
+          current_balance: newBal,
+          updated_at: new Date().toISOString(),
+        }).eq('id', bank_account_id);
+      }
+    }
+
+    // Update PO
+    const poUpdates = {
+      payment_status: 'paid',
+      payment_method,
+      payment_ref: payment_ref || null,
+      status: 'received',
+      items: po.items,
+      updated_at: new Date().toISOString(),
+    };
+
+    const { data: updated, error: upErr } = await supabase.from('packing_procurement').update(poUpdates).eq('id', req.params.id).select().single();
+    if (upErr) return res.status(400).json({ error: upErr.message });
+
+    res.json(updated);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── POST /admin/migrate-po-numbers — one-time migration to new PO number format ──
 router.post('/admin/migrate-po-numbers', auth, requireRole('admin'), async (req, res) => {
   try {
@@ -286,6 +425,63 @@ router.post('/admin/migrate-po-numbers', auth, requireRole('admin'), async (req,
     }
 
     res.json({ ok: true, total: all.length, migrated: updated, renames });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /:id/add-logistics — add transport/delivery cost, split across items by qty ──
+router.post('/:id/add-logistics', auth, requireRole('admin','manager'), async (req, res) => {
+  try {
+    const { logistics_cost, logistics_ref, bank_account_id, paid_date } = req.body;
+    const amount = parseFloat(logistics_cost);
+    if (!amount || amount <= 0) return res.status(400).json({ error: 'logistics_cost required' });
+
+    const { data: po, error: poErr } = await supabase.from('packing_procurement').select('*').eq('id', req.params.id).single();
+    if (poErr || !po) return res.status(404).json({ error: 'PO not found' });
+
+    const totalQty = (po.items || []).reduce((s, i) => s + (parseFloat(i.qty) || 0), 0);
+    if (!totalQty) return res.status(400).json({ error: 'No items with qty on this PO' });
+
+    // Split logistics by qty, update each item's unit_price
+    const updatedItems = (po.items || []).map(item => {
+      const qty = parseFloat(item.qty) || 0;
+      const share = round2(amount * qty / totalQty);
+      const logPerUnit = round2(share / (qty || 1));
+      return { ...item, unit_price: round2((parseFloat(item.unit_price) || 0) + logPerUnit), logistics_allocated: share };
+    });
+
+    const newTotal = round2((parseFloat(po.total) || 0) + amount);
+
+    await supabase.from('packing_procurement').update({
+      items: updatedItems,
+      logistics_cost: round2((parseFloat(po.logistics_cost) || 0) + amount),
+      logistics_ref: logistics_ref || null,
+      total: newTotal,
+      updated_at: new Date().toISOString(),
+    }).eq('id', req.params.id);
+
+    // Record bank debit if bank account given
+    if (bank_account_id) {
+      const txDate = paid_date || new Date().toISOString().slice(0, 10);
+      const { data: bank } = await supabase.from('bank_accounts').select('current_balance').eq('id', bank_account_id).single();
+      await supabase.from('bank_transactions').insert({
+        bank_account_id,
+        date: txDate,
+        type: 'debit',
+        amount,
+        description: `Logistics — PO ${po.po_number} (${po.vendor_name})`,
+        reference: logistics_ref || po.po_number,
+        category: 'Logistics',
+        created_by: req.user?.email || '',
+        created_at: new Date().toISOString(),
+      });
+      if (bank) {
+        await supabase.from('bank_accounts').update({
+          current_balance: round2((parseFloat(bank.current_balance) || 0) - amount),
+        }).eq('id', bank_account_id);
+      }
+    }
+
+    res.json({ ok: true, logistics_cost: amount, new_total: newTotal });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 

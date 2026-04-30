@@ -18,6 +18,36 @@ const mailer = nodemailer.createTransport({
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) { console.error('FATAL: JWT_SECRET not set'); process.exit(1); }
 
+// ── Admin WhatsApp notifier (both numbers, template fallback) ─────────────────
+const cartNotifyThrottle = new Map(); // custId → timestamp, throttle cart alerts to 1/hr
+async function notifyAdmins(message) {
+  const token   = process.env.BOTSAILOR_API_TOKEN;
+  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
+  if (!token || !phoneId) return;
+  const numbers = [process.env.WA_ADMIN_PHONE1, process.env.WA_ADMIN_PHONE2]
+    .filter(Boolean).map(n => n.replace(/\D/g, '')).filter((v,i,a) => v && a.indexOf(v)===i);
+  for (const phone of numbers) {
+    try {
+      // Try free text
+      const params = new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message });
+      const r = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
+        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString(),
+      });
+      const d = await r.json();
+      if (d.status === '1' || d.status === 1) continue;
+      // Fallback to template (strip newlines for Meta compliance)
+      const tp = new URLSearchParams({
+        apiToken: token, phoneNumberID: phoneId, botTemplateID: '356870',
+        sendToPhoneNumber: phone,
+        'templateVariable-1': 'Admin',
+        'templateVariable-2': message.replace(/\n/g, ' | ').replace(/\*|_/g, '').slice(0, 150),
+        'templateVariable-3': '—', 'templateVariable-4': 'admin.sathvam.in', 'templateVariable-5': '—',
+      });
+      await fetch(`https://botsailor.com/api/v1/whatsapp/send/template?${tp.toString()}`, { method: 'POST' });
+    } catch (e) { console.error('notifyAdmins WA error:', e.message); }
+  }
+}
+
 // Cookie options for customer JWT (httpOnly — XSS-safe)
 // sameSite:'none' + domain:'.sathvam.in' allows the cookie to be sent cross-subdomain
 // (sathvam.in → api.sathvam.in). Requires secure:true (HTTPS only).
@@ -69,6 +99,14 @@ router.post('/signup', async (req, res) => {
 
     // Fire-and-forget admin notification
     setImmediate(async () => {
+      // WhatsApp alert to admins
+      notifyAdmins(
+        `🆕 *New Customer Signup*\n\n` +
+        `👤 *${plain.name}*\n` +
+        `📞 ${plain.phone || '—'}\n` +
+        `📧 ${normEmail}\n\n` +
+        `🔗 admin.sathvam.in → Webstore Orders → CRM`
+      ).catch(() => {});
       try {
         const adminEmail = process.env.SMTP_USER;
         if (!adminEmail) return;
@@ -358,6 +396,21 @@ router.post('/cart', custAuth, async (req, res) => {
         { session_id: sessionId, items, updated_at: new Date().toISOString() },
         { onConflict: 'session_id' }
       );
+      // Notify admins — throttle to once per hour per customer
+      const custId = req.customer.id;
+      const lastNotify = cartNotifyThrottle.get(custId) || 0;
+      if (Date.now() - lastNotify > 60 * 60 * 1000) {
+        cartNotifyThrottle.set(custId, Date.now());
+        const itemList = items.map(i => `• ${i.name} × ${i.qty || 1}`).join('\n');
+        const total    = items.reduce((s, i) => s + (parseFloat(i.price || i.website_price || 0) * (i.qty || 1)), 0);
+        notifyAdmins(
+          `🛒 *Cart Activity*\n\n` +
+          `👤 ${req.customer.name || 'Customer'}\n\n` +
+          `📋 *Items:*\n${itemList}\n\n` +
+          `💰 Est. Total: ₹${total.toLocaleString('en-IN')}\n\n` +
+          `🔗 admin.sathvam.in → Webstore Orders`
+        ).catch(() => {});
+      }
     }
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }

@@ -14,6 +14,8 @@
 
 const express   = require('express');
 const Anthropic  = require('@anthropic-ai/sdk');
+const crypto     = require('crypto');
+const Razorpay   = require('razorpay');
 const { createClient } = require('@supabase/supabase-js');
 const { auth } = require('../middleware/auth');
 
@@ -229,6 +231,229 @@ async function storeMessage(fields) {
   if (error) console.error('WA store message error:', error.message);
 }
 
+// ── Flow: order number generator ─────────────────────────────────────────────
+const FLOW_MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+async function generateFlowOrderNo() {
+  const today  = new Date().toISOString().slice(0, 10);
+  const d      = new Date();
+  const prefix = `SA${d.getFullYear()}${FLOW_MONTHS[d.getMonth()]}${String(d.getDate()).padStart(2, '0')}`;
+  const [s, w] = await Promise.all([
+    supabase.from('sales').select('id', { count: 'exact', head: true }).eq('date', today),
+    supabase.from('webstore_orders').select('id', { count: 'exact', head: true }).eq('date', today),
+  ]);
+  const seq = ((s.count || 0) + (w.count || 0) + 1);
+  return `${prefix}-${String(seq).padStart(2, '0')}`;
+}
+
+// ── Flow: BotSailor send helper ───────────────────────────────────────────────
+async function sendFlowViaBotSailor(phone, message) {
+  const token   = process.env.BOTSAILOR_API_TOKEN;
+  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
+  if (!token || !phoneId) return false;
+  try {
+    const res = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body:    new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message }).toString(),
+    });
+    const data = await res.json();
+    return data.status === '1' || data.status === 1;
+  } catch (e) {
+    console.error('Flow BotSailor send error:', e.message);
+    return false;
+  }
+}
+
+// ── Flow: handle nfm_reply submission ────────────────────────────────────────
+async function handleFlowSubmission(fromPhone, nfmReply) {
+  try {
+    let payload;
+    try {
+      payload = JSON.parse(nfmReply.response_json || '{}');
+    } catch (e) {
+      console.error('WA Flow: invalid response_json', e.message);
+      return;
+    }
+
+    const { product1, qty1, product2, qty2, cust_name, cust_phone, address, city, state, pincode } = payload;
+
+    if (!product1 || !qty1 || !cust_name || !address) {
+      console.error('WA Flow: missing required fields', JSON.stringify(payload));
+      await sendFlowViaBotSailor(fromPhone, '❌ Order submission incomplete. Please try again or call +91 70921 77092.');
+      return;
+    }
+
+    // Look up products by UUID
+    const productIds = [product1];
+    if (product2 && product2 !== 'none') productIds.push(product2);
+
+    const { data: products, error: prodErr } = await supabase
+      .from('products')
+      .select('id,name,website_price,price,pack_size,pack_unit,unit')
+      .in('id', productIds);
+
+    if (prodErr || !products?.length) {
+      console.error('WA Flow: product lookup failed', prodErr?.message);
+      await sendFlowViaBotSailor(fromPhone, '❌ Product lookup failed. Please call +91 70921 77092.');
+      return;
+    }
+
+    const prodMap = {};
+    for (const p of products) prodMap[p.id] = p;
+
+    // Build items
+    const items = [];
+    const p1 = prodMap[product1];
+    if (p1) {
+      const price = p1.website_price || p1.price || 0;
+      const qty   = Math.max(1, parseInt(qty1) || 1);
+      const pack  = `${p1.pack_size || ''}${p1.pack_unit || p1.unit || ''}`.trim();
+      items.push({ id: p1.id, name: `${p1.name}${pack ? ' ' + pack : ''}`, qty, price });
+    }
+    if (product2 && product2 !== 'none') {
+      const p2  = prodMap[product2];
+      const qty = Math.max(0, parseInt(qty2) || 0);
+      if (p2 && qty > 0) {
+        const price = p2.website_price || p2.price || 0;
+        const pack  = `${p2.pack_size || ''}${p2.pack_unit || p2.unit || ''}`.trim();
+        items.push({ id: p2.id, name: `${p2.name}${pack ? ' ' + pack : ''}`, qty, price });
+      }
+    }
+
+    if (!items.length) {
+      await sendFlowViaBotSailor(fromPhone, '❌ No valid products in order. Please try again.');
+      return;
+    }
+
+    // Calculate totals
+    const subtotal = items.reduce((sum, i) => sum + i.qty * i.price, 0);
+    const gst      = Math.round(subtotal * 0.05 * 100) / 100;
+    const shipping  = subtotal >= 499 ? 0 : 50;
+    const total     = Math.round((subtotal + gst + shipping) * 100) / 100;
+
+    // Generate order number
+    const orderNo = await generateFlowOrderNo();
+    const dbId    = crypto.randomUUID();
+
+    // Customer data (stored plain — not PII-encrypted here since no login)
+    const waPhone  = fromPhone.replace(/\D/g, '');
+    const formPhone = (cust_phone || '').replace(/\D/g, '');
+    const customer = {
+      name:    cust_name.trim(),
+      phone:   formPhone || waPhone,
+      address: address.trim(),
+      city:    (city    || '').trim(),
+      state:   (state   || '').trim(),
+      pincode: (pincode || '').trim(),
+      wa_phone: waPhone,
+    };
+
+    // Save order with pending payment
+    const { error: insertErr } = await supabase.from('webstore_orders').insert({
+      id:             dbId,
+      order_no:       orderNo,
+      date:           new Date().toISOString().slice(0, 10),
+      customer,
+      items,
+      subtotal,
+      gst,
+      shipping,
+      total,
+      status:         'new',
+      payment_status: 'pending',
+      channel:        'whatsapp_flow',
+      notes:          `WhatsApp Flow | wa: ${waPhone}`,
+    });
+
+    if (insertErr) {
+      console.error('WA Flow: order insert failed', insertErr.message);
+      await sendFlowViaBotSailor(fromPhone, '❌ Could not save your order. Please call +91 70921 77092.');
+      return;
+    }
+
+    // Create Razorpay Payment Link
+    let payUrl = null;
+    try {
+      const rzp = new Razorpay({
+        key_id:     process.env.RAZORPAY_KEY_ID,
+        key_secret: process.env.RAZORPAY_KEY_SECRET,
+      });
+      const custContact = customer.phone.startsWith('91')
+        ? `+${customer.phone}`
+        : `+91${customer.phone.slice(-10)}`;
+
+      const payLink = await rzp.paymentLink.create({
+        amount:          Math.round(total * 100),
+        currency:        'INR',
+        accept_partial:  false,
+        description:     `Sathvam Order ${orderNo}`,
+        customer:        { name: customer.name, contact: custContact },
+        notify:          { sms: true, email: false },
+        reminder_enable: true,
+        notes:           { order_no: orderNo, order_id: dbId, channel: 'whatsapp_flow' },
+      });
+      payUrl = payLink.short_url;
+
+      // Store payment link ID in notes
+      await supabase.from('webstore_orders')
+        .update({ notes: `WhatsApp Flow | wa: ${waPhone} | rzp_link: ${payLink.id}` })
+        .eq('id', dbId);
+    } catch (rzpErr) {
+      console.error('WA Flow: Razorpay link creation failed', rzpErr.message);
+      // Order is saved — continue without payment link, admin will follow up
+    }
+
+    // Send order summary + payment link to customer
+    const itemList = items.map(i =>
+      `  • ${i.name} × ${i.qty} — ₹${(i.qty * i.price).toLocaleString('en-IN')}`
+    ).join('\n');
+
+    const custMsg =
+      `🌿 *Sathvam — Order Received!*\n\n` +
+      `📋 *Order No:* ${orderNo}\n\n` +
+      `*Items:*\n${itemList}\n\n` +
+      `─────────────────\n` +
+      `Subtotal: ₹${subtotal.toLocaleString('en-IN')}\n` +
+      (gst > 0 ? `GST (5%):  ₹${gst.toLocaleString('en-IN')}\n` : '') +
+      `Shipping:  ${shipping > 0 ? '₹' + shipping : 'FREE 🎉'}\n` +
+      `*Total: ₹${total.toLocaleString('en-IN')}*\n\n` +
+      `📍 *Deliver to:*\n${[customer.address, customer.city, customer.state, customer.pincode].filter(Boolean).join(', ')}\n\n` +
+      (payUrl
+        ? `💳 *Pay securely here:*\n${payUrl}\n\n_Your order will be processed once payment is received._`
+        : `💳 Our team will send you a payment link shortly.\n📞 For queries: +91 70921 77092`) +
+      `\n\n_Thank you for choosing Sathvam! 🙏_`;
+
+    await sendFlowViaBotSailor(fromPhone, custMsg);
+
+    // Notify admins
+    const adminNumbers = [
+      process.env.WA_ADMIN_PHONE1,
+      process.env.WA_ADMIN_PHONE2,
+    ].filter(Boolean).map(n => n.replace(/\D/g, '')).filter(Boolean);
+
+    const adminMsg =
+      `🛒 *New WhatsApp Flow Order — ${orderNo}*\n\n` +
+      `👤 ${customer.name}\n` +
+      `📞 ${customer.phone}\n` +
+      `📍 ${[customer.city, customer.state].filter(Boolean).join(', ')}\n\n` +
+      `📋 ${items.map(i => `${i.name} × ${i.qty}`).join(', ')}\n` +
+      `💰 Total: ₹${total.toLocaleString('en-IN')}\n` +
+      (payUrl ? `🔗 Pay link sent ✅` : `⚠️ Pay link FAILED — send manually`) +
+      `\n\n🔗 admin.sathvam.in → Webstore Orders`;
+
+    for (const ap of adminNumbers) {
+      try { await sendFlowViaBotSailor(ap, adminMsg); } catch (e) {}
+    }
+
+    console.log(`WA Flow order created: ${orderNo} | total: ₹${total} | from: ${waPhone}`);
+  } catch (err) {
+    console.error('WA Flow submission error:', err.message);
+    try {
+      await sendFlowViaBotSailor(fromPhone, '❌ Something went wrong. Please call +91 70921 77092 to place your order.');
+    } catch (e) {}
+  }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /api/whatsapp/webhook  — Meta webhook challenge verification
 // ─────────────────────────────────────────────────────────────────────────────
@@ -294,6 +519,12 @@ router.post('/webhook', express.json(), async (req, res) => {
             status:        'received',
             timestamp:     new Date(parseInt(msg.timestamp) * 1000).toISOString(),
           });
+
+          // ── WhatsApp Flow submission ──────────────────────────────────────
+          if (msg.type === 'interactive' && msg.interactive?.type === 'nfm_reply') {
+            setImmediate(() => handleFlowSubmission(phone, msg.interactive.nfm_reply));
+            continue;
+          }
 
           // ── Auto-reply (text messages only) ──────────────────────────────
           if (!AI_REPLIES_ENABLED || msg.type !== 'text' || !content.trim()) continue;

@@ -574,7 +574,28 @@ const procurement = express.Router();
 procurement.get('/', auth, async (req, res) => {
   const { data, error } = await supabase.from('procurements').select('*').order('date', { ascending: false }).limit(1000);
   if (error) return res.status(500).json({ error: 'Failed to load procurements' });
-  res.json(data);
+  // Map snake_case DB fields to camelCase for frontend
+  const mapped = (data||[]).map(p => ({
+    ...p,
+    commodityId:       p.commodity_id,
+    commodityName:     p.commodity_name,
+    vendorId:          p.vendor_id,
+    orderedQty:        p.ordered_qty,
+    orderedPricePerKg: p.ordered_price_per_kg,
+    receivedQty:       p.received_qty,
+    cleanedQty:        p.cleaned_qty,
+    receivedDate:      p.received_date,
+    cleanedDate:       p.cleaned_date,
+    paymentStatus:     p.payment_status || 'unpaid',
+    paymentMethod:     p.payment_method,
+    paymentRef:        p.payment_ref,
+    invoiceAmount:     p.invoice_amount,
+    advancePaid:       p.advance_paid,
+    finalPaid:         p.final_paid,
+    logisticsCostPerKg: p.logistics_cost_per_kg,
+    landedCostPerKg:   p.landed_cost_per_kg,
+  }));
+  res.json(mapped);
 });
 procurement.post('/', auth, requireRole('admin','manager'), async (req, res) => {
   const p = req.body;
@@ -602,7 +623,10 @@ procurement.put('/:id', auth, requireRole('admin','manager'), async (req, res) =
     gst:parseFloat(p.gst)||0,
     received_qty:p.receivedQty||null, received_date:p.receivedDate||null,
     cleaned_qty:p.cleanedQty||null, cleaned_date:p.cleanedDate||null,
-    status:p.status, notes:p.notes||''
+    status:p.status, notes:p.notes||'',
+    payment_status:p.paymentStatus||null, payment_method:p.paymentMethod||null,
+    payment_ref:p.paymentRef||null, invoice_amount:p.invoiceAmount||null,
+    advance_paid:p.advancePaid||null, final_paid:p.finalPaid||null
   }).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: error.message });
 
@@ -646,6 +670,112 @@ procurement.put('/:id', auth, requireRole('admin','manager'), async (req, res) =
 procurement.delete('/:id', auth, requireRole('admin'), async (req, res) => {
   await supabase.from('procurements').delete().eq('id', req.params.id);
   res.json({ message: 'Deleted' });
+});
+
+// ── POST /procurement/mark-paid — mark entire PO group as paid ──────────────────
+procurement.post('/mark-paid', auth, requireRole('admin','manager'), async (req, res) => {
+  try {
+    const { purchase_order_id, payment_method, payment_ref, bank_account_id, paid_date, total_amount } = req.body;
+    if (!purchase_order_id) return res.status(400).json({ error: 'purchase_order_id required' });
+    if (!payment_method)    return res.status(400).json({ error: 'payment_method required' });
+
+    const { data: entries, error: fetchErr } = await supabase.from('procurements')
+      .select('id,ordered_qty,ordered_price_per_kg,gst,supplier')
+      .eq('purchase_order_id', purchase_order_id);
+    if (fetchErr || !entries?.length) return res.status(404).json({ error: 'No entries found' });
+
+    const totalAmt = parseFloat(total_amount) || entries.reduce((s,e) => {
+      const base = (parseFloat(e.ordered_qty)||0) * (parseFloat(e.ordered_price_per_kg)||0);
+      return s + base * (1 + (parseFloat(e.gst)||0)/100);
+    }, 0);
+
+    // Update all entries in group
+    const txDate = paid_date || new Date().toISOString().slice(0,10);
+    await supabase.from('procurements').update({
+      payment_status: 'paid',
+      payment_method,
+      payment_ref: payment_ref || null,
+      final_paid:  Math.round(totalAmt * 100) / 100,
+      invoice_amount: Math.round(totalAmt * 100) / 100,
+    }).eq('purchase_order_id', purchase_order_id);
+
+    // Record bank debit
+    if (bank_account_id) {
+      const { data: bank } = await supabase.from('bank_accounts').select('current_balance').eq('id', bank_account_id).single();
+      await supabase.from('bank_transactions').insert({
+        bank_account_id, date: txDate, type: 'debit', amount: Math.round(totalAmt*100)/100,
+        description: `Raw material purchase — ${entries[0]?.supplier} (${purchase_order_id})`,
+        reference: payment_ref || purchase_order_id, category: 'Raw Material Purchase',
+        created_by: req.user?.email || '', created_at: new Date().toISOString(),
+      });
+      if (bank) await supabase.from('bank_accounts').update({
+        current_balance: Math.round(((parseFloat(bank.current_balance)||0) - totalAmt)*100)/100,
+      }).eq('id', bank_account_id);
+    }
+    res.json({ ok: true, entries_updated: entries.length, total_amount: totalAmt });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── POST /procurement/add-logistics — split transport cost across a PO group by weight ──
+procurement.post('/add-logistics', auth, requireRole('admin','manager'), async (req, res) => {
+  try {
+    const { purchase_order_id, logistics_cost, logistics_ref, bank_account_id, paid_date } = req.body;
+    const amount = parseFloat(logistics_cost);
+    if (!purchase_order_id) return res.status(400).json({ error: 'purchase_order_id required' });
+    if (!amount || amount <= 0) return res.status(400).json({ error: 'logistics_cost required' });
+
+    // Load all entries in this PO group
+    const { data: entries, error: fetchErr } = await supabase.from('procurements')
+      .select('id,commodity_name,ordered_qty,ordered_price_per_kg,logistics_cost_per_kg')
+      .eq('purchase_order_id', purchase_order_id);
+    if (fetchErr || !entries?.length) return res.status(404).json({ error: 'No procurements found for this purchase_order_id' });
+
+    const totalQty = entries.reduce((s, e) => s + (parseFloat(e.ordered_qty) || 0), 0);
+    if (!totalQty) return res.status(400).json({ error: 'Total qty is zero' });
+
+    const costPerKg = Math.round((amount / totalQty) * 100) / 100;
+
+    // Update each entry: add logistics share to ordered_price_per_kg
+    for (const entry of entries) {
+      const qty = parseFloat(entry.ordered_qty) || 0;
+      const prevLogPerKg = parseFloat(entry.logistics_cost_per_kg) || 0;
+      const newLogPerKg  = Math.round((prevLogPerKg + costPerKg) * 100) / 100;
+      const newPricePerKg = Math.round(((parseFloat(entry.ordered_price_per_kg) || 0) + costPerKg) * 100) / 100;
+      const newLandedCost = newPricePerKg;
+
+      await supabase.from('procurements').update({
+        logistics_cost_per_kg: newLogPerKg,
+        landed_cost_per_kg:    newLandedCost,
+        ordered_price_per_kg:  newPricePerKg,
+        logistics_ref:         logistics_ref || null,
+        logistics_cost:        Math.round(((parseFloat(entry.logistics_cost) || 0) + (costPerKg * qty)) * 100) / 100,
+      }).eq('id', entry.id);
+    }
+
+    // Record bank debit if bank account given
+    if (bank_account_id) {
+      const txDate = paid_date || new Date().toISOString().slice(0, 10);
+      const { data: bank } = await supabase.from('bank_accounts').select('current_balance').eq('id', bank_account_id).single();
+      await supabase.from('bank_transactions').insert({
+        bank_account_id,
+        date: txDate,
+        type: 'debit',
+        amount,
+        description: `Logistics — PO ${purchase_order_id} (${entries[0]?.supplier || ''})`,
+        reference: logistics_ref || purchase_order_id,
+        category: 'Logistics',
+        created_by: req.user?.email || '',
+        created_at: new Date().toISOString(),
+      });
+      if (bank) {
+        await supabase.from('bank_accounts').update({
+          current_balance: Math.round(((parseFloat(bank.current_balance) || 0) - amount) * 100) / 100,
+        }).eq('id', bank_account_id);
+      }
+    }
+
+    res.json({ ok: true, purchase_order_id, logistics_cost: amount, cost_per_kg: costPerKg, entries_updated: entries.length });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 procurement.post('/bulk', auth, requireRole('admin','manager'), async (req, res) => {

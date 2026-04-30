@@ -4,7 +4,7 @@ const crypto       = require('crypto');
 const nodemailer   = require('nodemailer');
 const supabase     = require('../config/supabase');
 const { createInvoice, recordPayment } = require('../config/zoho');
-const { sendCustomerInvoice } = require('./webstoreOrders');
+const { sendCustomerInvoice, sendInvoiceWhatsApp } = require('./webstoreOrders');
 const { auth, requireRole } = require('../middleware/auth');
 const { encrypt, hmac, encryptCustomer } = require('../config/crypto');
 
@@ -90,7 +90,6 @@ async function sendViaBotSailor(phone, message, imageUrl = SATHVAM_LOGO_URL) {
 
 // ── WhatsApp order alert (to admin) ──────────────────────────────────────────
 async function sendWhatsAppAlert(order) {
-  // Notify all configured admin numbers
   const adminNumbers = [
     process.env.WA_NOTIFY_TO,
     process.env.WA_ADMIN_PHONE1,
@@ -99,21 +98,46 @@ async function sendWhatsAppAlert(order) {
 
   if (!adminNumbers.length) return;
 
-  const cust  = order.customer || {};
-  const items = (order.items || []).map(i => `• ${i.name} × ${i.qty}`).join('\n');
-  const text  =
-    `🛒 *New Webstore Order — ${order.orderNo || order.order_no}*\n\n` +
+  const cust     = order.customer || {};
+  const items    = (order.items || []).map(i => `• ${i.name} × ${i.qty}`).join('\n');
+  const orderNo  = order.orderNo || order.order_no || '—';
+  const total    = parseFloat(order.total || 0).toLocaleString('en-IN');
+  const text     =
+    `🛒 *New Webstore Order — ${orderNo}*\n\n` +
     `👤 *${cust.name || 'Guest'}*\n` +
     `📞 ${cust.phone || '—'}\n` +
     `📍 ${[cust.city, cust.state, cust.pincode].filter(Boolean).join(', ')}\n\n` +
     `📋 *Items:*\n${items}\n\n` +
-    `💰 *Total: ₹${parseFloat(order.total || 0).toLocaleString('en-IN')}*` +
+    `💰 *Total: ₹${total}*` +
     `${order.shipping ? `  |  🚚 Shipping: ₹${order.shipping}` : ''}\n` +
     `✅ Payment: ${order.paymentId || order.payment_id || 'Online'}\n\n` +
     `📦 Action: admin.sathvam.in → Webstore Orders`;
 
+  const token   = process.env.BOTSAILOR_API_TOKEN;
+  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
+
   for (const phone of adminNumbers) {
-    try { await sendViaBotSailor(phone, text); } catch (e) { console.error('Admin WA alert failed:', e.message); }
+    try {
+      // Try free text first
+      const ok = await sendViaBotSailor(phone, text, null);
+      if (ok) continue;
+
+      // Fallback to template (bypasses 24h window) — template 356870
+      const tplParams = new URLSearchParams({
+        apiToken:          token,
+        phoneNumberID:     phoneId,
+        botTemplateID:     '356870',
+        sendToPhoneNumber: phone,
+        'templateVariable-1': 'Admin',
+        'templateVariable-2': (order.items || []).map(i => `${i.name} × ${i.qty}`).join(', '),
+        'templateVariable-3': `₹${total}`,
+        'templateVariable-4': [cust.name, cust.phone, cust.city, cust.state].filter(Boolean).join(', '),
+        'templateVariable-5': orderNo,
+      });
+      await fetch(`https://botsailor.com/api/v1/whatsapp/send/template?${tplParams.toString()}`, { method: 'POST' });
+    } catch (e) {
+      console.error('Admin WA alert failed:', e.message);
+    }
   }
 }
 
@@ -298,6 +322,9 @@ router.post('/verify', async (req, res) => {
 
       // Invoice/confirmation email to customer
       await sendCustomerInvoice({ ...o, orderNo: generatedOrderNo }, razorpay_payment_id);
+
+      // WhatsApp invoice PDF to customer
+      await sendInvoiceWhatsApp({ ...o, order_no: generatedOrderNo });
 
       // Zoho Books invoice
       try {
