@@ -616,24 +616,42 @@ procurement.post('/', auth, requireRole('admin','manager'), async (req, res) => 
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
 
-  // If paid upfront (advance or fully), auto-create vendor bill linked to this PO
+  // If paid upfront (advance or fully), auto-create (or link to) vendor bill
+  // One invoice may cover multiple POs — check by vendor+invoice_no before creating
   if (['advance','paid'].includes(payStatus) && data) {
     setImmediate(async () => {
       try {
-        const qty    = parseFloat(p.orderedQty) || 0;
-        const rate   = parseFloat(p.orderedPricePerKg) || 0;
-        const amount = Math.round(qty * rate * 100) / 100;
-        const gstPct = parseFloat(p.gst) || 0;
-        const gstAmt = Math.round(amount * gstPct / 100 * 100) / 100;
+        const invoiceNo  = p.invoice_no || null;
+        const vendorName = p.supplier || 'Unknown Vendor';
+
+        // Check if a vendor bill already exists for this vendor + invoice number
+        if (invoiceNo) {
+          const { data: existBill } = await supabase.from('vendor_bills')
+            .select('id').ilike('vendor_name', vendorName).eq('bill_no', invoiceNo)
+            .is('deleted_at', null).limit(1).single();
+          if (existBill) {
+            await supabase.from('procurements').update({ payable_id: existBill.id }).eq('id', data.id);
+            console.log(`[AUTO] PO ${data.id} linked to existing vendor bill ${existBill.id} (invoice ${invoiceNo})`);
+            return;
+          }
+        }
+
+        const qty        = parseFloat(p.orderedQty) || 0;
+        const rate       = parseFloat(p.orderedPricePerKg) || 0;
+        const calcAmount = Math.round(qty * rate * 100) / 100;
+        const invoiceAmt = parseFloat(p.invoiceAmount) || 0;
+        const amount     = invoiceAmt > 0 ? invoiceAmt : calcAmount;
+        const gstPct     = parseFloat(p.gst) || 0;
+        const gstAmt     = invoiceAmt > 0 ? 0 : Math.round(calcAmount * gstPct / 100 * 100) / 100;
         if (amount <= 0) return;
 
         const advPaid    = parseFloat(p.advancePaid) || 0;
         const isFullPaid = payStatus === 'paid';
-        const paidAmt    = isFullPaid ? (amount + gstAmt) : advPaid;
+        const paidAmt    = isFullPaid ? amount : advPaid;
 
         const { data: payable } = await supabase.from('vendor_bills').insert({
-          vendor_name:  p.supplier || 'Unknown Vendor',
-          bill_no:      p.invoice_no || `PROC-${data.id}`,
+          vendor_name:  vendorName,
+          bill_no:      invoiceNo || `PROC-${data.id}`,
           bill_date:    p.date || new Date().toISOString().slice(0,10),
           due_date:     p.date || new Date().toISOString().slice(0,10),
           amount,
@@ -641,13 +659,13 @@ procurement.post('/', auth, requireRole('admin','manager'), async (req, res) => 
           paid_amount:  paidAmt,
           status:       isFullPaid ? 'paid' : 'partial',
           category:     'Raw Materials',
-          notes:        `${isFullPaid?'Paid immediately (upfront)':'Advance paid'}: ${p.commodityName} ${qty}kg @ ₹${rate}/kg${p.paymentRef?' | Ref: '+p.paymentRef:''}`,
+          notes:        `${isFullPaid?'Paid immediately (upfront)':'Advance paid'}: ${p.commodityName}${p.paymentRef?' | Ref: '+p.paymentRef:''}`,
           created_by:   req.user?.email || 'system',
         }).select('id').single();
 
         if (payable) {
           await supabase.from('procurements').update({ payable_id: payable.id }).eq('id', data.id);
-          console.log(`[AUTO] Vendor bill created (upfront payment) for procurement ${data.id}: ₹${amount}, paid ₹${paidAmt}`);
+          console.log(`[AUTO] Vendor bill created (upfront) for ${invoiceNo||'no-inv'}: ₹${amount}, paid ₹${paidAmt}`);
         }
       } catch(e) { console.error('[AUTO] Procurement upfront bill error:', e.message); }
     });
@@ -674,30 +692,61 @@ procurement.put('/:id', auth, requireRole('admin','manager'), async (req, res) =
   }).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: error.message });
 
-  // Auto-create vendor payable when status first changes to 'received' (goods arrived at factory)
-  // Only if not already paid upfront (advance/paid) — those already have a vendor bill from POST
+  // Auto-create (or link) vendor bill when status first changes to 'received' (goods arrived at factory)
+  // Payment model: one vendor invoice covers multiple POs from same delivery.
+  // So: if a vendor bill already exists for this vendor+invoice_no, link to it (don't create duplicate).
+  // Only if not already paid upfront (advance/paid) — those already have a vendor bill from POST.
   const alreadyPaidUpfront = ['advance','paid'].includes(p.paymentStatus||existing?.payment_status);
   if (p.status === 'received' && !['received','cleaned','stocked'].includes(existing?.status) && !existing?.payable_id && !alreadyPaidUpfront) {
     setImmediate(async () => {
       try {
-        const qty    = parseFloat(p.receivedQty || p.orderedQty) || 0;
-        const rate   = parseFloat(p.orderedPricePerKg) || 0;
-        const amount = Math.round(qty * rate * 100) / 100;
-        const gstPct = parseFloat(p.gst) || 0;
-        const gstAmt = Math.round(amount * gstPct / 100 * 100) / 100;
+        const invoiceNo  = p.invoice_no || null;
+        const vendorName = p.supplier || 'Unknown Vendor';
+
+        // Check if a vendor bill already exists for this vendor + invoice number
+        let existingBillId = null;
+        if (invoiceNo) {
+          const { data: existBill } = await supabase.from('vendor_bills')
+            .select('id')
+            .ilike('vendor_name', vendorName)
+            .eq('bill_no', invoiceNo)
+            .is('deleted_at', null)
+            .limit(1)
+            .single();
+          if (existBill) existingBillId = existBill.id;
+        }
+
+        if (existingBillId) {
+          // Link this PO to the existing vendor bill — same invoice, no duplicate
+          await supabase.from('procurements').update({ payable_id: existingBillId }).eq('id', req.params.id);
+          console.log(`[AUTO] PO ${req.params.id} linked to existing vendor bill ${existingBillId} (invoice ${invoiceNo})`);
+          return;
+        }
+
+        // No existing bill — create one using the actual invoice amount if available
+        const qty         = parseFloat(p.receivedQty || p.orderedQty) || 0;
+        const rate        = parseFloat(p.orderedPricePerKg) || 0;
+        const calcAmount  = Math.round(qty * rate * 100) / 100;
+        const invoiceAmt  = parseFloat(p.invoiceAmount) || 0;
+        // Use invoice amount (total from vendor's bill) if provided, else fall back to PO calc
+        const amount      = invoiceAmt > 0 ? invoiceAmt : calcAmount;
+        const gstPct      = parseFloat(p.gst) || 0;
+        const gstAmt      = invoiceAmt > 0 ? 0 : Math.round(calcAmount * gstPct / 100 * 100) / 100; // GST already included in invoice amount
         if (amount <= 0) return;
 
-        const today    = new Date().toISOString().slice(0, 10);
-        const dueDate  = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        const today   = new Date().toISOString().slice(0, 10);
+        const dueDate = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
         const { data: payable } = await supabase.from('vendor_bills').insert({
-          vendor_name:  p.supplier || 'Unknown Vendor',
-          bill_no:      p.invoice_no || `PROC-${req.params.id}`,
-          bill_date:    today,
+          vendor_name:  vendorName,
+          bill_no:      invoiceNo || `PROC-${req.params.id}`,
+          bill_date:    p.receivedDate || today,
           due_date:     dueDate,
           amount,
           gst_amount:   gstAmt,
           category:     'Raw Materials',
-          notes:        `Auto: ${p.commodityName} ${qty}kg @ ₹${rate}/kg`,
+          notes:        invoiceAmt > 0
+            ? `Invoice ${invoiceNo} — covers multiple commodities. First item: ${p.commodityName}`
+            : `Auto: ${p.commodityName} ${qty}kg @ ₹${rate}/kg`,
           status:       'unpaid',
           paid_amount:  0,
           created_by:   req.user?.email || 'system',
@@ -705,7 +754,7 @@ procurement.put('/:id', auth, requireRole('admin','manager'), async (req, res) =
 
         if (payable) {
           await supabase.from('procurements').update({ payable_id: payable.id }).eq('id', req.params.id);
-          console.log(`[AUTO] Vendor payable created for procurement ${req.params.id}: ₹${amount}`);
+          console.log(`[AUTO] Vendor bill created for invoice ${invoiceNo||'no-inv'}: ₹${amount} (${vendorName})`);
         }
       } catch (e) { console.error('[AUTO] Procurement payable error:', e.message); }
     });
