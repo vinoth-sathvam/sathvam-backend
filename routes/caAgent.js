@@ -1,7 +1,147 @@
 const express  = require('express');
 const router   = express.Router();
+const multer   = require('multer');
 const { auth } = require('../middleware/auth');
 const supabase  = require('../config/supabase');
+
+// multer — memory storage, max 5MB, CSV/XLS only
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const ok = /\.(csv|xls|xlsx|txt)$/i.test(file.originalname) || file.mimetype.includes('csv') || file.mimetype.includes('spreadsheet') || file.mimetype.includes('text');
+    cb(ok ? null : new Error('Only CSV/XLS files accepted'), ok);
+  },
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Parse ICICI bank statement CSV
+// Handles formats:
+//   • Plain CSV (header row: Transaction Date, Value Date, Description, ...)
+//   • ICICI export with metadata header rows before the column header
+// ─────────────────────────────────────────────────────────────────────────────
+function parseIciciCsv(text) {
+  // Normalise line endings
+  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+
+  // Simple CSV line splitter that respects quoted fields
+  function splitCsvLine(line) {
+    const result = [];
+    let cur = '', inQ = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { inQ = !inQ; }
+      else if (ch === ',' && !inQ) { result.push(cur.trim()); cur = ''; }
+      else { cur += ch; }
+    }
+    result.push(cur.trim());
+    return result.map(v => v.replace(/^"|"$/g, '').trim());
+  }
+
+  // Clean number string → float
+  function toNum(s) {
+    if (!s) return 0;
+    return parseFloat(s.replace(/,/g, '').replace(/[^\d.-]/g, '')) || 0;
+  }
+
+  // Parse DD/MM/YYYY → YYYY-MM-DD
+  function parseDate(s) {
+    if (!s) return null;
+    const parts = s.trim().split('/');
+    if (parts.length === 3) {
+      const [d, m, y] = parts;
+      return `${y.length === 2 ? '20' + y : y}-${m.padStart(2,'0')}-${d.padStart(2,'0')}`;
+    }
+    // Try YYYY-MM-DD already
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s.trim())) return s.trim();
+    return null;
+  }
+
+  let openingBalance = null, closingBalance = null;
+  let headerIdx = -1;
+
+  // Scan for metadata rows (opening/closing balance) and find the column header row
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+    const low = raw.toLowerCase();
+    if (low.includes('opening balance') || low.includes('opening bal')) {
+      const cols = splitCsvLine(raw);
+      for (const c of cols) { const n = toNum(c); if (n > 0) { openingBalance = n; break; } }
+    }
+    if (low.includes('closing balance') || low.includes('closing bal')) {
+      const cols = splitCsvLine(raw);
+      for (const c of cols) { const n = toNum(c); if (n > 0) { closingBalance = n; break; } }
+    }
+    // Detect the transaction header row
+    if (low.includes('transaction date') || low.includes('txn date') || low.includes('value date')) {
+      headerIdx = i;
+      break;
+    }
+  }
+
+  if (headerIdx === -1) throw new Error('Could not find column header row in CSV. Expected a row with "Transaction Date".');
+
+  const headers = splitCsvLine(lines[headerIdx]).map(h => h.toLowerCase().replace(/[^a-z0-9]/g, '_'));
+
+  // Map header names to standard keys
+  function colIdx(candidates) {
+    for (const c of candidates) {
+      const idx = headers.findIndex(h => h.includes(c));
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  }
+
+  const iDate   = colIdx(['transaction_date','txn_date','date']);
+  const iDesc   = colIdx(['description','narration','particulars','remarks']);
+  const iRef    = colIdx(['ref_no','cheque_no','reference','ref','chq']);
+  const iDebit  = colIdx(['debit','dr','withdrawal']);
+  const iCredit = colIdx(['credit','cr','deposit']);
+  const iBalance= colIdx(['balance']);
+
+  if (iDate === -1) throw new Error('Cannot find Transaction Date column in CSV.');
+
+  const transactions = [];
+  let derivedOpening = null;
+  let derivedClosing = null;
+
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line || line.replace(/,/g, '').trim() === '') continue;
+
+    const cols = splitCsvLine(line);
+    const dateStr = cols[iDate] || '';
+    const date = parseDate(dateStr);
+    if (!date) continue; // skip non-transaction rows
+
+    const description = (iDesc !== -1 ? cols[iDesc] : '') || '';
+    const ref         = (iRef  !== -1 ? cols[iRef]  : '') || '';
+    const debit       = iDebit  !== -1 ? toNum(cols[iDebit])  : 0;
+    const credit      = iCredit !== -1 ? toNum(cols[iCredit]) : 0;
+    const balance     = iBalance !== -1 ? toNum(cols[iBalance]) : null;
+
+    if (debit === 0 && credit === 0) continue;
+
+    const type   = credit > 0 ? 'credit' : 'debit';
+    const amount = credit > 0 ? credit : debit;
+
+    if (balance !== null) {
+      if (derivedOpening === null) {
+        // First row: derive opening from balance - net
+        derivedOpening = type === 'credit' ? balance - amount : balance + amount;
+      }
+      derivedClosing = balance;
+    }
+
+    transactions.push({ date, description, reference: ref, type, amount });
+  }
+
+  return {
+    openingBalance: openingBalance ?? derivedOpening,
+    closingBalance: closingBalance ?? derivedClosing,
+    transactions,
+  };
+}
 
 // monitor-api runs on the host — backend is in Docker, cannot exec scripts directly
 const MONITOR_API = 'http://host.docker.internal:9191';
@@ -292,6 +432,147 @@ router.get('/report', auth, roleGuard, async (req, res) => {
     });
   } catch (e) {
     console.error('[CA Report]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/ca-agent/reconcile
+// Upload ICICI bank statement CSV → compare with bank_transactions in DB
+// Multipart field: "statement" (CSV file)
+// Query params:
+//   bank_account_id (default 1)
+//   import_missing  (true/false — auto-import missing txns into DB, default false)
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/reconcile', auth, roleGuard, upload.single('statement'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded. Send a CSV as multipart field "statement".' });
+
+    const bankAccountId  = parseInt(req.query.bank_account_id || req.body.bank_account_id || 1);
+    const importMissing  = (req.query.import_missing || req.body.import_missing) === 'true';
+
+    // Parse the uploaded CSV
+    const csvText = req.file.buffer.toString('utf-8');
+    let parsed;
+    try {
+      parsed = parseIciciCsv(csvText);
+    } catch (parseErr) {
+      return res.status(422).json({ error: `CSV parse error: ${parseErr.message}` });
+    }
+
+    const { openingBalance, closingBalance, transactions: bankTxns } = parsed;
+
+    if (!bankTxns.length) return res.status(422).json({ error: 'No transactions found in CSV. Check file format.' });
+
+    // Determine date range from statement
+    const dates = bankTxns.map(t => t.date).sort();
+    const fromDate = dates[0];
+    const toDate   = dates[dates.length - 1];
+
+    // Fetch software transactions for the same period
+    const { data: dbTxns, error: dbErr } = await supabase
+      .from('bank_transactions')
+      .select('id,date,type,amount,description,reference')
+      .eq('bank_account_id', bankAccountId)
+      .gte('date', fromDate)
+      .lte('date', toDate)
+      .order('date');
+
+    if (dbErr) return res.status(500).json({ error: dbErr.message });
+
+    const round2 = n => Math.round(parseFloat(n || 0) * 100) / 100;
+
+    // Build a match key: date|type|amount (rounded to 2dp)
+    function matchKey(t) { return `${t.date}|${t.type}|${round2(t.amount)}`; }
+    // Also index by reference (ICICI ref like S12345678)
+    function refKey(t) { return (t.reference || '').trim().toUpperCase(); }
+
+    const dbByKey = new Map();
+    const dbByRef = new Map();
+    for (const t of (dbTxns || [])) {
+      dbByKey.set(matchKey(t), t);
+      if (t.reference) dbByRef.set(refKey(t), t);
+    }
+
+    const bankByKey = new Map();
+    const bankByRef = new Map();
+    for (const t of bankTxns) {
+      bankByKey.set(matchKey(t), t);
+      if (t.reference) bankByRef.set(refKey(t), t);
+    }
+
+    // Classify each bank transaction
+    const matched          = [];
+    const missingInSoftware = [];
+
+    for (const bt of bankTxns) {
+      const byRef = bt.reference ? dbByRef.get(refKey(bt)) : null;
+      const byKey = dbByKey.get(matchKey(bt));
+      if (byRef || byKey) {
+        matched.push({ bank: bt, software: byRef || byKey });
+      } else {
+        missingInSoftware.push(bt);
+      }
+    }
+
+    // Find transactions in software not matched to any bank entry
+    const matchedDbIds = new Set(matched.map(m => m.software?.id).filter(Boolean));
+    const extraInSoftware = (dbTxns || []).filter(t => !matchedDbIds.has(t.id));
+
+    // Calculate balances
+    const { data: bankAcc } = await supabase.from('bank_accounts').select('opening_balance,current_balance').eq('id', bankAccountId).single();
+
+    const softwareCredits = (dbTxns || []).filter(t => t.type === 'credit').reduce((s, t) => s + round2(t.amount), 0);
+    const softwareDebits  = (dbTxns || []).filter(t => t.type === 'debit').reduce((s, t) => s + round2(t.amount), 0);
+    const softwareOpening = bankAcc?.opening_balance || 0;
+    const softwareClosing = round2(softwareOpening + softwareCredits - softwareDebits);
+
+    const bankBalance     = closingBalance ?? null;
+    const balanceDiff     = bankBalance !== null ? round2(bankBalance - softwareClosing) : null;
+    const isBalanced      = balanceDiff !== null && Math.abs(balanceDiff) < 0.02;
+
+    // Auto-import missing transactions if requested
+    let importResult = null;
+    if (importMissing && missingInSoftware.length > 0) {
+      const toInsert = missingInSoftware.map(t => ({
+        bank_account_id: bankAccountId,
+        date: t.date,
+        type: t.type,
+        amount: t.amount,
+        description: t.description,
+        reference: t.reference || null,
+        category: null,
+        reconciled: true,
+        created_at: new Date().toISOString(),
+      }));
+      const { data: inserted, error: insErr } = await supabase.from('bank_transactions').insert(toInsert).select('id');
+      if (insErr) {
+        importResult = { error: insErr.message };
+      } else {
+        // Recalculate balance
+        const newClosing = round2(softwareClosing + missingInSoftware.filter(t => t.type === 'credit').reduce((s, t) => s + round2(t.amount), 0) - missingInSoftware.filter(t => t.type === 'debit').reduce((s, t) => s + round2(t.amount), 0));
+        await supabase.from('bank_accounts').update({ current_balance: newClosing }).eq('id', bankAccountId);
+        importResult = { imported: inserted?.length || 0, new_balance: newClosing };
+      }
+    }
+
+    res.json({
+      period: { from: fromDate, to: toDate },
+      bank: { opening: openingBalance, closing: bankBalance, transaction_count: bankTxns.length },
+      software: { opening: softwareOpening, closing: softwareClosing, transaction_count: (dbTxns || []).length },
+      reconciliation: {
+        is_balanced: isBalanced,
+        difference: balanceDiff,
+        matched_count: matched.length,
+        missing_in_software_count: missingInSoftware.length,
+        extra_in_software_count: extraInSoftware.length,
+      },
+      missing_in_software: missingInSoftware,   // in bank, not in DB
+      extra_in_software: extraInSoftware.map(t => ({ id: t.id, date: t.date, type: t.type, amount: t.amount, description: t.description, reference: t.reference })), // in DB, not in bank
+      import_result: importResult,
+    });
+  } catch (e) {
+    console.error('[Reconcile]', e);
     res.status(500).json({ error: e.message });
   }
 });
