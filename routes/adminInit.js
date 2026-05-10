@@ -44,7 +44,7 @@ router.get('/', auth, async (req, res) => {
       supabase.from('sales').select('*').order('date', { ascending: false }).limit(300),
       supabase.from('vendors').select('*').order('display_name'),
       supabase.from('b2b_customers').select('id,company_name,contact_name,email,country,currency,address,phone,active,registered_date'),
-      supabase.from('b2b_orders').select('id,order_no,date,customer_id,buyer_name,stage,total_value,currency,notes,created_at,bl_no,container_no,etd,eta,port_of_loading,port_of_discharge,carrier_tracking_url, b2b_order_items(id,product_id,product_name,qty,shipped_qty,unit,unit_price,currency,notes,pack_size), b2b_order_stages(id,stage,date,note,updated_by)').order('created_at', { ascending: false }).limit(300),
+      supabase.from('b2b_orders').select('*, b2b_order_items(*), b2b_order_stages(*)').order('created_at', { ascending: false }).limit(300),
       supabase.from('projects').select('id,project_name,b2b_order_id,buyer_name,buyer_country,status,pi_no,pi_date,bl_no,container_no,etd,mfg_invoice_no,merch_invoice_no,created_at').order('created_at', { ascending: false }).limit(200),
       supabase.from('settings').select('key,value').like('key', 'project_full_%').limit(200),
       supabase.from('stock_ledger').select('*').order('date', { ascending: false }).limit(500),

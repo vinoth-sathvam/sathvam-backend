@@ -63,7 +63,7 @@ const b2bOrders = express.Router();
 b2bOrders.get('/', auth, async (req, res) => {
   // B2B customers can only see their own orders
   let query = supabase.from('b2b_orders')
-    .select('id,order_no,date,customer_id,buyer_name,stage,total_value,currency,notes,created_at,bl_no,container_no,etd,eta,port_of_loading,port_of_discharge,carrier_tracking_url, b2b_order_items(id,product_id,product_name,qty,shipped_qty,unit,unit_price,currency,notes,pack_size), b2b_order_stages(id,stage,date,note,updated_by)')
+    .select('*, b2b_order_items(*), b2b_order_stages(*)')
     .order('created_at', { ascending: false })
     .limit(300);
   if (req.user.type === 'b2b_customer') {
