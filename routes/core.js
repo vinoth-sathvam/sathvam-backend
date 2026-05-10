@@ -153,6 +153,26 @@ products.post('/', auth, requireRole('admin'), async (req, res) => {
 
   res.status(201).json(data);
 });
+// Bulk packing auto-link — re-runs autoLinkPacking for all products missing packing
+products.post('/run-packing-autolink', auth, requireRole('admin'), async (req, res) => {
+  const { data: prods } = await supabase.from('products').select('id,name,cat,pack_size,pack_unit,packing_links').eq('active', true);
+  if (!prods?.length) return res.json({ updated: 0 });
+  const toProcess = prods.filter(p => {
+    const links = p.packing_links || {};
+    const matIds = Array.isArray(links.materialIds) ? links.materialIds : (links.coverId ? [links.coverId] : []);
+    return matIds.length === 0 && !links.labelId; // only process products with no packing at all
+  });
+  let updated = 0;
+  for (const prod of toProcess) {
+    const links = await autoLinkPacking(prod);
+    if (links) {
+      await supabase.from('products').update({ packing_links: links }).eq('id', prod.id);
+      updated++;
+    }
+  }
+  res.json({ total: toProcess.length, updated });
+});
+
 // Batch price/field update — must be before /:id so Express doesn't match "batch" as an id
 products.put('/batch', auth, requireRole('admin', 'manager'), async (req, res) => {
   const prods = Array.isArray(req.body) ? req.body : [];
@@ -607,32 +627,58 @@ procurement.get('/commodity-costs', auth, async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('procurements')
-      .select('commodity_id, commodity_name, ordered_price_per_kg, logistics_cost_per_kg, gst, date, supplier, status')
+      .select('commodity_id, commodity_name, ordered_price_per_kg, ordered_qty, logistics_cost_per_kg, gst, date, supplier, status')
       .in('status', ['stocked', 'cleaned', 'received'])
       .not('commodity_id', 'is', null)
       .order('date', { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
 
-    // Keep only the most recent entry per commodity_id
-    const costMap = {};
+    // Weighted-average landed cost per commodity across all qualifying procurements
+    const groups = {};
     (data || []).forEach(p => {
-      if (!costMap[p.commodity_id]) {
-        const baseAndLogistics = parseFloat(p.ordered_price_per_kg) || 0;
-        const gstPct           = parseFloat(p.gst) || 0;
-        const logisticsCostPerKg = parseFloat(p.logistics_cost_per_kg) || 0;
-        // Full landed cost = (base + logistics) × (1 + GST%)
-        const costPerKg = Math.round(baseAndLogistics * (1 + gstPct / 100) * 100) / 100;
-        costMap[p.commodity_id] = {
-          commodityId: p.commodity_id,
-          commodityName: p.commodity_name,
-          costPerKg,                        // full landed cost incl. GST + logistics
-          basePerKg: Math.round((baseAndLogistics - logisticsCostPerKg) * 100) / 100,
-          logisticsCostPerKg,
-          gstPct,
-          date: p.date,
-          supplier: p.supplier,
-        };
-      }
+      const cid = p.commodity_id;
+      if (!groups[cid]) groups[cid] = { commodityName: p.commodity_name, entries: [] };
+      const baseAndLogistics   = parseFloat(p.ordered_price_per_kg) || 0;
+      const gstPct             = parseFloat(p.gst) || 0;
+      const logisticsCostPerKg = parseFloat(p.logistics_cost_per_kg) || 0;
+      const qty                = parseFloat(p.ordered_qty) || 0;
+      // Base (ex-logistics) — GST applies to vendor invoice only, NOT to freight
+      const basePerKg  = baseAndLogistics - logisticsCostPerKg;
+      const gstAmount  = basePerKg * gstPct / 100;
+      const landedCost = basePerKg + gstAmount + logisticsCostPerKg;
+      groups[cid].entries.push({ qty, landedCost, basePerKg, gstAmount, logisticsCostPerKg, gstPct, date: p.date, supplier: p.supplier });
+    });
+
+    const costMap = {};
+    Object.entries(groups).forEach(([cid, g]) => {
+      const totalQty    = g.entries.reduce((s, e) => s + e.qty, 0);
+      const wavgLanded  = totalQty > 0
+        ? g.entries.reduce((s, e) => s + e.landedCost * e.qty, 0) / totalQty
+        : (g.entries[0]?.landedCost || 0);
+      const wavgBase    = totalQty > 0
+        ? g.entries.reduce((s, e) => s + e.basePerKg * e.qty, 0) / totalQty : 0;
+      const wavgGst     = totalQty > 0
+        ? g.entries.reduce((s, e) => s + e.gstAmount * e.qty, 0) / totalQty : 0;
+      const wavgLogist  = totalQty > 0
+        ? g.entries.reduce((s, e) => s + e.logisticsCostPerKg * e.qty, 0) / totalQty : 0;
+      // For display: most recent date + unique suppliers
+      const latestDate  = g.entries[0]?.date;
+      const suppliers   = [...new Set(g.entries.map(e => e.supplier).filter(Boolean))].join(', ');
+      const gstPct      = g.entries[0]?.gstPct || 0;
+      const batchCount  = g.entries.length;
+      costMap[cid] = {
+        commodityId:        cid,
+        commodityName:      g.commodityName,
+        costPerKg:          Math.round(wavgLanded  * 100) / 100,
+        basePerKg:          Math.round(wavgBase    * 100) / 100,
+        gstAmount:          Math.round(wavgGst     * 100) / 100,
+        logisticsCostPerKg: Math.round(wavgLogist  * 100) / 100,
+        gstPct,
+        totalQtyKg:         Math.round(totalQty    * 100) / 100,
+        batchCount,
+        date:               latestDate,
+        supplier:           suppliers,
+      };
     });
     res.json(costMap);
   } catch(e) { res.status(500).json({ error: e.message }); }

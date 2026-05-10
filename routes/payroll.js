@@ -100,6 +100,39 @@ router.delete('/employees/:id', auth, requireRole('admin'), async (req, res) => 
 
 // ── Attendance ────────────────────────────────────────────────────────────────
 
+// GET /api/payroll/attendance/monthly?year=YYYY&month=M
+router.get('/attendance/monthly', auth, async (req, res) => {
+  const year  = parseInt(req.query.year)  || new Date().getFullYear();
+  const month = parseInt(req.query.month) || (new Date().getMonth() + 1);
+
+  const start = `${year}-${String(month).padStart(2,'0')}-01`;
+  const end   = new Date(year, month, 0).toISOString().slice(0, 10);
+
+  const [{ data: emps, error: empErr }, { data: att, error: attErr }] = await Promise.all([
+    supabase.from('employees').select('id,name,role,daily_rate,pay_type').eq('active', true).order('name'),
+    supabase.from('attendance').select('employee_id,date,status').gte('date', start).lte('date', end).order('date'),
+  ]);
+  if (empErr) return res.status(500).json({ error: empErr.message });
+  if (attErr) return res.status(500).json({ error: attErr.message });
+
+  // Build full date list for the month
+  const dates = [];
+  const cur = new Date(start + 'T00:00:00');
+  while (cur.toISOString().slice(0, 10) <= end) {
+    dates.push(cur.toISOString().slice(0, 10));
+    cur.setDate(cur.getDate() + 1);
+  }
+
+  // attendance map: employee_id -> date -> status
+  const attMap = {};
+  for (const a of att || []) {
+    if (!attMap[a.employee_id]) attMap[a.employee_id] = {};
+    attMap[a.employee_id][a.date] = a.status;
+  }
+
+  res.json({ year, month, start, end, dates, employees: emps || [], attendance: attMap });
+});
+
 // GET /api/payroll/attendance?date=YYYY-MM-DD
 router.get('/attendance', auth, async (req, res) => {
   const date = req.query.date || new Date().toISOString().slice(0, 10);

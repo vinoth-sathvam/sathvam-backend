@@ -1239,11 +1239,12 @@ router.post('/reviews/verify-purchase', reviewLimiter, async (req, res) => {
 // POST /api/webstore-orders/reviews — submit review (verified purchase only)
 router.post('/reviews', reviewLimiter, async (req, res) => {
   try {
-    const { product_id, product_name, order_no, reviewer_name, reviewer_email, rating, title, body } = req.body;
+    const { product_id, product_name, order_no, reviewer_name, reviewer_email, rating, title, body, photo_url } = req.body;
     if (!product_id || !rating || !reviewer_name || !order_no) return res.status(400).json({ error: 'product_id, rating, reviewer_name, order_no required' });
     if (reviewer_name.length > 100) return res.status(400).json({ error: 'Name too long' });
     if (title && title.length > 200) return res.status(400).json({ error: 'Title too long' });
     if (body && body.length > 2000) return res.status(400).json({ error: 'Review too long' });
+    if (photo_url && photo_url.length > 500) return res.status(400).json({ error: 'Invalid photo URL' });
 
     // Verify the order exists and is from a real customer
     const { data: order } = await supabase.from('webstore_orders')
@@ -1256,7 +1257,7 @@ router.post('/reviews', reviewLimiter, async (req, res) => {
     if (existing) return res.status(400).json({ error: 'You have already reviewed this product.' });
 
     const { data, error } = await supabase.from('product_reviews')
-      .insert({ product_id, product_name: product_name || '', order_id: order_no.trim().toUpperCase(), reviewer_name, reviewer_email: reviewer_email || '', rating: Math.min(5, Math.max(1, parseInt(rating))), title: title || '', body: body || '', status: 'pending' })
+      .insert({ product_id, product_name: product_name || '', order_id: order_no.trim().toUpperCase(), reviewer_name, reviewer_email: reviewer_email || '', rating: Math.min(5, Math.max(1, parseInt(rating))), title: title || '', body: body || '', photo_url: photo_url || null, status: 'pending' })
       .select().single();
     if (error) return res.status(400).json({ error: error.message });
     res.json(data);

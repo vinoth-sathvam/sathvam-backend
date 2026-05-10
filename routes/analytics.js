@@ -748,4 +748,119 @@ router.get('/carts', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// GET /api/analytics/segments
+router.get('/segments', auth, async (req, res) => {
+  try {
+    const { data: orders, error } = await supabase
+      .from('webstore_orders')
+      .select('customer, total, date, payment_status, status');
+    if (error) return res.status(500).json({ error: error.message });
+
+    const today = new Date();
+    const map   = new Map();
+
+    for (const o of orders) {
+      const cust  = o.customer || {};
+      const email = cust.email || '__unknown__';
+      if (!map.has(email)) {
+        map.set(email, {
+          email,
+          name:             cust.name  || '',
+          phone:            cust.phone || '',
+          total_spend:      0,
+          order_count:      0,
+          last_order_date:  null,
+          first_order_date: null,
+        });
+      }
+      const entry      = map.get(email);
+      const cancelled  = ['cancelled', 'rejected'].includes(o.status);
+      const orderDate  = o.date ? new Date(o.date) : null;
+
+      if (!cancelled) {
+        entry.order_count++;
+        if (o.payment_status === 'paid') entry.total_spend += parseFloat(o.total || 0);
+        if (orderDate) {
+          if (!entry.last_order_date  || orderDate > new Date(entry.last_order_date))  entry.last_order_date  = o.date;
+          if (!entry.first_order_date || orderDate < new Date(entry.first_order_date)) entry.first_order_date = o.date;
+        }
+      }
+    }
+
+    const customers = Array.from(map.values()).map(c => {
+      const daysSince = c.last_order_date
+        ? Math.floor((today - new Date(c.last_order_date)) / 86400000)
+        : 9999;
+      const daysSinceFirst = c.first_order_date
+        ? Math.floor((today - new Date(c.first_order_date)) / 86400000)
+        : 9999;
+
+      const segments = [];
+      if (c.total_spend >= 20000)                          segments.push('vip');
+      if (c.total_spend >= 5000 || c.order_count >= 5)     segments.push('high_value');
+      if (daysSinceFirst <= 30)                            segments.push('new');
+      if (daysSince <= 60)                                 segments.push('active');
+      if (daysSince >= 61 && daysSince <= 120)             segments.push('at_risk');
+      if (daysSince > 120)                                 segments.push('churned');
+
+      return { ...c, days_since_last_order: daysSince, segments };
+    });
+
+    res.json(customers);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/analytics/segments/summary
+router.get('/segments/summary', auth, async (req, res) => {
+  try {
+    const { data: orders, error } = await supabase
+      .from('webstore_orders')
+      .select('customer, total, date, payment_status, status');
+    if (error) return res.status(500).json({ error: error.message });
+
+    const today = new Date();
+    const map   = new Map();
+
+    for (const o of orders) {
+      const cust  = o.customer || {};
+      const email = cust.email || '__unknown__';
+      if (!map.has(email)) {
+        map.set(email, { total_spend: 0, order_count: 0, last_order_date: null, first_order_date: null });
+      }
+      const entry     = map.get(email);
+      const cancelled = ['cancelled', 'rejected'].includes(o.status);
+      const orderDate = o.date ? new Date(o.date) : null;
+
+      if (!cancelled) {
+        entry.order_count++;
+        if (o.payment_status === 'paid') entry.total_spend += parseFloat(o.total || 0);
+        if (orderDate) {
+          if (!entry.last_order_date  || orderDate > new Date(entry.last_order_date))  entry.last_order_date  = o.date;
+          if (!entry.first_order_date || orderDate < new Date(entry.first_order_date)) entry.first_order_date = o.date;
+        }
+      }
+    }
+
+    const summary = { vip: 0, high_value: 0, new: 0, active: 0, at_risk: 0, churned: 0 };
+
+    for (const c of map.values()) {
+      const daysSince = c.last_order_date
+        ? Math.floor((today - new Date(c.last_order_date)) / 86400000)
+        : 9999;
+      const daysSinceFirst = c.first_order_date
+        ? Math.floor((today - new Date(c.first_order_date)) / 86400000)
+        : 9999;
+
+      if (c.total_spend >= 20000)                       summary.vip++;
+      if (c.total_spend >= 5000 || c.order_count >= 5)  summary.high_value++;
+      if (daysSinceFirst <= 30)                         summary.new++;
+      if (daysSince <= 60)                              summary.active++;
+      if (daysSince >= 61 && daysSince <= 120)          summary.at_risk++;
+      if (daysSince > 120)                              summary.churned++;
+    }
+
+    res.json(summary);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 module.exports = router;

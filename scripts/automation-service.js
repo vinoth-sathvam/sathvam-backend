@@ -611,6 +611,20 @@ async function runCartFollowUps() {
       if (phone) {
         const waSent = await sendWhatsAppMsg(phone, waMsg);
         if (waSent) { sent = true; console.log(`[CART-WA] Touch ${touch} sent to ${phone} (${sid})`); }
+
+        if (waSent && touch === 1) {
+          const imageUrl = cart.items?.[0]?.image_url;
+          const bsToken  = process.env.BOTSAILOR_API_TOKEN;
+          if (imageUrl && bsToken) {
+            const normalized = phone.replace(/\D/g, '');
+            const to = normalized.length === 10 ? '91' + normalized : normalized;
+            fetch('https://app.botsailor.com/api/whatsapp-service/quick-send-image', {
+              method:  'POST',
+              headers: { Authorization: `Bearer ${bsToken}`, 'Content-Type': 'application/json' },
+              body:    JSON.stringify({ phone: to, image: imageUrl, caption: 'Your cart item from Sathvam 🌿' }),
+            }).catch(e => console.error('[CART-IMG] Failed:', e.message));
+          }
+        }
       }
       if (email && process.env.SMTP_USER && process.env.SMTP_PASS) {
         try {

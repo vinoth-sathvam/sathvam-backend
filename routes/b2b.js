@@ -1,4 +1,5 @@
 const express = require('express');
+const bcrypt = require('bcryptjs');
 const supabase = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
 const { createInvoice, recordPayment, zoho } = require('../config/zoho');
@@ -36,6 +37,15 @@ b2bCustomers.put('/:id', auth, requireRole('admin','manager'), async (req, res) 
   if (error) return res.status(400).json({ error: 'Update failed' });
   res.json(data);
 });
+b2bCustomers.post('/:id/reset-password', auth, requireRole('admin','manager'), async (req, res) => {
+  const { password } = req.body;
+  if (!password || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  const hash = await bcrypt.hash(password, 10);
+  const { error } = await supabase.from('b2b_customers').update({ password_hash: hash }).eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: 'Failed to reset password' });
+  res.json({ success: true });
+});
+
 b2bCustomers.post('/', auth, requireRole('admin'), async (req, res) => {
   const c = req.body;
   const { data, error } = await supabase.from('b2b_customers').insert({
@@ -77,7 +87,7 @@ b2bOrders.post('/', auth, async (req, res) => {
   const { data: order, error } = await supabase.from('b2b_orders').insert({ order_no:o.orderNo, date:o.date, customer_id:o.customerId, buyer_name:o.buyerName, stage:o.stage||'order_placed', total_value:o.totalValue||0, notes:o.notes||'' }).select().single();
   if (error) return res.status(400).json({ error: 'Failed to create order' });
   if (o.items && o.items.length) {
-    await supabase.from('b2b_order_items').insert(o.items.map(i => ({ order_id:order.id, product_id:i.productId, product_name:i.productName, qty:i.qty, unit:i.unit||'pcs', unit_price:i.unitPrice, currency:i.currency||'INR', notes:i.notes||'' })));
+    await supabase.from('b2b_order_items').insert(o.items.map(i => ({ order_id:order.id, product_id:i.productId, product_name:i.productName, qty:i.qty, unit:i.unit||'pcs', unit_price:i.unitPrice, currency:i.currency||'INR', notes:i.notes||'', shipped_qty:i.shippedQty!=null?i.shippedQty:null })));
   }
   await supabase.from('b2b_order_stages').insert({ order_id:order.id, stage:o.stage||'order_placed', date:o.date, note:o.stageNote||'Order created', updated_by:req.user ? req.user.name || req.user.companyName : 'System' });
   res.status(201).json(order);
@@ -96,12 +106,32 @@ b2bOrders.put('/:id/items', auth, async (req, res) => {
   if (items && items.length) {
     await supabase.from('b2b_order_items').insert(items.map(i => ({
       order_id: req.params.id, product_id: i.productId, product_name: i.productName,
-      qty: i.qty, unit: i.unit||'pcs', unit_price: i.unitPrice, currency: i.currency||'INR', notes: i.notes||''
+      qty: i.qty, unit: i.unit||'pcs', unit_price: i.unitPrice, currency: i.currency||'INR', notes: i.notes||'',
+      shipped_qty: i.shippedQty!=null ? i.shippedQty : null,
     })));
   }
   await supabase.from('b2b_order_stages').insert({ order_id: req.params.id, stage: order.stage, date: new Date().toISOString().slice(0,10), note: 'Order items updated by buyer', updated_by: updatedBy||'Buyer' });
   res.json({ message: 'Items updated' });
 });
+// Update shipped qty per item (admin/manager only — works at any stage)
+b2bOrders.patch('/:id/shipped-qtys', auth, requireRole('admin','manager'), async (req, res) => {
+  const { items } = req.body; // [{ id: <item_id>, shippedQty: <number> }, ...]
+  if (!Array.isArray(items) || items.length === 0)
+    return res.status(400).json({ error: 'items array required' });
+  const errors = [];
+  for (const it of items) {
+    if (it.id == null) continue;
+    const sq = it.shippedQty != null ? parseFloat(it.shippedQty) : null;
+    const { error } = await supabase.from('b2b_order_items')
+      .update({ shipped_qty: sq })
+      .eq('id', it.id)
+      .eq('order_id', req.params.id);
+    if (error) errors.push(it.id);
+  }
+  if (errors.length) return res.status(500).json({ error: 'Some items failed to update', failed: errors });
+  res.json({ message: 'Shipped quantities updated' });
+});
+
 b2bOrders.put('/:id/stage', auth, requireRole('admin','manager','ceo'), async (req, res) => {
   const { stage, note, date, blNo, containerNo, carrierTrackingUrl } = req.body;
   const updates = { stage };
@@ -535,6 +565,28 @@ b2bQuotes.post('/:id/convert', auth, requireRole('admin','manager'), async (req,
   res.status(201).json(order);
 });
 
+// ── Project Docs for customer portal ─────────────────────────────────────────
+// Returns the full project blob for the project linked to this B2B order,
+// so the customer portal can generate Manufacturer/Merchant Invoices & Packing Lists.
+b2bOrders.get('/:id/project-docs', auth, async (req, res) => {
+  try {
+    // Customers may only see docs for their own orders
+    if (req.user.type === 'b2b_customer') {
+      const { data: order } = await supabase.from('b2b_orders').select('customer_id').eq('id', req.params.id).single();
+      if (!order || order.customer_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+    }
+    // Find the project linked to this order
+    const { data: project } = await supabase.from('projects').select('id,project_name,status,mfg_invoice_no,merch_invoice_no').eq('b2b_order_id', req.params.id).maybeSingle();
+    if (!project) return res.json({ project: null });
+    // Return full project blob
+    const { data: setting } = await supabase.from('settings').select('value').eq('key', `project_full_${project.id}`).maybeSingle();
+    const full = setting?.value ? { ...setting.value, id: project.id } : { id: project.id, projectName: project.project_name, status: project.status };
+    res.json({ project: full });
+  } catch (e) {
+    res.status(500).json({ error: 'Failed to load project documents' });
+  }
+});
+
 // ── Document Vault ────────────────────────────────────────────────────────────
 const b2bDocs = express.Router();
 b2bDocs.get('/:orderId', auth, async (req, res) => {
@@ -689,10 +741,10 @@ b2bAnalytics.get('/', auth, requireRole('admin','manager','ceo'), async (req, re
   }});
 });
 
-// POST /api/b2b/orders/:id/payment — admin records advance or remaining payment
+// POST /api/b2b/orders/:id/payment — admin records advance, remaining, or logistics payment
 b2bOrders.post('/:id/payment', auth, requireRole('admin','manager','ceo'), async (req, res) => {
   const { type, amount, date, ref, notes } = req.body;
-  if (!['advance','remaining'].includes(type)) return res.status(400).json({ error: 'type must be advance or remaining' });
+  if (!['advance','remaining','logistics'].includes(type)) return res.status(400).json({ error: 'type must be advance, remaining, or logistics' });
 
   // Payment data stored in settings table (key: b2b_payments) as {[orderId]: {...}}
   const SETTINGS_KEY = 'b2b_payments';
@@ -701,17 +753,36 @@ b2bOrders.post('/:id/payment', auth, requireRole('admin','manager','ceo'), async
   const orderPayment = allPayments[req.params.id] || {};
 
   if (type === 'advance') {
-    orderPayment.advance_paid   = parseFloat(amount)||0;
-    orderPayment.advance_date   = date || new Date().toISOString().slice(0,10);
-    orderPayment.advance_ref    = ref || '';
-    orderPayment.advance_notes  = notes || '';
-    orderPayment.payment_status = 'advance_paid';
-  } else {
+    // Migrate legacy single-entry format to array
+    if (!Array.isArray(orderPayment.advance_entries)) {
+      orderPayment.advance_entries = orderPayment.advance_paid > 0
+        ? [{ amount: orderPayment.advance_paid, date: orderPayment.advance_date||'', ref: orderPayment.advance_ref||'', notes: orderPayment.advance_notes||'' }]
+        : [];
+    }
+    orderPayment.advance_entries.push({
+      amount: parseFloat(amount)||0,
+      date:   date || new Date().toISOString().slice(0,10),
+      ref:    ref   || '',
+      notes:  notes || '',
+    });
+    orderPayment.advance_paid  = orderPayment.advance_entries.reduce((s,e)=>s+(parseFloat(e.amount)||0), 0);
+    orderPayment.advance_date  = orderPayment.advance_entries[orderPayment.advance_entries.length-1].date;
+    orderPayment.advance_ref   = orderPayment.advance_entries[orderPayment.advance_entries.length-1].ref;
+    orderPayment.advance_notes = orderPayment.advance_entries[orderPayment.advance_entries.length-1].notes;
+    // only upgrade to advance_paid if not already fully_paid
+    if (orderPayment.payment_status !== 'fully_paid') orderPayment.payment_status = 'advance_paid';
+  } else if (type === 'remaining') {
     orderPayment.remaining_paid   = parseFloat(amount)||0;
     orderPayment.remaining_date   = date || new Date().toISOString().slice(0,10);
     orderPayment.remaining_ref    = ref || '';
     orderPayment.remaining_notes  = notes || '';
     orderPayment.payment_status   = 'fully_paid';
+  } else {
+    // logistics payment
+    orderPayment.logistics_paid   = parseFloat(amount)||0;
+    orderPayment.logistics_date   = date || new Date().toISOString().slice(0,10);
+    orderPayment.logistics_ref    = ref || '';
+    orderPayment.logistics_notes  = notes || '';
   }
   allPayments[req.params.id] = orderPayment;
 
@@ -727,7 +798,7 @@ b2bOrders.post('/:id/payment', auth, requireRole('admin','manager','ceo'), async
       const { data: cust } = await supabase.from('b2b_customers').select('phone,contact_name').eq('id', order.customer_id).maybeSingle();
       const phone = cust?.phone;
       if (!phone || !process.env.BOTSAILOR_API_TOKEN) return;
-      const typeLabel = type === 'advance' ? 'Advance Payment' : 'Final Payment';
+      const typeLabel = type === 'advance' ? 'Advance Payment' : type === 'remaining' ? 'Final Payment' : 'Logistics Payment';
       const msg = `🌿 *Sathvam Organics – Payment Received*\n\nDear ${cust?.contact_name || order.buyer_name || 'Customer'},\n\nWe have received your *${typeLabel}* of *₹${amount}* for order *${order.order_no}*.\n\nReference: ${ref || 'N/A'} · Date: ${date}\n\nThank you!\n_sathvam.in_`;
       const cleanPhone = phone.replace(/\D/g,'');
       const waPhone = cleanPhone.startsWith('91') ? cleanPhone : '91' + cleanPhone;
@@ -738,6 +809,25 @@ b2bOrders.post('/:id/payment', auth, requireRole('admin','manager','ceo'), async
       });
     } catch(e) { console.error('[B2B-WA-PAYMENT]', e.message); }
   });
+});
+
+// POST /api/b2b/orders/:id/charges — admin sets logistics_charge and other_charges on an order
+b2bOrders.post('/:id/charges', auth, requireRole('admin','manager','ceo'), async (req, res) => {
+  const { logistics_charge, logistics_charge_note, other_charges, other_charges_note } = req.body;
+  const SETTINGS_KEY = 'b2b_payments';
+  const { data: existing } = await supabase.from('settings').select('value').eq('key', SETTINGS_KEY).single();
+  const allPayments = existing?.value || {};
+  const orderPayment = allPayments[req.params.id] || {};
+
+  if (logistics_charge !== undefined) orderPayment.logistics_charge      = parseFloat(logistics_charge)||0;
+  if (logistics_charge_note !== undefined) orderPayment.logistics_charge_note = logistics_charge_note || '';
+  if (other_charges !== undefined)     orderPayment.other_charges         = parseFloat(other_charges)||0;
+  if (other_charges_note !== undefined) orderPayment.other_charges_note   = other_charges_note || '';
+
+  allPayments[req.params.id] = orderPayment;
+  const { error } = await supabase.from('settings').upsert({ key: SETTINGS_KEY, value: allPayments });
+  if (error) return res.status(400).json({ error: 'Charges update failed: ' + error.message });
+  res.json({ id: req.params.id, ...orderPayment });
 });
 
 const b2bProfile = express.Router();
@@ -753,6 +843,190 @@ b2bProfile.put('/', auth, async (req, res) => {
   const { data, error } = await supabase.from('b2b_customers').update(updates).eq('id', req.user.id).select(B2B_CUST_SELECT).single();
   if (error) return res.status(400).json({ error: 'Profile update failed' });
   res.json(data);
+});
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+const multer = require('multer');
+const b2bUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const B2B_DOC_BUCKET = 'b2b-docs';
+async function ensureB2bBucket() {
+  const { data: buckets } = await supabase.storage.listBuckets();
+  if (!buckets?.find(b => b.name === B2B_DOC_BUCKET)) {
+    await supabase.storage.createBucket(B2B_DOC_BUCKET, { public: true, fileSizeLimit: 10 * 1024 * 1024 });
+  }
+}
+async function getSettingsBlob(key) {
+  const { data } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
+  return data?.value || {};
+}
+async function saveSettingsBlob(key, value) {
+  await supabase.from('settings').upsert({ key, value });
+}
+async function ownsOrder(userId, orderId) {
+  const { data } = await supabase.from('b2b_orders').select('customer_id').eq('id', orderId).single();
+  return data?.customer_id === userId;
+}
+
+// ── Modification Requests ─────────────────────────────────────────────────
+const b2bModRequests = express.Router();
+b2bModRequests.get('/:orderId', auth, async (req, res) => {
+  if (req.user.type === 'b2b_customer' && !(await ownsOrder(req.user.id, req.params.orderId)))
+    return res.status(403).json({ error: 'Forbidden' });
+  const all = await getSettingsBlob('b2b_mod_requests');
+  res.json(all[req.params.orderId] || []);
+});
+b2bModRequests.post('/:orderId', auth, async (req, res) => {
+  if (req.user.type === 'b2b_customer' && !(await ownsOrder(req.user.id, req.params.orderId)))
+    return res.status(403).json({ error: 'Forbidden' });
+  const { data: order } = await supabase.from('b2b_orders').select('stage').eq('id', req.params.orderId).single();
+  if (['in_production','quality_check','ready_to_ship','shipped','sailing','delivered'].includes(order?.stage))
+    return res.status(400).json({ error: 'Order is too far in production to modify' });
+  const all = await getSettingsBlob('b2b_mod_requests');
+  const list = all[req.params.orderId] || [];
+  const newReq = { id: Date.now().toString(), date: new Date().toISOString().slice(0,10), note: req.body.note||'', status: 'pending', submittedBy: req.user.companyName || req.user.name || '' };
+  list.push(newReq);
+  all[req.params.orderId] = list;
+  await saveSettingsBlob('b2b_mod_requests', all);
+  res.json(newReq);
+});
+b2bModRequests.put('/:orderId/:reqId', auth, requireRole('admin','manager','ceo'), async (req, res) => {
+  const all = await getSettingsBlob('b2b_mod_requests');
+  const list = all[req.params.orderId] || [];
+  const idx = list.findIndex(r => r.id === req.params.reqId);
+  if (idx === -1) return res.status(404).json({ error: 'Request not found' });
+  list[idx] = { ...list[idx], status: req.body.status || list[idx].status, adminNote: req.body.adminNote || '' };
+  all[req.params.orderId] = list;
+  await saveSettingsBlob('b2b_mod_requests', all);
+  res.json(list[idx]);
+});
+
+// ── Cancellation Requests ─────────────────────────────────────────────────
+const b2bCancelRequests = express.Router();
+b2bCancelRequests.post('/:orderId', auth, async (req, res) => {
+  if (req.user.type === 'b2b_customer' && !(await ownsOrder(req.user.id, req.params.orderId)))
+    return res.status(403).json({ error: 'Forbidden' });
+  const { data: order } = await supabase.from('b2b_orders').select('stage').eq('id', req.params.orderId).single();
+  if (['delivered','cancelled'].includes(order?.stage))
+    return res.status(400).json({ error: 'Cannot cancel a delivered or already-cancelled order' });
+  const all = await getSettingsBlob('b2b_cancel_requests');
+  all[req.params.orderId] = { date: new Date().toISOString().slice(0,10), reason: req.body.reason||'', status: 'pending', submittedBy: req.user.companyName || req.user.name || '' };
+  await saveSettingsBlob('b2b_cancel_requests', all);
+  res.json(all[req.params.orderId]);
+});
+b2bCancelRequests.put('/:orderId', auth, requireRole('admin','manager','ceo'), async (req, res) => {
+  const all = await getSettingsBlob('b2b_cancel_requests');
+  if (!all[req.params.orderId]) return res.status(404).json({ error: 'No cancellation request found' });
+  all[req.params.orderId] = { ...all[req.params.orderId], status: req.body.status || 'pending', adminNote: req.body.adminNote || '' };
+  await saveSettingsBlob('b2b_cancel_requests', all);
+  if (req.body.status === 'approved') {
+    await supabase.from('b2b_orders').update({ stage: 'cancelled' }).eq('id', req.params.orderId);
+    await supabase.from('b2b_order_stages').insert({ order_id: req.params.orderId, stage: 'cancelled', date: new Date().toISOString().slice(0,10), note: 'Order cancelled — customer request approved', updated_by: req.user.name || 'Admin' });
+  }
+  res.json(all[req.params.orderId]);
+});
+
+// ── Disputes ──────────────────────────────────────────────────────────────
+const b2bDisputes = express.Router();
+b2bDisputes.get('/:orderId', auth, async (req, res) => {
+  if (req.user.type === 'b2b_customer' && !(await ownsOrder(req.user.id, req.params.orderId)))
+    return res.status(403).json({ error: 'Forbidden' });
+  const all = await getSettingsBlob('b2b_disputes');
+  res.json(all[req.params.orderId] || []);
+});
+b2bDisputes.post('/:orderId', auth, async (req, res) => {
+  if (req.user.type === 'b2b_customer' && !(await ownsOrder(req.user.id, req.params.orderId)))
+    return res.status(403).json({ error: 'Forbidden' });
+  const all = await getSettingsBlob('b2b_disputes');
+  const list = all[req.params.orderId] || [];
+  const newD = { id: Date.now().toString(), date: new Date().toISOString().slice(0,10), subject: req.body.subject||'', description: req.body.description||'', status: 'open', submittedBy: req.user.companyName || req.user.name || '' };
+  list.push(newD);
+  all[req.params.orderId] = list;
+  await saveSettingsBlob('b2b_disputes', all);
+  res.json(newD);
+});
+b2bDisputes.put('/:orderId/:disputeId', auth, requireRole('admin','manager','ceo'), async (req, res) => {
+  const all = await getSettingsBlob('b2b_disputes');
+  const list = all[req.params.orderId] || [];
+  const idx = list.findIndex(d => d.id === req.params.disputeId);
+  if (idx === -1) return res.status(404).json({ error: 'Dispute not found' });
+  list[idx] = { ...list[idx], status: req.body.status || list[idx].status, adminResponse: req.body.adminResponse || '' };
+  all[req.params.orderId] = list;
+  await saveSettingsBlob('b2b_disputes', all);
+  res.json(list[idx]);
+});
+
+// ── Payment Proof Upload ───────────────────────────────────────────────────
+const b2bPaymentProof = express.Router();
+b2bPaymentProof.post('/:orderId', auth, b2bUpload.single('proof'), async (req, res) => {
+  if (req.user.type === 'b2b_customer' && !(await ownsOrder(req.user.id, req.params.orderId)))
+    return res.status(403).json({ error: 'Forbidden' });
+  if (!req.file) return res.status(400).json({ error: 'No file provided' });
+  const ALLOWED = { 'image/jpeg':'jpg','image/jpg':'jpg','image/png':'png','image/webp':'webp','application/pdf':'pdf' };
+  const ext = ALLOWED[req.file.mimetype];
+  if (!ext) return res.status(400).json({ error: 'Allowed types: jpg, png, webp, pdf' });
+  await ensureB2bBucket();
+  const fname = `proof-${req.params.orderId}-${Date.now()}.${ext}`;
+  const { error: upErr } = await supabase.storage.from(B2B_DOC_BUCKET).upload(fname, req.file.buffer, { contentType: req.file.mimetype });
+  if (upErr) return res.status(500).json({ error: 'Upload failed: ' + upErr.message });
+  const { data: { publicUrl } } = supabase.storage.from(B2B_DOC_BUCKET).getPublicUrl(fname);
+  const SETTINGS_KEY = 'b2b_payments';
+  const all = await getSettingsBlob(SETTINGS_KEY);
+  all[req.params.orderId] = { ...(all[req.params.orderId]||{}), proof_url: publicUrl, proof_filename: req.file.originalname, proof_uploaded_at: new Date().toISOString() };
+  await saveSettingsBlob(SETTINGS_KEY, all);
+  res.json({ proof_url: publicUrl, proof_filename: req.file.originalname });
+});
+
+// ── Customer Document Upload ───────────────────────────────────────────────
+const b2bCustomerDocs = express.Router();
+b2bCustomerDocs.post('/:orderId', auth, b2bUpload.single('doc'), async (req, res) => {
+  if (req.user.type === 'b2b_customer' && !(await ownsOrder(req.user.id, req.params.orderId)))
+    return res.status(403).json({ error: 'Forbidden' });
+  if (!req.file) return res.status(400).json({ error: 'No file provided' });
+  const ALLOWED = { 'image/jpeg':'jpg','image/jpg':'jpg','image/png':'png','image/webp':'webp','application/pdf':'pdf' };
+  const ext = ALLOWED[req.file.mimetype];
+  if (!ext) return res.status(400).json({ error: 'Allowed types: jpg, png, webp, pdf' });
+  await ensureB2bBucket();
+  const fname = `cust-doc-${req.params.orderId}-${Date.now()}.${ext}`;
+  const { error: upErr } = await supabase.storage.from(B2B_DOC_BUCKET).upload(fname, req.file.buffer, { contentType: req.file.mimetype });
+  if (upErr) return res.status(500).json({ error: 'Upload failed: ' + upErr.message });
+  const { data: { publicUrl } } = supabase.storage.from(B2B_DOC_BUCKET).getPublicUrl(fname);
+  const KEY = `b2b_cust_docs_${req.params.orderId}`;
+  const all = await getSettingsBlob(KEY);
+  const docs = Array.isArray(all.docs) ? all.docs : [];
+  const newDoc = { id: Date.now().toString(), url: publicUrl, filename: req.file.originalname, uploadedBy: 'customer', uploadedAt: new Date().toISOString(), label: req.body.label || '' };
+  docs.push(newDoc);
+  await saveSettingsBlob(KEY, { docs });
+  res.json(newDoc);
+});
+b2bCustomerDocs.get('/:orderId', auth, async (req, res) => {
+  if (req.user.type === 'b2b_customer' && !(await ownsOrder(req.user.id, req.params.orderId)))
+    return res.status(403).json({ error: 'Forbidden' });
+  const all = await getSettingsBlob(`b2b_cust_docs_${req.params.orderId}`);
+  res.json(Array.isArray(all.docs) ? all.docs : []);
+});
+
+// ── Account / Volume Tier ─────────────────────────────────────────────────
+const b2bAccount = express.Router();
+b2bAccount.get('/:customerId', auth, async (req, res) => {
+  if (req.user.type === 'b2b_customer' && req.user.id !== req.params.customerId)
+    return res.status(403).json({ error: 'Forbidden' });
+  const { data: cust } = await supabase.from('b2b_customers').select('credit_limit,credit_used').eq('id', req.params.customerId).single();
+  const { data: orders } = await supabase.from('b2b_orders')
+    .select('id,total_value,stage,created_at,b2b_order_items(qty,unit)')
+    .eq('customer_id', req.params.customerId)
+    .not('stage','in','("cancelled","draft")')
+    .limit(200);
+  const now = new Date();
+  const ms30 = 30*24*60*60*1000, ms60 = 60*24*60*60*1000, ms90 = 90*24*60*60*1000;
+  let kg30=0, kg60=0, kg90=0;
+  (orders||[]).forEach(o => {
+    const age = now - new Date(o.created_at);
+    const kgs = (o.b2b_order_items||[]).reduce((s,i)=>s+(parseFloat(i.qty)||0),0);
+    if (age<=ms30) kg30+=kgs;
+    if (age<=ms60) kg60+=kgs;
+    if (age<=ms90) kg90+=kgs;
+  });
+  res.json({ creditLimit: cust?.credit_limit||0, creditUsed: cust?.credit_used||0, kg30, kg60, kg90 });
 });
 
 const b2bNotifications = express.Router();
@@ -782,4 +1056,4 @@ b2bNotifications.get('/:customerId', auth, async (req, res) => {
   res.json(notifications.slice(0, 40));
 });
 
-module.exports = { b2bCustomers, b2bOrders, projects, b2bItemProgress, b2bStatement, b2bStock, b2bCustomPrices, b2bQuotes, b2bDocs, b2bSamples, b2bMessages, b2bAnalytics, b2bProfile, b2bNotifications };
+module.exports = { b2bCustomers, b2bOrders, projects, b2bItemProgress, b2bStatement, b2bStock, b2bCustomPrices, b2bQuotes, b2bDocs, b2bSamples, b2bMessages, b2bAnalytics, b2bProfile, b2bNotifications, b2bModRequests, b2bCancelRequests, b2bDisputes, b2bPaymentProof, b2bCustomerDocs, b2bAccount };
