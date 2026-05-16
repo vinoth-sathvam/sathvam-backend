@@ -984,6 +984,91 @@ procurement.post('/bulk', auth, requireRole('admin','manager'), async (req, res)
   res.status(201).json({ inserted: data.length });
 });
 
+// ── POST /procurement/ai-raise — parse natural language PO prompt ─────────────
+procurement.post('/ai-raise', auth, requireRole('admin','manager'), async (req, res) => {
+  const { prompt } = req.body;
+  if (!prompt || !prompt.trim()) return res.status(400).json({ error: 'prompt required' });
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'AI not configured' });
+
+  const today = new Date().toISOString().slice(0, 10);
+
+  // Fetch vendor list for context
+  const { data: vendorList } = await supabase
+    .from('vendors').select('id, display_name, company_name').eq('active', true).limit(300);
+  const vendorNames = (vendorList || []).map(v => v.display_name || v.company_name).filter(Boolean).join(', ');
+
+  const systemPrompt = `You are a procurement assistant for Sathvam Natural Products, a cold-pressed oil factory in Karur, Tamil Nadu.
+Extract purchase order details from the user prompt and return ONLY a valid JSON object — no explanation, no markdown.
+
+Known vendors: ${vendorNames || 'none on file'}
+Today: ${today}
+
+Return this exact JSON structure:
+{
+  "vendor": "vendor name string",
+  "date": "YYYY-MM-DD",
+  "invoiceNo": "PO reference or empty string",
+  "notes": "any extra notes or empty string",
+  "items": [
+    {
+      "commodityName": "item name",
+      "orderedQty": <number>,
+      "orderedPricePerKg": <number or 0 if not mentioned>,
+      "gst": <number or 0>,
+      "unit": "kg"
+    }
+  ]
+}
+
+Rules:
+- Match vendor to known vendors (fuzzy match by name).
+- If price not mentioned, use 0.
+- If date not mentioned, use today (${today}).
+- Quantities in kg unless clearly stated otherwise.
+- invoiceNo: if user mentions an invoice/PO number use it, else empty string.`;
+
+  try {
+    const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 1024,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    const aiJson = await aiRes.json();
+    if (!aiRes.ok) return res.status(502).json({ error: aiJson?.error?.message || 'AI error' });
+
+    const raw = aiJson.content?.[0]?.text || '';
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return res.status(422).json({ error: 'Could not parse AI response', raw });
+
+    const parsed = JSON.parse(match[0]);
+
+    // Try to match vendor name to vendor master
+    if (parsed.vendor && vendorList?.length) {
+      const lower = parsed.vendor.toLowerCase();
+      const matched = vendorList.find(v => {
+        const dn = (v.display_name || '').toLowerCase();
+        const cn = (v.company_name || '').toLowerCase();
+        return dn.includes(lower) || lower.includes(dn) || cn.includes(lower) || lower.includes(cn);
+      });
+      if (matched) {
+        parsed.vendorId = matched.id;
+        parsed.vendor = matched.display_name || matched.company_name;
+      }
+    }
+
+    res.json(parsed);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const vendors = express.Router();
 vendors.get('/', auth, async (req, res) => {
   const { data, error } = await supabase.from('vendors').select('*').eq('active', true).order('display_name').limit(500);
