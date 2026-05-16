@@ -810,6 +810,259 @@ router.get('/segments', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/analytics/demand-forecast
+// AI-powered demand prediction per SKU based on 24 months of historical sales
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/demand-forecast', auth, async (req, res) => {
+  try {
+    const Anthropic = require('@anthropic-ai/sdk');
+    const client = new Anthropic.default({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+    const ago24m = new Date(); ago24m.setMonth(ago24m.getMonth() - 24);
+    const ago24mStr = ago24m.toISOString().slice(0, 10);
+
+    const [wsRes, salesRes, prodRes] = await Promise.all([
+      supabase.from('webstore_orders').select('date,items,total,status')
+        .in('status', ['confirmed','packed','shipped','delivered','paid'])
+        .gte('date', ago24mStr).order('date'),
+      supabase.from('sales').select('date,items,final_amount,status')
+        .in('status', ['delivered','dispatched','paid'])
+        .gte('date', ago24mStr).order('date'),
+      supabase.from('products').select('id,name,sku,cat,website_price').eq('active', true),
+    ]);
+
+    const products = prodRes.data || [];
+    const prodMap = Object.fromEntries(products.map(p => [p.id, p]));
+
+    // Build per-product monthly qty aggregation
+    const monthly = {}; // { product_id: { 'YYYY-MM': qty } }
+    const addItems = (items, date) => {
+      if (!items || !date) return;
+      const month = date.slice(0, 7);
+      for (const it of items) {
+        const pid = it.id || it.product_id;
+        if (!pid || !prodMap[pid]) continue;
+        if (!monthly[pid]) monthly[pid] = {};
+        monthly[pid][month] = (monthly[pid][month] || 0) + (parseFloat(it.qty) || 1);
+      }
+    };
+    for (const o of wsRes.data || []) addItems(o.items, o.date);
+    for (const o of salesRes.data || []) addItems(o.items, o.date);
+
+    // Build time series summary per product (top 25 by volume)
+    const now = new Date();
+    const currentMonth = now.toISOString().slice(0, 7);
+
+    const summaries = Object.entries(monthly).map(([pid, byMonth]) => {
+      const prod = prodMap[pid] || { name: pid, sku: '', cat: '' };
+      // Last 3 months average
+      const last3 = [1, 2, 3].map(i => {
+        const d = new Date(now); d.setMonth(d.getMonth() - i);
+        return byMonth[d.toISOString().slice(0, 7)] || 0;
+      });
+      const avg3 = last3.reduce((s, v) => s + v, 0) / 3;
+      // Last 12 months for YoY
+      const last12 = Array.from({ length: 12 }, (_, i) => {
+        const d = new Date(now); d.setMonth(d.getMonth() - i - 1);
+        return { m: d.toISOString().slice(0, 7), qty: byMonth[d.toISOString().slice(0, 7)] || 0 };
+      }).reverse();
+      // Same month last year
+      const sameMonthLY = (() => {
+        const d = new Date(now); d.setFullYear(d.getFullYear() - 1);
+        return byMonth[d.toISOString().slice(0, 7)] || 0;
+      })();
+      const total = Object.values(byMonth).reduce((s, v) => s + v, 0);
+      return { pid, name: prod.name, sku: prod.sku || '', cat: prod.cat || '', avg3: Math.round(avg3 * 10) / 10, total, sameMonthLY, last12 };
+    }).sort((a, b) => b.total - a.total).slice(0, 25);
+
+    if (summaries.length === 0) {
+      return res.json({ forecast_month: currentMonth, forecasts: [], model_note: 'No sales history found.' });
+    }
+
+    // Build Claude prompt
+    const nextMonth = (() => { const d = new Date(now); d.setMonth(d.getMonth() + 1); return d.toISOString().slice(0, 7); })();
+    const prompt = `You are a demand forecasting analyst for Sathvam Natural Products, a cold-pressed oil manufacturer in Tamil Nadu, India.
+
+Forecast next-month demand (${nextMonth}) for each product based on historical monthly sales data.
+
+Historical data (units sold per month, last 12 months shown):
+${summaries.map(s => `${s.name} (${s.cat}): avg_last3m=${s.avg3}u, same_month_last_year=${s.sameMonthLY}u, monthly=[${s.last12.map(x => x.qty).join(',')}]`).join('\n')}
+
+For EACH product, respond with EXACTLY one JSON object per line (no markdown, no explanation):
+{"pid":"<product_id>","units":<integer>,"confidence":"high|medium|low","trend":"up|stable|down","reason":"<1 sentence>"}
+
+Product IDs: ${summaries.map(s => `${s.name}=${s.pid}`).join(', ')}
+
+Rules:
+- units = your best estimate for ${nextMonth} in units
+- confidence: high if clear trend (>4 months data, consistent), medium if variable, low if sparse
+- trend: up if growing, down if declining, stable if flat
+- reason: 1 short sentence explaining the forecast`;
+
+    const aiRes = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1500,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const lines = (aiRes.content[0]?.text || '').split('\n').filter(l => l.trim().startsWith('{'));
+    const aiMap = {};
+    for (const line of lines) {
+      try { const o = JSON.parse(line.trim()); if (o.pid) aiMap[o.pid] = o; } catch {}
+    }
+
+    const forecasts = summaries.map(s => {
+      const ai = aiMap[s.pid] || {};
+      return {
+        product_id: s.pid,
+        product_name: s.name,
+        sku: s.sku,
+        cat: s.cat,
+        last_3m_avg_units: s.avg3,
+        same_month_last_year: s.sameMonthLY,
+        predicted_units: ai.units || Math.round(s.avg3),
+        confidence: ai.confidence || 'low',
+        trend: ai.trend || 'stable',
+        reasoning: ai.reason || 'Based on recent average.',
+      };
+    });
+
+    res.json({ forecast_month: nextMonth, generated_at: now.toISOString().slice(0, 10), forecasts, model_note: 'Based on up to 24 months of sales + webstore data via Claude Haiku.' });
+  } catch (e) {
+    console.error('[demand-forecast]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/analytics/price-optimization
+// Compare our prices vs competitor prices and flag over/under-priced products
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/price-optimization', auth, async (req, res) => {
+  try {
+    const Anthropic = require('@anthropic-ai/sdk');
+    const client = new Anthropic.default({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+    const ago90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+
+    const [prodRes, cpRes, procRes, batchRes] = await Promise.all([
+      supabase.from('products').select('id,name,sku,cat,website_price,retail_price,price,gst').eq('active', true),
+      supabase.from('settings').select('value,updated_at').eq('key', 'competitor_prices').maybeSingle(),
+      supabase.from('procurements').select('commodity_name,ordered_price_per_kg,date').order('date', { ascending: false }).limit(100),
+      supabase.from('batches').select('oil_type,raw_input_kg,oil_output,date').gte('date', ago90).order('date', { ascending: false }),
+    ]);
+
+    const products = prodRes.data || [];
+    const cpData = cpRes.data?.value || {}; // { product_id: { Amazon: 450, BigBasket: 420 } }
+    const cpUpdatedAt = cpRes.data?.updated_at || null;
+
+    // Latest raw material cost per commodity
+    const rawCostMap = {};
+    for (const p of procRes.data || []) {
+      if (!rawCostMap[p.commodity_name]) rawCostMap[p.commodity_name] = parseFloat(p.ordered_price_per_kg) || 0;
+    }
+
+    // Yield per oil type from recent batches
+    const yieldMap = {};
+    for (const b of batchRes.data || []) {
+      if (!yieldMap[b.oil_type] && b.raw_input_kg > 0 && b.oil_output > 0) {
+        yieldMap[b.oil_type] = parseFloat(b.oil_output) / parseFloat(b.raw_input_kg); // litres per kg
+      }
+    }
+
+    // Commodity → oil_type mapping (heuristic)
+    const commOilMap = { sesame: 'sesame', groundnut: 'groundnut', coconut: 'coconut', mustard: 'mustard', sunflower: 'sunflower', castor: 'castor' };
+
+    const results = [];
+    const flagged = [];
+
+    for (const prod of products) {
+      const cp = cpData[prod.id];
+      if (!cp || typeof cp !== 'object') continue; // skip if no competitor data
+
+      const compPrices = Object.entries(cp).filter(([, v]) => v > 0).map(([k, v]) => ({ name: k, price: parseFloat(v) }));
+      if (compPrices.length === 0) continue;
+
+      const compAvg = compPrices.reduce((s, p) => s + p.price, 0) / compPrices.length;
+      const ourPrice = parseFloat(prod.website_price) || 0;
+      const deviationPct = compAvg > 0 ? Math.round((ourPrice - compAvg) / compAvg * 1000) / 10 : 0;
+      const flag = deviationPct > 10 ? 'over' : deviationPct < -10 ? 'under' : 'ok';
+
+      // Estimate cost per unit (rough)
+      const nameLower = (prod.name || '').toLowerCase();
+      let costPerUnit = 0;
+      for (const [comm, oil] of Object.entries(commOilMap)) {
+        if (nameLower.includes(comm) || nameLower.includes(oil)) {
+          const rawCost = rawCostMap[comm] || rawCostMap[oil] || 0;
+          const yld = yieldMap[oil] || 0.35;
+          // 500ml ≈ 0.5L, 1L ≈ 1L (extract pack size from name)
+          const sizeMatch = (prod.name || '').match(/(\d+)\s*(ml|l|g|kg)/i);
+          let sizeLitres = 0.5;
+          if (sizeMatch) {
+            const num = parseFloat(sizeMatch[1]);
+            const unit = sizeMatch[2].toLowerCase();
+            sizeLitres = unit === 'l' ? num : unit === 'ml' ? num / 1000 : unit === 'kg' ? num : unit === 'g' ? num / 1000 : 0.5;
+          }
+          costPerUnit = yld > 0 ? (rawCost / yld) * sizeLitres * 1.25 : 0; // 25% processing overhead
+          break;
+        }
+      }
+
+      const suggestedPrice = Math.round(compAvg * 0.97 / 5) * 5; // 3% below avg, rounded to ₹5
+      const minViablePrice = costPerUnit > 0 ? Math.round(costPerUnit * 1.3 / 5) * 5 : 0; // 30% margin floor
+
+      const row = {
+        product_id: prod.id, product_name: prod.name, sku: prod.sku || '', cat: prod.cat || '',
+        our_website_price: ourPrice,
+        competitor_prices: Object.fromEntries(compPrices.map(p => [p.name, p.price])),
+        competitor_avg: Math.round(compAvg * 10) / 10,
+        deviation_pct: deviationPct,
+        flag,
+        suggested_price: suggestedPrice > (minViablePrice || 0) ? suggestedPrice : Math.max(suggestedPrice, minViablePrice),
+        min_viable_price: minViablePrice,
+        ai_reasoning: null,
+      };
+      results.push(row);
+      if (flag !== 'ok') flagged.push(row);
+    }
+
+    // Claude reasoning only for flagged products (limit cost)
+    if (flagged.length > 0) {
+      const prompt = `You are a pricing strategist for Sathvam Natural Products (cold-pressed oils, Tamil Nadu).
+For each flagged product, give a ONE-sentence pricing recommendation. Reply as JSON array:
+[{"product_id":"<id>","reasoning":"<1 sentence>"}]
+
+Flagged products:
+${flagged.map(p => `${p.product_name}: our=₹${p.our_website_price}, comp_avg=₹${p.competitor_avg}, flag=${p.flag}, min_viable=₹${p.min_viable_price}`).join('\n')}`;
+
+      try {
+        const aiRes = await client.messages.create({
+          model: 'claude-haiku-4-5-20251001',
+          max_tokens: 800,
+          messages: [{ role: 'user', content: prompt }],
+        });
+        const text = aiRes.content[0]?.text || '';
+        const match = text.match(/\[[\s\S]*\]/);
+        if (match) {
+          const arr = JSON.parse(match[0]);
+          for (const item of arr) {
+            const r = results.find(x => x.product_id === item.product_id);
+            if (r) r.ai_reasoning = item.reasoning;
+          }
+        }
+      } catch {}
+    }
+
+    const summary = { total: results.length, over: flagged.filter(f => f.flag === 'over').length, under: flagged.filter(f => f.flag === 'under').length, ok: results.filter(r => r.flag === 'ok').length };
+
+    res.json({ generated_at: new Date().toISOString().slice(0, 10), prices_last_updated: cpUpdatedAt, products: results, summary });
+  } catch (e) {
+    console.error('[price-optimization]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/analytics/segments/summary
 router.get('/segments/summary', auth, async (req, res) => {
   try {

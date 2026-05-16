@@ -85,6 +85,7 @@ const { b2bCustomers, b2bOrders, projects, b2bItemProgress, b2bStatement, b2bSto
 const b2bAuth = require('./routes/b2bAuth');
 const purchases = require('./routes/purchases');
 const flourBatches = require('./routes/flourBatches');
+const spiceBatches = require('./routes/spiceBatches');
 const webstoreOrders = require('./routes/webstoreOrders');
 
 app.get('/health', (req, res) => res.json({ status: 'ok', version: '1.2.0', time: new Date().toISOString() }));
@@ -99,6 +100,7 @@ app.use('/api/settings',      settings);
 app.use('/api/users',         users);
 app.use('/api/purchases',     purchases);
 app.use('/api/flour-batches', flourBatches);
+app.use('/api/spice-batches', spiceBatches);
 app.use('/api/webstore-orders', webstoreOrders);
 app.use('/api/customer/signup',             signupLimiter);
 app.use('/api/customer/login',             authLimiter);

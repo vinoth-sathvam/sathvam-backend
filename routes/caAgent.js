@@ -1229,6 +1229,192 @@ router.get('/simple-dashboard', auth, roleGuard, async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/ca-agent/balance-sheet
+// Approximate management balance sheet from live DB data
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/balance-sheet', auth, roleGuard, async (req, res) => {
+  try {
+    const r2 = n => Math.round((parseFloat(n) || 0) * 100) / 100;
+    const today = new Date().toISOString().slice(0, 10);
+
+    const [bankAccs, b2bAR, wsAR, stockLedger, prods, procLast, apBills] = await Promise.all([
+      supabase.from('bank_accounts').select('name,current_balance').eq('is_active', true),
+      supabase.from('b2b_orders').select('total_value').not('stage', 'in', '("delivered","cancelled","invoice_paid")'),
+      supabase.from('webstore_orders').select('total').in('status', ['confirmed', 'processing']),
+      supabase.from('stock_ledger').select('product_id,type,qty,rate'),
+      supabase.from('products').select('id,website_price').eq('active', true),
+      supabase.from('procurements').select('commodity_name,received_qty,ordered_price_per_kg,date')
+        .order('date', { ascending: false }).limit(300),
+      supabase.from('vendor_bills').select('amount,gst_amount,paid_amount,status')
+        .in('status', ['unpaid', 'partial', 'overdue']).is('deleted_at', null),
+    ]);
+
+    // ── Assets ────────────────────────────────────────────────────────────────
+    const cashAndBank = r2((bankAccs.data || []).reduce((s, a) => s + (a.current_balance || 0), 0));
+    const arB2B       = r2((b2bAR.data || []).reduce((s, o) => s + (o.total_value || 0), 0));
+    const arWebstore  = r2((wsAR.data || []).reduce((s, o) => s + (o.total || 0), 0));
+
+    // Finished goods stock value: net stock qty × website_price
+    const priceMap = Object.fromEntries((prods.data || []).map(p => [p.id, parseFloat(p.website_price) || 0]));
+    const netStock = {};
+    for (const row of stockLedger.data || []) {
+      const pid = row.product_id;
+      if (!netStock[pid]) netStock[pid] = 0;
+      netStock[pid] += row.type === 'IN' ? (parseFloat(row.qty) || 0) : -(parseFloat(row.qty) || 0);
+    }
+    const inventoryFG = r2(Object.entries(netStock).reduce((s, [pid, qty]) => {
+      return s + Math.max(0, qty) * (priceMap[pid] || 0) * 0.6; // at ~60% of selling price (cost basis)
+    }, 0));
+
+    // Raw material inventory: latest receipts not yet consumed (heuristic)
+    const rawByComm = {};
+    for (const p of procLast.data || []) {
+      if (!rawByComm[p.commodity_name]) rawByComm[p.commodity_name] = { qty: 0, rate: 0 };
+      rawByComm[p.commodity_name].qty += parseFloat(p.received_qty) || 0;
+      if (!rawByComm[p.commodity_name].rate) rawByComm[p.commodity_name].rate = parseFloat(p.ordered_price_per_kg) || 0;
+    }
+    const inventoryRaw = r2(Object.values(rawByComm).reduce((s, v) => s + v.qty * v.rate * 0.3, 0)); // approx remaining
+
+    const totalCurrentAssets = r2(cashAndBank + arB2B + arWebstore + inventoryFG + inventoryRaw);
+
+    // ── Liabilities ───────────────────────────────────────────────────────────
+    const apTotal = r2((apBills.data || []).reduce((s, b) =>
+      s + r2((b.amount || 0) + (b.gst_amount || 0) - (b.paid_amount || 0)), 0));
+
+    // ── Equity (residual) ─────────────────────────────────────────────────────
+    const totalAssets      = totalCurrentAssets;
+    const totalLiabilities = apTotal;
+    const netWorth         = r2(totalAssets - totalLiabilities);
+
+    res.json({
+      as_of: today,
+      note: 'Management summary only — excludes fixed assets, depreciation, loans, and share capital. Not a statutory balance sheet.',
+      assets: {
+        current: {
+          cash_and_bank:         cashAndBank,
+          accounts_receivable_b2b:     arB2B,
+          accounts_receivable_webstore: arWebstore,
+          inventory_finished_goods:    inventoryFG,
+          inventory_raw_materials:     inventoryRaw,
+          total_current:               totalCurrentAssets,
+        },
+        fixed: { note: 'Not tracked — enter manually in Tally/Zoho', value: 0 },
+        total_assets: totalAssets,
+      },
+      liabilities: {
+        current: { accounts_payable: apTotal, total_current: apTotal },
+        long_term: { note: 'Not tracked in system', value: 0 },
+        total_liabilities: totalLiabilities,
+      },
+      equity: {
+        net_worth_approx: netWorth,
+        note: 'Total Assets − Total Liabilities (approximate)',
+      },
+    });
+  } catch (e) {
+    console.error('[balance-sheet]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/ca-agent/tally-export
+// Generate Tally-compatible XML for vouchers
+// Query params: type=sales|expenses  from=YYYY-MM-DD  to=YYYY-MM-DD
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/tally-export', auth, roleGuard, async (req, res) => {
+  try {
+    const type = req.query.type || 'sales';
+    const from = req.query.from || new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
+    const to   = req.query.to   || new Date().toISOString().slice(0, 10);
+
+    const escXml = s => String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    const tallyDate = d => (d || '').replace(/-/g, ''); // YYYYMMDD
+
+    let vouchers = [];
+
+    if (type === 'sales') {
+      const [salesRes, wsRes] = await Promise.all([
+        supabase.from('sales').select('order_no,customer_name,final_amount,date,payment_method,items')
+          .in('status', ['delivered','dispatched','paid']).gte('date', from).lte('date', to).order('date'),
+        supabase.from('webstore_orders').select('order_no,customer,total,date,payment_status')
+          .in('status', ['delivered','paid']).gte('date', from).lte('date', to).order('date'),
+      ]);
+      for (const s of salesRes.data || []) {
+        const amt = parseFloat(s.final_amount) || 0;
+        if (amt <= 0) continue;
+        const payMode = (s.payment_method || 'Cash').includes('UPI') || (s.payment_method || '').includes('Online') ? 'Bank Account' : 'Cash';
+        vouchers.push({ date: s.date, no: s.order_no, party: s.customer_name || 'Cash Sale', amount: amt, payLedger: payMode, type: 'Sales' });
+      }
+      for (const o of wsRes.data || []) {
+        const amt = parseFloat(o.total) || 0;
+        if (amt <= 0) continue;
+        const custName = typeof o.customer === 'object' ? (o.customer?.name || 'Web Customer') : 'Web Customer';
+        vouchers.push({ date: o.date, no: o.order_no, party: custName, amount: amt, payLedger: 'Bank Account', type: 'Sales' });
+      }
+    } else if (type === 'expenses') {
+      const { data: expenses } = await supabase.from('company_expenses')
+        .select('date,category,amount,vendor_name,description,payment_mode')
+        .is('deleted_at', null).gte('date', from).lte('date', to).order('date');
+      for (const e of expenses || []) {
+        const amt = parseFloat(e.amount) || 0;
+        if (amt <= 0) continue;
+        const payLedger = (e.payment_mode || 'Cash').toLowerCase().includes('bank') || (e.payment_mode || '').toLowerCase().includes('online') ? 'Bank Account' : 'Cash';
+        vouchers.push({ date: e.date, no: '', party: e.vendor_name || 'Miscellaneous', amount: amt, payLedger, type: e.category || 'Indirect Expenses', note: e.description });
+      }
+    }
+
+    const voucherXml = vouchers.map((v, i) => `
+        <TALLYMESSAGE xmlns:UDF="TallyUDF">
+          <VOUCHER VCHTYPE="${escXml(v.type)}" ACTION="Create" OBJVIEW="Accounting Voucher View">
+            <DATE>${tallyDate(v.date)}</DATE>
+            <VOUCHERNUMBER>${escXml(v.no || String(i + 1))}</VOUCHERNUMBER>
+            <NARRATION>${escXml(v.note || v.type + (v.no ? ' - ' + v.no : ''))}</NARRATION>
+            <PARTYLEDGERNAME>${escXml(v.party)}</PARTYLEDGERNAME>
+            <ALLLEDGERENTRIES.LIST>
+              <LEDGERNAME>${escXml(v.payLedger)}</LEDGERNAME>
+              <ISDEEMEDPOSITIVE>Yes</ISDEEMEDPOSITIVE>
+              <AMOUNT>-${v.amount.toFixed(2)}</AMOUNT>
+            </ALLLEDGERENTRIES.LIST>
+            <ALLLEDGERENTRIES.LIST>
+              <LEDGERNAME>${escXml(v.party)}</LEDGERNAME>
+              <ISDEEMEDPOSITIVE>No</ISDEEMEDPOSITIVE>
+              <AMOUNT>${v.amount.toFixed(2)}</AMOUNT>
+            </ALLLEDGERENTRIES.LIST>
+          </VOUCHER>
+        </TALLYMESSAGE>`).join('');
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<!-- Tally XML Export — Sathvam Natural Products | ${type} | ${from} to ${to} | ${vouchers.length} vouchers -->
+<ENVELOPE>
+  <HEADER>
+    <TALLYREQUEST>Import Data</TALLYREQUEST>
+  </HEADER>
+  <BODY>
+    <IMPORTDATA>
+      <REQUESTDESC>
+        <REPORTNAME>Vouchers</REPORTNAME>
+        <STATICVARIABLES>
+          <SVCURRENTCOMPANY>Sathvam Natural Products Private Limited</SVCURRENTCOMPANY>
+        </STATICVARIABLES>
+      </REQUESTDESC>
+      <REQUESTDATA>${voucherXml}
+      </REQUESTDATA>
+    </IMPORTDATA>
+  </BODY>
+</ENVELOPE>`;
+
+    const filename = `tally_${type}_${from}_to_${to}.xml`;
+    res.setHeader('Content-Type', 'application/xml');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(xml);
+  } catch (e) {
+    console.error('[tally-export]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // POST /api/ca-agent/run — trigger a manual run via monitor-api on the host
 // (backend runs in Docker; ca-agent.js needs host node + node_modules)
 router.post('/run', auth, roleGuard, async (req, res) => {

@@ -106,93 +106,163 @@ async function buildWeeklyReport() {
   const d7         = new Date(Date.now() - 7  * 24*60*60*1000).toISOString().slice(0, 10);
   const d14        = new Date(Date.now() - 14 * 24*60*60*1000).toISOString().slice(0, 10);
   const monthStart = today.slice(0, 7) + '-01';
+  const inr = n => '₹' + Math.round(parseFloat(n)||0).toLocaleString('en-IN');
 
-  const [thisWeek, lastWeek, monthSales, stockData, products, lowStockRes, weekExp] = await Promise.all([
-    supabase.from('sales').select('final_amount,channel,status').gte('date', d7).lte('date', today),
-    supabase.from('sales').select('final_amount').gte('date', d14).lt('date', d7),
-    supabase.from('sales').select('final_amount').gte('date', monthStart).lte('date', today),
+  const [
+    thisWeekSales, lastWeekSales, monthSales,
+    thisWeekWso, lastWeekWso, monthWso,
+    thisWeekB2b,
+    stockData, products, pendingOrders, weekExp,
+    bankAccs, procData,
+  ] = await Promise.all([
+    supabase.from('sales').select('final_amount,channel,status').gte('date', d7).lte('date', today).in('status',['delivered','dispatched','paid']),
+    supabase.from('sales').select('final_amount').gte('date', d14).lt('date', d7).in('status',['delivered','dispatched','paid']),
+    supabase.from('sales').select('final_amount').gte('date', monthStart).lte('date', today).in('status',['delivered','dispatched','paid']),
+    supabase.from('webstore_orders').select('total').gte('date', d7).lte('date', today).in('status',['confirmed','shipped','delivered','paid']),
+    supabase.from('webstore_orders').select('total').gte('date', d14).lt('date', d7).in('status',['confirmed','shipped','delivered','paid']),
+    supabase.from('webstore_orders').select('total').gte('date', monthStart).lte('date', today).in('status',['confirmed','shipped','delivered','paid']),
+    supabase.from('b2b_orders').select('total_value').gte('date', monthStart).lte('date', today).not('stage','eq','cancelled'),
     supabase.from('stock_ledger').select('product_id,type,qty'),
     supabase.from('products').select('id,name').eq('active', true),
-    supabase.from('sales').select('order_no,customer_name,final_amount').eq('status', 'pending').limit(10),
+    supabase.from('webstore_orders').select('order_no,customer,total').in('status',['confirmed','processing']).limit(10),
     supabase.from('company_expenses').select('category,amount').gte('date', d7).lte('date', today).is('deleted_at', null),
+    supabase.from('bank_accounts').select('name,current_balance').eq('is_active', true),
+    supabase.from('procurements').select('ordered_qty,ordered_price_per_kg,gst').gte('date', d7).lte('date', today).in('status',['received','stocked','cleaned']),
   ]);
 
-  const twRev     = (thisWeek.data||[]).reduce((s,r) => s+(r.final_amount||0), 0);
-  const lwRev     = (lastWeek.data||[]).reduce((s,r) => s+(r.final_amount||0), 0);
-  const monRev    = (monthSales.data||[]).reduce((s,r) => s+(r.final_amount||0), 0);
-  const weekExpTotal = (weekExp.data||[]).reduce((s,r) => s+parseFloat(r.amount||0), 0);
+  // Revenue
+  const twSalesRev = (thisWeekSales.data||[]).reduce((s,r)=>s+parseFloat(r.final_amount||0),0);
+  const twWsoRev   = (thisWeekWso.data||[]).reduce((s,r)=>s+parseFloat(r.total||0),0);
+  const twRev      = twSalesRev + twWsoRev;
+  const lwRev      = (lastWeekSales.data||[]).reduce((s,r)=>s+parseFloat(r.final_amount||0),0)
+                   + (lastWeekWso.data||[]).reduce((s,r)=>s+parseFloat(r.total||0),0);
+  const monSalesRev= (monthSales.data||[]).reduce((s,r)=>s+parseFloat(r.final_amount||0),0);
+  const monWsoRev  = (monthWso.data||[]).reduce((s,r)=>s+parseFloat(r.total||0),0);
+  const monB2bRev  = (thisWeekB2b.data||[]).reduce((s,r)=>s+parseFloat(r.total_value||0),0);
+  const monRev     = monSalesRev + monWsoRev + monB2bRev;
+
+  // Expenses & COGS
+  const weekExpTotal = (weekExp.data||[]).reduce((s,r)=>s+parseFloat(r.amount||0),0);
+  const weekProcCost = (procData.data||[]).reduce((s,r)=>{
+    const qty=parseFloat(r.ordered_qty||0), rate=parseFloat(r.ordered_price_per_kg||0), gst=parseFloat(r.gst||0);
+    return s + qty*rate*(1+gst/100);
+  },0);
+  const weekGrossProfit = twRev - weekProcCost;
+  const weekNet = twRev - weekExpTotal - weekProcCost;
+
+  // Gross margin
+  const grossMarginPct = twRev > 0 ? Math.round(weekGrossProfit / twRev * 100) : 0;
+  const netMarginPct   = twRev > 0 ? Math.round(weekNet / twRev * 100) : 0;
+
   const revChange = lwRev > 0 ? Math.round(((twRev-lwRev)/lwRev)*100) : 0;
 
-  const byChannel = {};
-  for (const r of thisWeek.data||[]) byChannel[r.channel] = (byChannel[r.channel]||0) + (r.final_amount||0);
+  // Bank balance
+  const cashBalance = (bankAccs.data||[]).reduce((s,a)=>s+(a.current_balance||0),0);
 
+  // Stock
   const stock = {};
   for (const row of stockData.data||[]) {
     if (!stock[row.product_id]) stock[row.product_id] = 0;
-    stock[row.product_id] += row.type==='in' ? (+row.qty||0) : -(+row.qty||0);
+    stock[row.product_id] += row.type==='IN' ? (+row.qty||0) : -(+row.qty||0);
   }
   const lowStock = (products.data||[]).filter(p => (stock[p.id]||0) < 10).map(p => p.name);
 
-  // Expense breakdown this week
-  const byCat = {};
-  for (const r of weekExp.data||[]) byCat[r.category] = (byCat[r.category]||0) + parseFloat(r.amount||0);
-  const expCatRows = Object.entries(byCat).sort((a,b)=>b[1]-a[1])
-    .map(([cat,amt]) => `<tr><td style="padding:5px 10px">${cat}</td><td style="padding:5px 10px;text-align:right;font-weight:600">₹${Math.round(amt).toLocaleString('en-IN')}</td></tr>`).join('');
+  // Channel breakdown (sales table only)
+  const byChannel = {};
+  for (const r of thisWeekSales.data||[]) byChannel[r.channel||'Direct'] = (byChannel[r.channel||'Direct']||0) + parseFloat(r.final_amount||0);
+  byChannel['Webstore'] = (byChannel['Webstore']||0) + twWsoRev;
 
   const channelRows = Object.entries(byChannel)
-    .map(([ch,rev]) => `<tr><td style="padding:6px 12px">${ch}</td><td style="padding:6px 12px;text-align:right">₹${Math.round(rev).toLocaleString('en-IN')}</td><td style="padding:6px 12px;text-align:center">${(thisWeek.data||[]).filter(r=>r.channel===ch).length}</td></tr>`).join('');
+    .map(([ch,rev]) => `<tr><td style="padding:6px 12px">${ch}</td><td style="padding:6px 12px;text-align:right;font-weight:600">${inr(rev)}</td></tr>`).join('');
+
+  const expByCat = {};
+  for (const r of weekExp.data||[]) expByCat[r.category] = (expByCat[r.category]||0) + parseFloat(r.amount||0);
+  const expCatRows = Object.entries(expByCat).sort((a,b)=>b[1]-a[1])
+    .map(([cat,amt]) => `<tr><td style="padding:5px 10px;color:#6b7280">${cat}</td><td style="padding:5px 10px;text-align:right;font-weight:600">${inr(amt)}</td></tr>`).join('');
 
   const html = `
-<div style="font-family:sans-serif;max-width:600px;margin:0 auto">
-  <div style="background:#1a5c2a;color:#fff;padding:20px 24px;border-radius:8px 8px 0 0">
-    <h2 style="margin:0">Sathvam Weekly Report</h2>
-    <p style="margin:4px 0 0;opacity:.8;font-size:13px">${d7} to ${today}</p>
+<div style="font-family:sans-serif;max-width:640px;margin:0 auto">
+  <div style="background:linear-gradient(135deg,#0f2820,#1a5c2a);color:#fff;padding:20px 24px;border-radius:8px 8px 0 0">
+    <h2 style="margin:0;font-size:18px">📊 Sathvam Weekly P&amp;L Report</h2>
+    <p style="margin:4px 0 0;opacity:.8;font-size:13px">${d7} → ${today} · Auto-generated every Monday 9 AM IST</p>
   </div>
-  <div style="border:1px solid #ddd;border-top:none;padding:20px 24px;border-radius:0 0 8px 8px">
-    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:20px">
-      <div style="flex:1;min-width:120px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px">
-        <div style="font-size:12px;color:#6b7280">This Week Revenue</div>
-        <div style="font-size:22px;font-weight:700;color:#1a5c2a">₹${Math.round(twRev).toLocaleString('en-IN')}</div>
-        <div style="font-size:12px;color:${revChange>=0?'#16a34a':'#dc2626'}">${revChange>=0?'▲':'▼'} ${Math.abs(revChange)}% vs last week</div>
+  <div style="border:1px solid #ddd;border-top:none;padding:20px 24px;border-radius:0 0 8px 8px;background:#fff">
+
+    <!-- KPI Cards -->
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px">
+      <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px;text-align:center">
+        <div style="font-size:11px;color:#6b7280;margin-bottom:4px">THIS WEEK REVENUE</div>
+        <div style="font-size:20px;font-weight:800;color:#15803d">${inr(twRev)}</div>
+        <div style="font-size:11px;color:${revChange>=0?'#16a34a':'#dc2626'}">${revChange>=0?'▲':'▼'} ${Math.abs(revChange)}% vs last week</div>
       </div>
-      <div style="flex:1;min-width:120px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px">
-        <div style="font-size:12px;color:#6b7280">This Week Expenses</div>
-        <div style="font-size:22px;font-weight:700;color:#dc2626">₹${Math.round(weekExpTotal).toLocaleString('en-IN')}</div>
+      <div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;padding:12px;text-align:center">
+        <div style="font-size:11px;color:#6b7280;margin-bottom:4px">GROSS PROFIT</div>
+        <div style="font-size:20px;font-weight:800;color:${weekGrossProfit>=0?'#15803d':'#dc2626'}">${inr(weekGrossProfit)}</div>
+        <div style="font-size:11px;color:#6b7280">${grossMarginPct}% margin</div>
       </div>
-      <div style="flex:1;min-width:120px;background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:12px">
-        <div style="font-size:12px;color:#6b7280">Month Revenue</div>
-        <div style="font-size:22px;font-weight:700;color:#1a5c2a">₹${Math.round(monRev).toLocaleString('en-IN')}</div>
+      <div style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:12px;text-align:center">
+        <div style="font-size:11px;color:#6b7280;margin-bottom:4px">CASH IN BANK</div>
+        <div style="font-size:20px;font-weight:800;color:${cashBalance>=50000?'#15803d':cashBalance>=0?'#d97706':'#dc2626'}">${inr(cashBalance)}</div>
+        <div style="font-size:11px;color:#6b7280">As of today</div>
       </div>
     </div>
 
-    <h3 style="margin:0 0 8px;font-size:14px;color:#374151">Sales by Channel</h3>
+    <!-- P&L Table -->
+    <h3 style="margin:0 0 8px;font-size:14px;color:#374151;border-bottom:2px solid #e5e7eb;padding-bottom:6px">📈 Weekly P&amp;L Summary</h3>
     <table style="width:100%;border-collapse:collapse;margin-bottom:20px;font-size:13px">
-      <thead><tr style="background:#f9fafb"><th style="padding:6px 12px;text-align:left">Channel</th><th style="padding:6px 12px;text-align:right">Revenue</th><th style="padding:6px 12px;text-align:center">Orders</th></tr></thead>
-      <tbody>${channelRows}</tbody>
+      <tbody>
+        <tr><td style="padding:6px 10px;color:#374151">Revenue (Sales + Webstore)</td><td style="padding:6px 10px;text-align:right;font-weight:600;color:#15803d">${inr(twRev)}</td></tr>
+        <tr style="background:#fafafa"><td style="padding:6px 10px;color:#6b7280">  Raw Material Cost (COGS)</td><td style="padding:6px 10px;text-align:right;color:#dc2626">(${inr(weekProcCost)})</td></tr>
+        <tr style="border-top:1px solid #e5e7eb"><td style="padding:6px 10px;font-weight:700">Gross Profit</td><td style="padding:6px 10px;text-align:right;font-weight:800;color:${weekGrossProfit>=0?'#15803d':'#dc2626'}">${inr(weekGrossProfit)} <span style="font-weight:400;font-size:11px">(${grossMarginPct}%)</span></td></tr>
+        <tr style="background:#fafafa"><td style="padding:6px 10px;color:#6b7280">  Operating Expenses</td><td style="padding:6px 10px;text-align:right;color:#dc2626">(${inr(weekExpTotal)})</td></tr>
+        <tr style="border-top:2px solid #374151"><td style="padding:8px 10px;font-weight:800;font-size:14px">Net Profit / (Loss)</td><td style="padding:8px 10px;text-align:right;font-weight:800;font-size:14px;color:${weekNet>=0?'#15803d':'#dc2626'}">${inr(weekNet)} <span style="font-weight:400;font-size:11px">(${netMarginPct}%)</span></td></tr>
+      </tbody>
     </table>
 
-    ${expCatRows ? `
-    <h3 style="margin:0 0 8px;font-size:14px;color:#374151">Expenses This Week</h3>
-    <table style="width:100%;border-collapse:collapse;margin-bottom:20px;font-size:13px">
-      <tbody>${expCatRows}</tbody>
-      <tfoot><tr style="background:#fef2f2"><td style="padding:6px 10px;font-weight:700">Total</td><td style="padding:6px 10px;text-align:right;font-weight:700;color:#dc2626">₹${Math.round(weekExpTotal).toLocaleString('en-IN')}</td></tr></tfoot>
+    <!-- Month Revenue -->
+    <div style="background:#f8fafc;border-radius:8px;padding:14px;margin-bottom:18px;font-size:13px">
+      <strong>Month-to-Date Revenue (${today.slice(0,7)})</strong><br>
+      <span style="color:#6b7280">Local Sales: </span><strong>${inr(monSalesRev)}</strong> &nbsp;|&nbsp;
+      <span style="color:#6b7280">Webstore: </span><strong>${inr(monWsoRev)}</strong> &nbsp;|&nbsp;
+      <span style="color:#6b7280">B2B: </span><strong>${inr(monB2bRev)}</strong><br>
+      <span style="font-size:12px;color:#6b7280">Total MTD: </span><strong style="font-size:15px;color:#15803d">${inr(monRev)}</strong>
+    </div>
+
+    <!-- Channel breakdown -->
+    ${channelRows ? `
+    <h3 style="margin:0 0 8px;font-size:14px;color:#374151">Revenue by Channel</h3>
+    <table style="width:100%;border-collapse:collapse;margin-bottom:16px;font-size:13px;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden">
+      <tbody>${channelRows}</tbody>
     </table>` : ''}
 
+    <!-- Expenses -->
+    ${expCatRows ? `
+    <h3 style="margin:0 0 8px;font-size:14px;color:#374151">Expenses This Week</h3>
+    <table style="width:100%;border-collapse:collapse;margin-bottom:16px;font-size:13px;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden">
+      <tbody>${expCatRows}</tbody>
+      <tfoot><tr style="background:#fef2f2;font-weight:700"><td style="padding:6px 10px">Total</td><td style="padding:6px 10px;text-align:right;color:#dc2626">${inr(weekExpTotal)}</td></tr></tfoot>
+    </table>` : ''}
+
+    <!-- Low stock alert -->
     ${lowStock.length > 0 ? `
-    <div style="background:#fff1f2;border:1px solid #fecdd3;border-radius:8px;padding:12px;margin-bottom:16px">
-      <strong style="color:#dc2626">Low Stock (${lowStock.length} products)</strong>
-      <p style="margin:6px 0 0;font-size:13px;color:#7f1d1d">${lowStock.slice(0,10).join(', ')}${lowStock.length>10?` and ${lowStock.length-10} more`:''}</p>
+    <div style="background:#fff1f2;border:1px solid #fecdd3;border-radius:8px;padding:12px;margin-bottom:14px">
+      <strong style="color:#dc2626">⚠️ Low Stock (${lowStock.length} products)</strong>
+      <p style="margin:6px 0 0;font-size:12px;color:#7f1d1d">${lowStock.slice(0,10).join(', ')}${lowStock.length>10?` and ${lowStock.length-10} more`:''}</p>
     </div>` : ''}
 
-    ${(lowStockRes.data||[]).length > 0 ? `
-    <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:12px">
-      <strong style="color:#92400e">Pending Orders (${(lowStockRes.data||[]).length})</strong>
-      <ul style="margin:6px 0 0;padding-left:16px;font-size:13px;color:#78350f">
-        ${(lowStockRes.data||[]).map(o=>`<li>${o.order_no} — ${o.customer_name} — ₹${(o.final_amount||0).toLocaleString('en-IN')}</li>`).join('')}
+    <!-- Pending orders -->
+    ${(pendingOrders.data||[]).length > 0 ? `
+    <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:12px;margin-bottom:14px">
+      <strong style="color:#92400e">📦 Pending Webstore Orders (${(pendingOrders.data||[]).length})</strong>
+      <ul style="margin:6px 0 0;padding-left:16px;font-size:12px;color:#78350f">
+        ${(pendingOrders.data||[]).map(o=>`<li>${o.order_no} — ${typeof o.customer==='object'?(o.customer?.name||'Guest'):'Guest'} — ${inr(o.total)}</li>`).join('')}
       </ul>
     </div>` : ''}
 
-    <p style="margin:20px 0 0;font-size:12px;color:#9ca3af;text-align:center">Sathvam Natural Products · Karur, Tamil Nadu · Auto-generated weekly report</p>
+    <div style="border-top:1px solid #e5e7eb;margin-top:16px;padding-top:12px;text-align:center">
+      <a href="https://admin.sathvam.in" style="display:inline-block;background:#1a5c2a;color:#fff;padding:10px 24px;border-radius:8px;text-decoration:none;font-weight:700;font-size:13px">View Full Dashboard →</a>
+      <p style="margin:10px 0 0;font-size:11px;color:#9ca3af">Sathvam Natural Products · Karur, Tamil Nadu · Auto-generated Monday 9 AM IST</p>
+    </div>
   </div>
 </div>`;
   return html;
@@ -201,14 +271,14 @@ async function buildWeeklyReport() {
 // ── Scheduler ──────────────────────────────────────────────────────────────────
 
 function startScheduler() {
-  // ── Weekly report: Every Monday 8:00 AM IST (2:30 AM UTC) ─────────────────
-  cron.schedule('30 2 * * 1', async () => {
+  // ── Weekly report: Every Monday 9:00 AM IST (3:30 AM UTC) ─────────────────
+  cron.schedule('30 3 * * 1', async () => {
     if (!process.env.SMTP_USER || !process.env.SMTP_PASS) return;
     try {
       const html  = await buildWeeklyReport();
       const today = new Date().toISOString().slice(0, 10);
-      // Send to all admins + configured address
-      const { data: admins } = await supabase.from('users').select('email').eq('role','admin').eq('active',true);
+      // Send to all admins + CEO role users + configured address
+      const { data: admins } = await supabase.from('users').select('email').in('role',['admin','ceo']).eq('active',true);
       const toList = [...new Set(['vinoth@sathvam.in', ...(admins||[]).map(u=>u.email).filter(Boolean)])];
       await mailer.sendMail({
         from:    process.env.SMTP_FROM || 'Sathvam <noreply@sathvam.in>',

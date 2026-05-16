@@ -158,10 +158,11 @@ router.get('/stock', async (req, res) => {
     }
 
     // Step 3: liters already packed per oil type (production channel entries in ledger)
+    const productMap = new Map((products || []).map(p => [p.id, p]));
     const packedL = {};
     for (const row of (ledger || [])) {
       if (row.channel !== 'production' || row.type !== 'in' || !row.product_id) continue;
-      const prod = (products || []).find(p => p.id === row.product_id);
+      const prod = productMap.get(row.product_id);
       if (!prod?.oil_type_key) continue;
       const key = prod.oil_type_key.toLowerCase();
       const packUnit = (prod.pack_unit || 'ML').toUpperCase();

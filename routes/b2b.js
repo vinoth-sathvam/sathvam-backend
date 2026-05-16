@@ -5,7 +5,7 @@ const { auth, requireRole } = require('../middleware/auth');
 const { createInvoice, recordPayment, zoho } = require('../config/zoho');
 
 const b2bCustomers = express.Router();
-const B2B_CUST_SELECT = 'id,company_name,contact_name,email,country,currency,address,delivery_address,phone,gstin,pan,gst_treatment,payment_terms,active,registered_date,credit_limit,credit_used';
+const B2B_CUST_SELECT = 'id,company_name,contact_name,email,country,currency,address,delivery_address,phone,gstin,pan,gst_treatment,payment_terms,active,registered_date,credit_limit,credit_used,branch';
 
 b2bCustomers.get('/', auth, requireRole('admin','manager','ceo'), async (req, res) => {
   const { data, error } = await supabase
@@ -33,6 +33,7 @@ b2bCustomers.put('/:id', auth, requireRole('admin','manager'), async (req, res) 
   if (c.paymentTerms      !== undefined) updates.payment_terms    = c.paymentTerms;
   if (c.active            !== undefined) updates.active           = c.active;
   if (c.creditLimit       !== undefined) updates.credit_limit     = c.creditLimit;
+  if (c.branch            !== undefined) updates.branch           = c.branch;
   const { data, error } = await supabase.from('b2b_customers').update(updates).eq('id', req.params.id).select(B2B_CUST_SELECT + ',credit_limit,credit_used').single();
   if (error) return res.status(400).json({ error: 'Update failed' });
   res.json(data);
@@ -54,8 +55,9 @@ b2bCustomers.post('/', auth, requireRole('admin'), async (req, res) => {
     address: c.address, delivery_address: c.deliveryAddress||null,
     phone: c.phone, gstin: c.gstin||null, pan: c.pan||null,
     gst_treatment: c.gstTreatment||null, payment_terms: c.paymentTerms||null,
+    branch: c.branch||null,
   }).select(B2B_CUST_SELECT).single();
-  if (error) return res.status(400).json({ error: 'Failed to create customer' });
+  if (error) return res.status(400).json({ error: 'Failed to create customer', detail: error.message, code: error.code });
   res.status(201).json(data);
 });
 

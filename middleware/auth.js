@@ -14,13 +14,16 @@ const auth = async (req, res, next) => {
     // Single-session enforcement for admin users only (not customer/b2b tokens)
     // session_token in JWT must match the DB value — new login overwrites it
     if (decoded.role && decoded.session_token) {
-      const { data: row } = await supabase
+      const { data: row, error: dbErr } = await supabase
         .from('users')
         .select('session_token')
         .eq('id', decoded.id)
         .single();
 
-      if (!row || row.session_token !== decoded.session_token) {
+      if (dbErr) {
+        // Supabase error — fail open rather than kicking the user out
+        console.error('[auth] session_token check failed:', dbErr.message);
+      } else if (!row || row.session_token !== decoded.session_token) {
         return res.status(401).json({
           error: 'Session ended — your account was logged in on another device.',
           code: 'SESSION_SUPERSEDED',
