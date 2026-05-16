@@ -159,6 +159,7 @@ app.use('/api/coupons',           require('./routes/coupons'));
 app.use('/api/quality',           require('./routes/quality'));
 app.use('/api/stock-counts',      require('./routes/stockCounts'));
 app.use('/api/tasks',             require('./routes/tasks'));
+app.use('/api/ai-command',        require('./routes/aiCommand'));
 app.use('/api/compliance',        require('./routes/compliance'));
 app.use('/api/payouts',           require('./routes/payouts'));
 app.use('/api/campaigns',         require('./routes/campaigns'));
