@@ -2,11 +2,21 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const fs = require('fs');
 const path = require('path');
+const multer = require('multer');
 const nodemailer = require('nodemailer');
 const supabase = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
 const { createInvoice, recordPayment } = require('../config/zoho');
 const { bustCache } = require('./public');
+
+const procUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+const INVOICE_MIME = { 'image/jpeg':'jpg','image/jpg':'jpg','image/png':'png','image/webp':'webp','application/pdf':'pdf' };
+async function ensurePOBillsBucket() {
+  const { data: buckets } = await supabase.storage.listBuckets();
+  if (!buckets?.find(b => b.name === 'po-bills')) {
+    await supabase.storage.createBucket('po-bills', { public: true, fileSizeLimit: 10485760 });
+  }
+}
 
 const ENV_PATH = path.join(__dirname, '../.env');
 
@@ -619,6 +629,8 @@ procurement.get('/', auth, async (req, res) => {
     finalPaid:         p.final_paid,
     logisticsCostPerKg: p.logistics_cost_per_kg,
     landedCostPerKg:   p.landed_cost_per_kg,
+    vendorBillNo:      p.vendor_bill_no,
+    billScanUrl:       p.bill_scan_url,
   }));
   res.json(mapped);
 });
@@ -982,6 +994,33 @@ procurement.post('/bulk', auth, requireRole('admin','manager'), async (req, res)
   const { data, error } = await supabase.from('procurements').insert(rows).select();
   if (error) return res.status(400).json({ error: error.message });
   res.status(201).json({ inserted: data.length });
+});
+
+// ── POST /procurement/:id/attach-bill — attach vendor invoice (bill no + optional scan) ──
+procurement.post('/:id/attach-bill', auth, requireRole('admin','manager'), procUpload.single('bill_scan'), async (req, res) => {
+  try {
+    await ensurePOBillsBucket();
+    const { vendor_bill_no } = req.body;
+    const updates = { updated_at: new Date().toISOString() };
+
+    if (vendor_bill_no !== undefined) updates.vendor_bill_no = vendor_bill_no.trim();
+
+    if (req.file) {
+      const ext = INVOICE_MIME[req.file.mimetype];
+      if (!ext) return res.status(400).json({ error: 'Invalid file type. Allowed: jpg, png, webp, pdf' });
+      const fileName = `proc-${req.params.id}-${Date.now()}.${ext}`;
+      const { error: upErr } = await supabase.storage.from('po-bills').upload(fileName, req.file.buffer, {
+        contentType: req.file.mimetype, upsert: true,
+      });
+      if (upErr) return res.status(500).json({ error: 'Upload failed: ' + upErr.message });
+      const { data: urlData } = supabase.storage.from('po-bills').getPublicUrl(fileName);
+      updates.bill_scan_url = urlData.publicUrl;
+    }
+
+    const { data, error } = await supabase.from('procurements').update(updates).eq('id', req.params.id).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ ok: true, vendor_bill_no: data.vendor_bill_no, bill_scan_url: data.bill_scan_url });
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── POST /procurement/ai-raise — parse natural language PO prompt ─────────────
