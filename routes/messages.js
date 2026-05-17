@@ -131,6 +131,45 @@ router.post('/', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// DELETE /api/messages/:id — delete a single message (sender or admin only)
+router.delete('/:id', auth, async (req, res) => {
+  try {
+    const myName = req.user.name || req.user.username;
+    const isAdmin = ADMIN_ROLES.includes(req.user.role);
+    // Fetch message first to check ownership
+    const { data: msg, error: fe } = await supabase
+      .from('internal_messages').select('id,from_user').eq('id', req.params.id).single();
+    if (fe || !msg) return res.status(404).json({ error: 'Message not found' });
+    if (!isAdmin && msg.from_user !== myName)
+      return res.status(403).json({ error: 'Can only delete your own messages' });
+    const { error } = await supabase.from('internal_messages').delete().eq('id', req.params.id);
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE /api/messages/dm/:otherUserId/clear — delete all messages in a DM conversation
+router.delete('/dm/:otherUserId/clear', auth, async (req, res) => {
+  try {
+    const myName = req.user.name || req.user.username;
+    const { data: other } = await supabase
+      .from('users').select('name').eq('id', req.params.otherUserId).single();
+    if (!other) return res.status(404).json({ error: 'User not found' });
+    // Fetch IDs of messages in this conversation
+    const { data: msgs } = await supabase
+      .from('internal_messages').select('id,from_user,to_user').limit(500);
+    const ids = (msgs || [])
+      .filter(m =>
+        (m.from_user === myName && m.to_user === other.name) ||
+        (m.from_user === other.name && m.to_user === myName)
+      ).map(m => m.id);
+    if (ids.length > 0) {
+      await supabase.from('internal_messages').delete().in('id', ids);
+    }
+    res.json({ ok: true, deleted: ids.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // PATCH /api/messages/:id/read — mark a single message as read
 router.patch('/:id/read', auth, async (req, res) => {
   try {
