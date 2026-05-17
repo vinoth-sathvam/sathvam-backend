@@ -95,11 +95,42 @@ router.get('/', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /api/messages/typing — broadcast typing indicator (ephemeral, 5 s TTL)
+router.post('/typing', auth, async (req, res) => {
+  try {
+    const myName = req.user.name || req.user.username;
+    const { toUserId } = req.body;
+    if (!toUserId) return res.status(400).json({ error: 'toUserId required' });
+    const key = `chat_typing_${toUserId}`;
+    const { data: row } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
+    const list = Array.isArray(row?.value)
+      ? row.value.filter(e => e.name !== myName && Date.now() - e.ts < 6000)
+      : [];
+    list.push({ name: myName, ts: Date.now() });
+    await supabase.from('settings').upsert({ key, value: list, updated_at: new Date().toISOString() });
+    res.json({ ok: true });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET /api/messages/typing/:userId — check if a user is typing to me
+router.get('/typing/:userId', auth, async (req, res) => {
+  try {
+    const key = `chat_typing_${req.user.id}`;
+    const { data: row } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
+    const { data: other } = await supabase.from('users').select('name').eq('id', req.params.userId).single();
+    if (!other) return res.json({ typing: false });
+    const now = Date.now();
+    const typing = (Array.isArray(row?.value) ? row.value : [])
+      .some(e => e.name === other.name && now - e.ts < 6000);
+    res.json({ typing });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // POST /api/messages — send a message (supports DM via to_user_id or role-based via to_role)
 router.post('/', auth, async (req, res) => {
   try {
     const { name, role } = req.user;
-    const { to_user_id, to_role, to_user, message, thread_id } = req.body;
+    const { to_user_id, to_role, to_user, message, thread_id, reply_to_id } = req.body;
     if (!message?.trim()) return res.status(400).json({ error: 'message is required' });
 
     let resolvedToUser = to_user || null;
@@ -116,12 +147,13 @@ router.post('/', auth, async (req, res) => {
     const { data, error } = await supabase
       .from('internal_messages')
       .insert({
-        thread_id: thread_id || crypto.randomUUID(),
-        from_user: name || role,
-        from_role: role,
-        to_user:   resolvedToUser,
-        to_role:   resolvedToRole,
-        message:   message.trim(),
+        thread_id:   thread_id || crypto.randomUUID(),
+        from_user:   name || role,
+        from_role:   role,
+        to_user:     resolvedToUser,
+        to_role:     resolvedToRole,
+        message:     message.trim(),
+        reply_to_id: reply_to_id || null,
       })
       .select()
       .single();
@@ -167,6 +199,48 @@ router.delete('/dm/:otherUserId/clear', auth, async (req, res) => {
       await supabase.from('internal_messages').delete().in('id', ids);
     }
     res.json({ ok: true, deleted: ids.length });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH /api/messages/:id — edit message text (sender only, within 5 min)
+router.patch('/:id', auth, async (req, res) => {
+  try {
+    const myName = req.user.name || req.user.username;
+    const { message } = req.body;
+    if (!message?.trim()) return res.status(400).json({ error: 'message required' });
+    const { data: msg } = await supabase.from('internal_messages')
+      .select('id,from_user,created_at').eq('id', req.params.id).single();
+    if (!msg) return res.status(404).json({ error: 'Message not found' });
+    if (msg.from_user !== myName) return res.status(403).json({ error: 'Can only edit your own messages' });
+    if (Date.now() - new Date(msg.created_at).getTime() > 5 * 60 * 1000)
+      return res.status(400).json({ error: 'Can only edit within 5 minutes of sending' });
+    const { data, error } = await supabase.from('internal_messages')
+      .update({ message: message.trim(), edited_at: new Date().toISOString() })
+      .eq('id', req.params.id).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/messages/:id/react — toggle emoji reaction
+router.post('/:id/react', auth, async (req, res) => {
+  try {
+    const myName = req.user.name || req.user.username;
+    const { emoji } = req.body;
+    if (!emoji) return res.status(400).json({ error: 'emoji required' });
+    const { data: msg } = await supabase.from('internal_messages')
+      .select('id,reactions').eq('id', req.params.id).single();
+    if (!msg) return res.status(404).json({ error: 'Message not found' });
+    const reactions = { ...(msg.reactions || {}) };
+    if (!reactions[emoji]) reactions[emoji] = [];
+    const idx = reactions[emoji].indexOf(myName);
+    if (idx > -1) reactions[emoji].splice(idx, 1);
+    else reactions[emoji].push(myName);
+    if (reactions[emoji].length === 0) delete reactions[emoji];
+    const { data, error } = await supabase.from('internal_messages')
+      .update({ reactions }).eq('id', req.params.id).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
