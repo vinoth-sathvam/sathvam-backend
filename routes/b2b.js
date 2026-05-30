@@ -1,8 +1,59 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const nodemailer = require('nodemailer');
 const supabase = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
 const { createInvoice, recordPayment, zoho } = require('../config/zoho');
+
+const mailer = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || 'smtp.gmail.com',
+  port: parseInt(process.env.SMTP_PORT || '587'),
+  secure: false,
+  auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+});
+
+// ── Reusable email helper ─────────────────────────────────────────────────────
+async function sendOrderEmail(orderId, { subject, heading, rows, note, trackingUrl }) {
+  try {
+    const { data: order } = await supabase
+      .from('b2b_orders')
+      .select('order_no, customer_id, customer_name, b2b_customers(email, contact_name, company_name)')
+      .eq('id', orderId).single();
+    const email = order?.b2b_customers?.email;
+    if (!email) return;
+    const customerName = order.b2b_customers.contact_name || order.customer_name || 'Customer';
+    const company = order.b2b_customers.company_name || '';
+    const rowsHtml = rows.filter(r => r[1]).map(([label, value]) =>
+      `<tr><td style="padding:7px 12px;color:#6b7280;font-size:13px;white-space:nowrap">${label}</td><td style="padding:7px 12px;font-weight:600;font-size:13px;color:#1f2937">${value}</td></tr>`
+    ).join('');
+    const trackingBtn = trackingUrl
+      ? `<div style="text-align:center;margin:16px 0"><a href="${trackingUrl}" style="background:#0A4840;color:#fff;padding:10px 22px;border-radius:8px;text-decoration:none;font-weight:700;font-size:13px">Track Shipment →</a></div>`
+      : '';
+    await mailer.sendMail({
+      from: `"Sathvam Natural Products" <${process.env.SMTP_USER}>`,
+      to: email,
+      subject,
+      html: `<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;color:#1f2937">
+        <div style="background:#0A4840;padding:22px 24px;border-radius:12px 12px 0 0;text-align:center">
+          <h2 style="color:#fff;margin:0;font-size:18px">${heading}</h2>
+          <p style="color:#a7f3d0;margin:4px 0 0;font-size:13px">Order ${order.order_no}</p>
+        </div>
+        <div style="background:#f9fafb;padding:24px;border-radius:0 0 12px 12px;border:1px solid #e5e7eb">
+          <p style="margin:0 0 16px">Dear ${customerName}${company ? ` (${company})` : ''},</p>
+          <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;margin-bottom:16px">${rowsHtml}</table>
+          ${note ? `<p style="margin:0 0 16px;font-size:13px;color:#374151;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:12px">${note}</p>` : ''}
+          ${trackingBtn}
+          <div style="text-align:center;margin-top:16px">
+            <a href="https://admin.sathvam.in" style="background:#1d4ed8;color:#fff;padding:10px 22px;border-radius:8px;text-decoration:none;font-weight:700;font-size:13px">View in Portal →</a>
+          </div>
+          <p style="margin:16px 0 0;font-size:11px;color:#9ca3af;text-align:center">Sathvam Natural Products · sathvam.in</p>
+        </div>
+      </div>`,
+    });
+  } catch (e) {
+    console.error('[b2b-email]', e.message);
+  }
+}
 
 const b2bCustomers = express.Router();
 const B2B_CUST_SELECT = 'id,company_name,contact_name,email,country,currency,address,delivery_address,phone,gstin,pan,gst_treatment,payment_terms,active,registered_date,credit_limit,credit_used,branch';
@@ -42,7 +93,7 @@ b2bCustomers.post('/:id/reset-password', auth, requireRole('admin','manager'), a
   const { password } = req.body;
   if (!password || password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
   const hash = await bcrypt.hash(password, 10);
-  const { error } = await supabase.from('b2b_customers').update({ password_hash: hash }).eq('id', req.params.id);
+  const { error } = await supabase.from('b2b_customers').update({ password: hash }).eq('id', req.params.id);
   if (error) return res.status(500).json({ error: 'Failed to reset password' });
   res.json({ success: true });
 });
@@ -145,6 +196,74 @@ b2bOrders.put('/:id/stage', auth, requireRole('admin','manager','ceo'), async (r
   await supabase.from('b2b_order_stages').insert({ order_id:req.params.id, stage, date:date||new Date().toISOString().slice(0,10), note:note||('Stage: '+stage), updated_by:req.user ? req.user.name : 'Admin' });
   res.json(data);
 
+  // Non-blocking: Email customer on stage change
+  const stageLabels = {
+    order_placed:'Order Placed', confirmed:'Order Confirmed', in_production:'In Production',
+    quality_check:'Quality Check', ready_to_ship:'Ready to Ship', shipped:'Shipped',
+    in_transit:'In Transit', arrived_at_port:'Arrived at Port', customs_clearance:'Customs Clearance',
+    out_for_delivery:'Out for Delivery', delivered:'Delivered', invoice_sent:'Invoice Sent',
+    invoice_paid:'Invoice Paid', cancelled:'Cancelled',
+  };
+  setImmediate(() => sendOrderEmail(req.params.id, {
+    subject: `Order Update — ${stageLabels[stage] || stage}`,
+    heading: `🔄 Order Status Updated`,
+    rows: [
+      ['New Status', stageLabels[stage] || stage],
+      ['BL No', blNo],
+      ['Container No', containerNo],
+      ['Note', note],
+    ],
+    trackingUrl: carrierTrackingUrl,
+  }));
+
+  // Non-blocking: Deduct finished goods + stock_ledger when shipped
+  if (stage === 'shipped') {
+    setImmediate(async () => {
+      try {
+        const { data: orderItems } = await supabase.from('b2b_order_items').select('*').eq('order_id', req.params.id);
+        const { data: orderMeta }  = await supabase.from('b2b_orders').select('order_no').eq('id', req.params.id).single();
+        if (!orderItems?.length) return;
+        const orderNo = orderMeta?.order_no || req.params.id;
+        const today   = new Date().toISOString().slice(0, 10);
+
+        // finished_goods OUT entries
+        const fgRows = orderItems.map(i => ({
+          product_name: i.product_name || 'Unknown',
+          category:     'oil',
+          unit:         'pcs',
+          qty:          parseFloat(i.shipped_qty != null ? i.shipped_qty : i.qty) || 1,
+          type:         'out',
+          date:         today,
+          notes:        `Auto-deducted on B2B ship — ${orderNo}`,
+          batch_ref:    orderNo,
+          created_by:   'system',
+          created_at:   new Date().toISOString(),
+          updated_at:   new Date().toISOString(),
+        }));
+        await supabase.from('finished_goods').insert(fgRows);
+
+        // stock_ledger OUT entries
+        const ledgerRows = orderItems
+          .filter(i => i.product_id)
+          .map(i => ({
+            product_id:   i.product_id,
+            product_name: i.product_name || 'Unknown',
+            date:         today,
+            type:         'out',
+            qty:          parseFloat(i.shipped_qty != null ? i.shipped_qty : i.qty) || 1,
+            unit:         i.unit || 'pcs',
+            rate:         parseFloat(i.unit_price) || 0,
+            total_value:  (parseFloat(i.shipped_qty != null ? i.shipped_qty : i.qty) || 1) * (parseFloat(i.unit_price) || 0),
+            channel:      'b2b',
+            reference:    orderNo,
+            notes:        `Shipped — B2B ${orderNo}`,
+          }));
+        if (ledgerRows.length) await supabase.from('stock_ledger').insert(ledgerRows);
+        console.log(`[B2B-STOCK] Deducted finished goods + stock_ledger for ${orderNo}`);
+      } catch (e) { console.error('[B2B-STOCK] Deduct error:', e.message); }
+    });
+  }
+
   // Non-blocking: Auto WhatsApp to buyer on stage change
   setImmediate(async () => {
     try {
@@ -219,6 +338,26 @@ b2bOrders.put('/:id', auth, requireRole('admin','manager'), async (req, res) => 
   const { data, error } = await supabase.from('b2b_orders').update(u).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: 'Update failed' });
   res.json(data);
+
+  // Non-blocking: Email customer on order details update
+  const changed = [];
+  if (o.blNo)          changed.push(['BL No', o.blNo]);
+  if (o.containerNo)   changed.push(['Container No', o.containerNo]);
+  if (o.etd)           changed.push(['ETD', o.etd]);
+  if (o.eta)           changed.push(['ETA', o.eta]);
+  if (o.courier)       changed.push(['Courier', o.courier]);
+  if (o.awbNumber)     changed.push(['AWB / Tracking No', o.awbNumber]);
+  if (o.dispatchDate)  changed.push(['Dispatch Date', o.dispatchDate]);
+  if (o.deliveredDate) changed.push(['Delivered Date', o.deliveredDate]);
+  if (o.notes)         changed.push(['Notes', o.notes]);
+  if (changed.length) {
+    setImmediate(() => sendOrderEmail(req.params.id, {
+      subject: `Order Details Updated`,
+      heading: `📋 Order Details Updated`,
+      rows: changed,
+      note: null,
+    }));
+  }
 });
 b2bOrders.delete('/:id', auth, requireRole('admin'), async (req, res) => {
   await supabase.from('b2b_order_items').delete().eq('order_id', req.params.id);
@@ -310,6 +449,9 @@ projects.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   }).eq('id', req.params.id);
   if (error) return res.status(400).json({ error: 'Update failed' });
 
+  // Fetch previous state to detect meaningful changes for email
+  const { data: prev } = await supabase.from('settings').select('value').eq('key', `project_full_${req.params.id}`).maybeSingle();
+
   // Update full blob + sync project_expenses
   await saveProjectFull(req.params.id, p);
   await supabase.from('project_expenses').delete().eq('project_id', req.params.id);
@@ -322,6 +464,148 @@ projects.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   if (exps.length) await supabase.from('project_expenses').insert(exps);
 
   res.json({ id: req.params.id, success: true });
+
+  // Non-blocking: Email customer if meaningful fields changed
+  if (p.b2bOrderId) {
+    const old = prev?.value || {};
+    const rows = [];
+    const statusLabels = { draft:'Draft', confirmed:'Confirmed', in_production:'In Production', shipped:'Shipped', delivered:'Delivered', cancelled:'Cancelled' };
+    if (p.status && p.status !== old.status)                         rows.push(['Status', statusLabels[p.status] || p.status]);
+    if (p.etd && p.etd !== old.etd)                                  rows.push(['ETD', p.etd]);
+    if (p.blNo && p.blNo !== old.blNo)                               rows.push(['BL No', p.blNo]);
+    if (p.containerNo && p.containerNo !== old.containerNo)          rows.push(['Container No', p.containerNo]);
+    if (p.mfg?.invoiceNo && p.mfg.invoiceNo !== old.mfg?.invoiceNo)  rows.push(['Manufacturer Invoice', p.mfg.invoiceNo + (p.mfg.invoiceDate ? ` (${p.mfg.invoiceDate})` : '')]);
+    if (p.merch?.invoiceNo && p.merch.invoiceNo !== old.merch?.invoiceNo) rows.push(['Merchandiser Invoice', p.merch.invoiceNo + (p.merch.invoiceDate ? ` (${p.merch.invoiceDate})` : '')]);
+    if (p.piNo && p.piNo !== old.piNo)                               rows.push(['Proforma Invoice No', p.piNo]);
+    if (rows.length) {
+      setImmediate(() => sendOrderEmail(p.b2bOrderId, {
+        subject: `Project Update — ${p.projectName || 'Your Order'}`,
+        heading: `📦 Project Update`,
+        rows,
+        note: p.notes && p.notes !== old.notes ? p.notes : null,
+        trackingUrl: null,
+      }));
+    }
+  }
+});
+
+// POST — email financial summary to B2B customer
+projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), async (req, res) => {
+  try {
+    // Load project index row
+    const { data: proj, error: pe } = await supabase.from('projects')
+      .select('id,project_name,b2b_order_id,buyer_name,status,pi_no,mfg_invoice_no,merch_invoice_no')
+      .eq('id', req.params.id).single();
+    if (pe || !proj) return res.status(404).json({ error: 'Project not found' });
+
+    if (!proj.b2b_order_id) return res.status(400).json({ error: 'No linked B2B order — cannot find customer email' });
+
+    // Load linked B2B order (for customer email + payment data)
+    const { data: order } = await supabase.from('b2b_orders')
+      .select('id,order_no,total_value,currency,b2b_customers(email,contact_name,company_name)')
+      .eq('id', proj.b2b_order_id).single();
+    const email = order?.b2b_customers?.email;
+    if (!email) return res.status(400).json({ error: 'Customer email not found' });
+
+    // Load b2b_payments for this order
+    const { data: paymentsRow } = await supabase.from('settings').select('value').eq('key','b2b_payments').single();
+    const payments = (paymentsRow?.value || {})[proj.b2b_order_id] || {};
+
+    // Load full project blob for invoice items
+    const { data: fullRow } = await supabase.from('settings').select('value').eq('key',`project_full_${proj.id}`).maybeSingle();
+    const full = fullRow?.value || {};
+
+    // Financials from request body (most current — just saved by frontend)
+    const fin = req.body.financials || full.financials || {};
+
+    // Compute MFG + MERCH totals
+    const toNum = v => parseFloat(v)||0;
+    const mfgItems = full.mfg?.items || [];
+    const mrchItems = full.merch?.items || [];
+    const calcItem = it => {
+      const qty = toNum(it.qty); const rate = toNum(it.rateINR||it.rate); return qty*rate;
+    };
+    const mfgTotal  = mfgItems.reduce((s,it)=>s+(toNum(it.totalINR)||calcItem(it)),0);
+    const mrchTotal = mrchItems.reduce((s,it)=>s+(toNum(it.totalINR)||calcItem(it)),0);
+    const invoiceVal = (mfgTotal+mrchTotal) > 0 ? (mfgTotal+mrchTotal) : toNum(order.total_value);
+    const logCharge  = toNum(fin.logisticsCharge);
+    const otherChr   = toNum(fin.otherCharges);
+    const totalBill  = invoiceVal + logCharge + otherChr;
+
+    // Advance entries
+    const advEntries = (fin.advanceEntries||[]).filter(e=>toNum(e.amount)>0);
+    const totalAdv   = advEntries.reduce((s,e)=>s+toNum(e.amount),0);
+    const balance    = totalBill - totalAdv;
+
+    const cur = order.currency || 'INR';
+    const fmtINR = v => `${cur} ${v.toLocaleString('en-IN',{minimumFractionDigits:2})}`;
+
+    const advRows = advEntries.map((e,i) =>
+      `<tr><td style="padding:5px 12px;color:#6b7280;font-size:12px">#${i+1} · ${e.date||''}</td><td style="padding:5px 12px;text-align:right;font-weight:700;font-size:12px;color:#d97706">${fmtINR(toNum(e.amount))}</td></tr>`
+    ).join('');
+
+    const customerName = order.b2b_customers.contact_name || 'Customer';
+    const company = order.b2b_customers.company_name || '';
+
+    const html = `<div style="font-family:Arial,sans-serif;max-width:580px;margin:0 auto;color:#1f2937">
+      <div style="background:linear-gradient(135deg,#0A4840,#1A6B5E);padding:24px;border-radius:12px 12px 0 0;text-align:center">
+        <h2 style="color:#fff;margin:0 0 4px;font-size:20px">💳 Financial Summary</h2>
+        <p style="color:#a7f3d0;margin:0;font-size:13px">Project: ${proj.project_name || 'Your Order'} · ${order.order_no}</p>
+      </div>
+      <div style="background:#f9fafb;padding:24px;border-radius:0 0 12px 12px;border:1px solid #e5e7eb">
+        <p style="margin:0 0 20px">Dear ${customerName}${company ? ` (${company})` : ''},</p>
+        <p style="margin:0 0 16px;font-size:13px;color:#374151">Please find below the financial summary for your export order.</p>
+
+        <!-- Invoice breakdown -->
+        <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;margin-bottom:16px;overflow:hidden">
+          <thead><tr style="background:#0A4840"><th colspan="2" style="padding:10px 12px;color:#fff;font-size:12px;text-align:left;letter-spacing:.5px">INVOICE BREAKDOWN</th></tr></thead>
+          <tbody>
+            ${mfgTotal>0?`<tr><td style="padding:7px 12px;color:#6b7280;font-size:13px">MFG Invoice (${proj.mfg_invoice_no||'—'})</td><td style="padding:7px 12px;text-align:right;font-weight:600;font-size:13px;color:#1f2937">${fmtINR(mfgTotal)}</td></tr>`:''}
+            ${mrchTotal>0?`<tr><td style="padding:7px 12px;color:#6b7280;font-size:13px">Merchandiser Invoice (${proj.merch_invoice_no||'—'})</td><td style="padding:7px 12px;text-align:right;font-weight:600;font-size:13px;color:#1f2937">${fmtINR(mrchTotal)}</td></tr>`:''}
+            ${logCharge>0?`<tr><td style="padding:7px 12px;color:#6b7280;font-size:13px">Logistics${fin.logisticsNote?` (${fin.logisticsNote})`:''}</td><td style="padding:7px 12px;text-align:right;font-weight:600;font-size:13px;color:#d97706">${fmtINR(logCharge)}</td></tr>`:''}
+            ${otherChr>0?`<tr><td style="padding:7px 12px;color:#6b7280;font-size:13px">Other Charges</td><td style="padding:7px 12px;text-align:right;font-weight:600;font-size:13px;color:#6b7280">${fmtINR(otherChr)}</td></tr>`:''}
+            <tr style="background:#f0fdf4;border-top:2px solid #0A4840"><td style="padding:10px 12px;font-weight:800;font-size:14px;color:#0A4840">Total Bill Value</td><td style="padding:10px 12px;text-align:right;font-weight:900;font-size:15px;color:#0A4840">${fmtINR(totalBill)}</td></tr>
+          </tbody>
+        </table>
+
+        <!-- Advance payments -->
+        ${advRows?`<table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;margin-bottom:16px;overflow:hidden">
+          <thead><tr style="background:#92400e"><th colspan="2" style="padding:10px 12px;color:#fff;font-size:12px;text-align:left;letter-spacing:.5px">ADVANCE PAYMENTS RECEIVED</th></tr></thead>
+          <tbody>${advRows}<tr style="border-top:1px solid #e5e7eb"><td style="padding:7px 12px;font-weight:700;font-size:13px;color:#92400e">Total Advance Paid</td><td style="padding:7px 12px;text-align:right;font-weight:800;font-size:13px;color:#d97706">${fmtINR(totalAdv)}</td></tr></tbody>
+        </table>`:''}
+
+        <!-- Summary -->
+        <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden">
+          <thead><tr style="background:#1f2937"><th colspan="2" style="padding:10px 12px;color:#fff;font-size:12px;text-align:left;letter-spacing:.5px">📊 SUMMARY</th></tr></thead>
+          <tbody>
+            <tr><td style="padding:8px 12px;color:#6b7280;font-size:13px">Total Bill Value</td><td style="padding:8px 12px;text-align:right;font-weight:700;font-size:13px">${fmtINR(totalBill)}</td></tr>
+            <tr><td style="padding:8px 12px;color:#6b7280;font-size:13px">Advance Paid</td><td style="padding:8px 12px;text-align:right;font-weight:700;font-size:13px;color:#d97706">${fmtINR(totalAdv)}</td></tr>
+            <tr style="background:${balance>0?'#fef2f2':'#f0fdf4'};border-top:2px solid #e5e7eb">
+              <td style="padding:10px 12px;font-weight:800;font-size:14px;color:${balance>0?'#dc2626':'#16a34a'}">${balance>0?'Amount to Receive from You':'Excess / Credit'}</td>
+              <td style="padding:10px 12px;text-align:right;font-weight:900;font-size:16px;color:${balance>0?'#dc2626':'#16a34a'}">${fmtINR(Math.abs(balance))}</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div style="text-align:center;margin-top:20px">
+          <a href="https://admin.sathvam.in/portal" style="background:#0A4840;color:#fff;padding:11px 24px;border-radius:8px;text-decoration:none;font-weight:700;font-size:13px">View in Portal →</a>
+        </div>
+        <p style="margin:16px 0 0;font-size:11px;color:#9ca3af;text-align:center">Sathvam Natural Products · sathvam.in</p>
+      </div>
+    </div>`;
+
+    await mailer.sendMail({
+      from: `"Sathvam Natural Products" <${process.env.SMTP_USER}>`,
+      to: email,
+      subject: `Financial Summary — ${proj.project_name || order.order_no}`,
+      html,
+    });
+
+    res.json({ success: true, sentTo: email });
+  } catch (err) {
+    console.error('[project-email-summary]', err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // DELETE project + all related data
@@ -460,6 +744,17 @@ b2bOrders.put('/:id/tracking', auth, requireRole('admin','manager'), async (req,
   const { error } = await supabase.from('b2b_orders').update(updates).eq('id', req.params.id);
   if (error) return res.status(400).json({ error: 'Update failed' });
   res.json({ message: 'Tracking updated' });
+
+  setImmediate(() => sendOrderEmail(req.params.id, {
+    subject: `Shipment Tracking Updated`,
+    heading: `🚢 Shipment Tracking Updated`,
+    rows: [
+      ['Courier', courier],
+      ['AWB / Tracking No', awbNumber],
+      ['Tracking Link', carrierTrackingUrl],
+    ],
+    trackingUrl: carrierTrackingUrl,
+  }));
 });
 
 // ── Compliance checklist ──────────────────────────────────────────────────────
@@ -608,6 +903,46 @@ b2bDocs.post('/:orderId', auth, async (req, res) => {
   arr.push(doc);
   await supabase.from('settings').upsert({ key, value: arr, updated_at: new Date() });
   res.status(201).json(doc);
+
+  // Send email notification to customer (non-blocking)
+  try {
+    const { data: order } = await supabase
+      .from('b2b_orders')
+      .select('order_no, customer_id, customer_name, b2b_customers(email, contact_name, company_name)')
+      .eq('id', req.params.orderId)
+      .single();
+    const email = order?.b2b_customers?.email;
+    if (email) {
+      const customerName = order.b2b_customers.contact_name || order.customer_name || 'Customer';
+      const company = order.b2b_customers.company_name || '';
+      await mailer.sendMail({
+        from: `"Sathvam Natural Products" <${process.env.SMTP_USER}>`,
+        to: email,
+        subject: `Document Available — ${docType} for Order ${order.order_no}`,
+        html: `
+          <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;color:#1f2937">
+            <div style="background:#0A4840;padding:24px;border-radius:12px 12px 0 0;text-align:center">
+              <h2 style="color:#fff;margin:0;font-size:20px">📁 New Document Available</h2>
+            </div>
+            <div style="background:#f9fafb;padding:28px;border-radius:0 0 12px 12px;border:1px solid #e5e7eb">
+              <p style="margin:0 0 16px">Dear ${customerName}${company ? ` (${company})` : ''},</p>
+              <p style="margin:0 0 16px">A new document has been uploaded to your order <strong>${order.order_no}</strong>:</p>
+              <div style="background:#fff;border:1px solid #e5e7eb;border-radius:8px;padding:16px;margin-bottom:20px">
+                <p style="margin:0 0 6px"><strong>Document:</strong> ${docType}</p>
+                <p style="margin:0 0 6px"><strong>File:</strong> ${fileName}</p>
+                <p style="margin:0"><strong>Uploaded by:</strong> ${doc.uploadedBy}</p>
+              </div>
+              <div style="text-align:center;margin-bottom:20px">
+                <a href="https://admin.sathvam.in" style="background:#0A4840;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:700;font-size:14px">View in Portal →</a>
+              </div>
+              <p style="margin:0;font-size:12px;color:#9ca3af">You can download this document from the Document Vault section in your B2B portal.</p>
+            </div>
+          </div>`,
+      });
+    }
+  } catch (e) {
+    console.error('[b2b-docs] Email notification failed:', e.message);
+  }
 });
 b2bDocs.delete('/:orderId/:docId', auth, requireRole('admin','manager'), async (req, res) => {
   const key = `b2b_docs_${req.params.orderId}`;
