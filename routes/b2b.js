@@ -614,7 +614,21 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
     <div style="font-size:10px;color:#9ca3af;text-align:center;margin-top:20px">Sathvam Natural Products · sathvam.in · This is a computer-generated document.</div>
     </body></html>`;
 
-    // ── PDF 2: Logistics & Charges ───────────────────────────────────────────
+    // ── PDF 2: Logistics Invoice (uses logisticsInvoice line items if present, else fallback) ──
+    const li      = fin.logisticsInvoice || {};
+    const liItems = (li.items||[]).filter(it=>it.description||(parseFloat(it.amount)||0)>0);
+    const liTotal = liItems.length > 0
+      ? liItems.reduce((s,it)=>s+(parseFloat(it.amount)||0),0)
+      : logCharge + otherChr;
+    const liInvoiceNo   = li.invoiceNo  || '';
+    const liInvoiceDate = li.invoiceDate ? new Date(li.invoiceDate).toLocaleDateString('en-IN',{day:'2-digit',month:'short',year:'numeric'}) : today;
+
+    // Build rows: use line items if available, else fallback to single logisticsCharge row
+    const liRowsHtml = liItems.length > 0
+      ? liItems.map((it,i)=>`<tr style="border-bottom:1px solid #f3f4f6;background:${i%2===0?'#fff':'#fafafa'}"><td style="padding:12px 14px;font-size:13px;color:#1f2937">${it.description||''}</td><td style="padding:12px 14px;text-align:right;font-weight:700;font-size:13px">₹${(parseFloat(it.amount)||0).toLocaleString('en-IN',{minimumFractionDigits:2})}</td></tr>`).join('')
+      : `${logCharge>0?`<tr style="border-bottom:1px solid #f3f4f6"><td style="padding:12px 14px;font-size:13px;color:#1f2937">Logistics Charges${fin.logisticsNote?`<br><span style='font-size:11px;color:#6b7280'>${fin.logisticsNote}</span>`:''}</td><td style="padding:12px 14px;text-align:right;font-weight:700;font-size:13px">${fmtINR(logCharge)}</td></tr>`:''}
+         ${otherChr>0?`<tr style="border-bottom:1px solid #f3f4f6"><td style="padding:12px 14px;font-size:13px;color:#1f2937">Other Charges</td><td style="padding:12px 14px;text-align:right;font-weight:700;font-size:13px">${fmtINR(otherChr)}</td></tr>`:''}`;
+
     const logisticsPdfHtml = `<!DOCTYPE html><html><head><meta charset="UTF-8">
     <style>body{font-family:Arial,sans-serif;margin:0;padding:24px;color:#1f2937}table{border-collapse:collapse}</style>
     </head><body>
@@ -624,26 +638,26 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
         <div style="font-size:11px;color:#6b7280;margin-top:2px">Cold Pressed Oils &amp; Spices · sathvam.in</div>
       </div>
       <div style="text-align:right">
-        <div style="font-size:18px;font-weight:800;color:#1f2937">DEBIT NOTE — LOGISTICS</div>
-        <div style="font-size:11px;color:#6b7280;margin-top:2px">Date: ${today}</div>
+        <div style="font-size:18px;font-weight:800;color:#1f2937">LOGISTICS INVOICE</div>
+        ${liInvoiceNo?`<div style="font-size:13px;font-weight:700;color:#1d4ed8;margin-top:2px">#${liInvoiceNo}</div>`:''}
+        <div style="font-size:11px;color:#6b7280;margin-top:2px">Date: ${liInvoiceDate}</div>
         <div style="font-size:11px;color:#6b7280">Order: ${order.order_no}</div>
+        <div style="font-size:11px;color:#6b7280">PI: ${proj.pi_no||'—'}</div>
       </div>
     </div>
     <div style="margin-bottom:24px;padding:12px 16px;background:#f9fafb;border-radius:8px;border:1px solid #e5e7eb">
-      <div style="font-weight:700;font-size:13px;color:#1f2937">${company}</div>
+      <div style="font-size:10px;font-weight:700;color:#9ca3af;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Bill To</div>
+      <div style="font-weight:700;font-size:14px;color:#1f2937">${company}</div>
       <div style="font-size:12px;color:#6b7280">${customerName}</div>
     </div>
     <table style="width:100%;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden">
       <thead><tr style="background:#0A4840">
-        <th style="padding:10px 14px;color:#fff;font-size:12px;width:60%">Description</th>
+        <th style="padding:10px 14px;color:#fff;font-size:12px;width:70%;text-align:left">Description</th>
         <th style="padding:10px 14px;color:#fff;font-size:12px;text-align:right">Amount</th>
       </tr></thead>
-      <tbody>
-        ${logCharge>0?`<tr style="border-bottom:1px solid #f3f4f6"><td style="padding:12px 14px;font-size:13px;color:#1f2937">Logistics Charges${fin.logisticsNote?`<br><span style="font-size:11px;color:#6b7280">${fin.logisticsNote}</span>`:''}</td><td style="padding:12px 14px;text-align:right;font-weight:700;font-size:13px">${fmtINR(logCharge)}</td></tr>`:''}
-        ${otherChr>0?`<tr style="border-bottom:1px solid #f3f4f6"><td style="padding:12px 14px;font-size:13px;color:#1f2937">Other Charges</td><td style="padding:12px 14px;text-align:right;font-weight:700;font-size:13px">${fmtINR(otherChr)}</td></tr>`:''}
-      </tbody>
+      <tbody>${liRowsHtml}</tbody>
       <tfoot>
-        <tr style="background:#0A4840"><td style="padding:12px 14px;font-weight:800;font-size:14px;color:#fff">TOTAL</td><td style="padding:12px 14px;text-align:right;font-weight:900;font-size:15px;color:#fbbf24">${fmtINR(logCharge+otherChr)}</td></tr>
+        <tr style="background:#0A4840"><td style="padding:12px 14px;font-weight:800;font-size:14px;color:#fff">TOTAL</td><td style="padding:12px 14px;text-align:right;font-weight:900;font-size:15px;color:#fbbf24">${fmtINR(liTotal)}</td></tr>
       </tfoot>
     </table>
     <div style="margin-top:24px;padding:16px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;font-size:12px;color:#374151">
