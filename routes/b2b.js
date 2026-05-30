@@ -502,13 +502,13 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
 
     // Load linked B2B order
     const { data: order } = await supabase.from('b2b_orders')
-      .select('id,order_no,total_value,currency,customer_id,customer_name')
+      .select('id,order_no,total_value,customer_id,customer_name')
       .eq('id', proj.b2b_order_id).single();
     if (!order) return res.status(404).json({ error: 'Linked order not found' });
 
     // Load customer email separately
     const { data: cust } = await supabase.from('b2b_customers')
-      .select('email,contact_name,company_name')
+      .select('email,contact_name,company_name,currency')
       .eq('id', order.customer_id).single();
     const email = cust?.email;
     if (!email) return res.status(400).json({ error: 'Customer email not found' });
@@ -545,7 +545,7 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
     const totalAdv   = advEntries.reduce((s,e)=>s+toNum(e.amount),0);
     const balance    = totalBill - totalAdv;
 
-    const cur = order.currency || 'INR';
+    const cur = cust?.currency || 'INR';
     const fmtINR = v => `${cur} ${v.toLocaleString('en-IN',{minimumFractionDigits:2})}`;
 
     const advRows = advEntries.map((e,i) =>
