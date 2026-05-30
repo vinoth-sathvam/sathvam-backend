@@ -522,6 +522,9 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
 
     // Financials from request body (most current — just saved by frontend)
     const fin = req.body.financials || full.financials || {};
+    // Which attachments to include (default: both)
+    const sendInvoicePdf   = req.body.sendInvoicePdf   !== false;
+    const sendLogisticsPdf = req.body.sendLogisticsPdf !== false;
 
     // Compute MFG + MERCH totals
     const toNum = v => parseFloat(v)||0;
@@ -551,47 +554,140 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
 
     const customerName = cust.contact_name || order.buyer_name || 'Customer';
     const company = cust.company_name || '';
+    const today = new Date().toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' });
 
-    const html = `<div style="font-family:Arial,sans-serif;max-width:580px;margin:0 auto;color:#1f2937">
+    // ── PDF 1: Invoice (MFG + MERCH items) ──────────────────────────────────
+    const allItems = [
+      ...(mfgItems.length ? [{ _header: true, label: `MFG Invoice — ${proj.mfg_invoice_no||''}` }] : []),
+      ...mfgItems,
+      ...(mrchItems.length ? [{ _header: true, label: `Merchandiser Invoice — ${proj.merch_invoice_no||''}` }] : []),
+      ...mrchItems,
+    ];
+    const itemRows = allItems.map(it => {
+      if (it._header) return `<tr style="background:#e8f5e9"><td colspan="6" style="padding:8px 12px;font-weight:800;font-size:12px;color:#0A4840;border-top:2px solid #0A4840">${it.label}</td></tr>`;
+      const qty = toNum(it.qty); const rate = toNum(it.rateINR||it.rate); const total = toNum(it.totalINR)||qty*rate;
+      return `<tr style="border-bottom:1px solid #f3f4f6">
+        <td style="padding:7px 10px;font-size:11px;color:#1f2937">${it.productName||it.description||''}</td>
+        <td style="padding:7px 10px;font-size:11px;color:#6b7280;text-align:center">${it.hsnCode||''}</td>
+        <td style="padding:7px 10px;font-size:11px;text-align:right">${qty}</td>
+        <td style="padding:7px 10px;font-size:11px;text-align:center">${it.unit||'KG'}</td>
+        <td style="padding:7px 10px;font-size:11px;text-align:right">${fmtINR(rate)}</td>
+        <td style="padding:7px 10px;font-size:11px;font-weight:700;text-align:right">${fmtINR(total)}</td>
+      </tr>`;
+    }).join('');
+
+    const invoicePdfHtml = `<!DOCTYPE html><html><head><meta charset="UTF-8">
+    <style>body{font-family:Arial,sans-serif;margin:0;padding:24px;color:#1f2937}table{border-collapse:collapse}th{text-align:left}</style>
+    </head><body>
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;border-bottom:3px solid #0A4840;padding-bottom:16px">
+      <div>
+        <div style="font-size:22px;font-weight:900;color:#0A4840;letter-spacing:1px">SATHVAM NATURAL PRODUCTS</div>
+        <div style="font-size:11px;color:#6b7280;margin-top:2px">Cold Pressed Oils &amp; Spices · sathvam.in</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:18px;font-weight:800;color:#1f2937">INVOICE SUMMARY</div>
+        <div style="font-size:11px;color:#6b7280;margin-top:2px">Date: ${today}</div>
+        <div style="font-size:11px;color:#6b7280">Order: ${order.order_no}</div>
+        <div style="font-size:11px;color:#6b7280">PI: ${proj.pi_no||'—'}</div>
+      </div>
+    </div>
+    <div style="margin-bottom:16px;padding:12px 16px;background:#f9fafb;border-radius:8px;border:1px solid #e5e7eb">
+      <div style="font-weight:700;font-size:13px;color:#1f2937">${company}</div>
+      <div style="font-size:12px;color:#6b7280">${customerName}</div>
+    </div>
+    <table style="width:100%;margin-bottom:16px;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden">
+      <thead><tr style="background:#0A4840">
+        <th style="padding:9px 10px;color:#fff;font-size:11px">Product</th>
+        <th style="padding:9px 10px;color:#fff;font-size:11px;text-align:center">HSN</th>
+        <th style="padding:9px 10px;color:#fff;font-size:11px;text-align:right">Qty</th>
+        <th style="padding:9px 10px;color:#fff;font-size:11px;text-align:center">Unit</th>
+        <th style="padding:9px 10px;color:#fff;font-size:11px;text-align:right">Rate</th>
+        <th style="padding:9px 10px;color:#fff;font-size:11px;text-align:right">Amount</th>
+      </tr></thead>
+      <tbody>${itemRows}</tbody>
+      <tfoot>
+        ${mfgTotal>0?`<tr style="background:#f9fafb"><td colspan="5" style="padding:8px 10px;font-size:12px;color:#374151">MFG Invoice (${proj.mfg_invoice_no||'—'})</td><td style="padding:8px 10px;text-align:right;font-weight:700;font-size:12px">${fmtINR(mfgTotal)}</td></tr>`:''}
+        ${mrchTotal>0?`<tr style="background:#f9fafb"><td colspan="5" style="padding:8px 10px;font-size:12px;color:#374151">Merchandiser Invoice (${proj.merch_invoice_no||'—'})</td><td style="padding:8px 10px;text-align:right;font-weight:700;font-size:12px">${fmtINR(mrchTotal)}</td></tr>`:''}
+        <tr style="background:#0A4840"><td colspan="5" style="padding:10px;font-weight:800;font-size:13px;color:#fff">TOTAL INVOICE VALUE</td><td style="padding:10px;text-align:right;font-weight:900;font-size:14px;color:#fbbf24">${fmtINR(invoiceVal)}</td></tr>
+      </tfoot>
+    </table>
+    <div style="font-size:10px;color:#9ca3af;text-align:center;margin-top:20px">Sathvam Natural Products · sathvam.in · This is a computer-generated document.</div>
+    </body></html>`;
+
+    // ── PDF 2: Logistics & Charges ───────────────────────────────────────────
+    const logisticsPdfHtml = `<!DOCTYPE html><html><head><meta charset="UTF-8">
+    <style>body{font-family:Arial,sans-serif;margin:0;padding:24px;color:#1f2937}table{border-collapse:collapse}</style>
+    </head><body>
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;border-bottom:3px solid #0A4840;padding-bottom:16px">
+      <div>
+        <div style="font-size:22px;font-weight:900;color:#0A4840;letter-spacing:1px">SATHVAM NATURAL PRODUCTS</div>
+        <div style="font-size:11px;color:#6b7280;margin-top:2px">Cold Pressed Oils &amp; Spices · sathvam.in</div>
+      </div>
+      <div style="text-align:right">
+        <div style="font-size:18px;font-weight:800;color:#1f2937">DEBIT NOTE — LOGISTICS</div>
+        <div style="font-size:11px;color:#6b7280;margin-top:2px">Date: ${today}</div>
+        <div style="font-size:11px;color:#6b7280">Order: ${order.order_no}</div>
+      </div>
+    </div>
+    <div style="margin-bottom:24px;padding:12px 16px;background:#f9fafb;border-radius:8px;border:1px solid #e5e7eb">
+      <div style="font-weight:700;font-size:13px;color:#1f2937">${company}</div>
+      <div style="font-size:12px;color:#6b7280">${customerName}</div>
+    </div>
+    <table style="width:100%;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden">
+      <thead><tr style="background:#0A4840">
+        <th style="padding:10px 14px;color:#fff;font-size:12px;width:60%">Description</th>
+        <th style="padding:10px 14px;color:#fff;font-size:12px;text-align:right">Amount</th>
+      </tr></thead>
+      <tbody>
+        ${logCharge>0?`<tr style="border-bottom:1px solid #f3f4f6"><td style="padding:12px 14px;font-size:13px;color:#1f2937">Logistics Charges${fin.logisticsNote?`<br><span style="font-size:11px;color:#6b7280">${fin.logisticsNote}</span>`:''}</td><td style="padding:12px 14px;text-align:right;font-weight:700;font-size:13px">${fmtINR(logCharge)}</td></tr>`:''}
+        ${otherChr>0?`<tr style="border-bottom:1px solid #f3f4f6"><td style="padding:12px 14px;font-size:13px;color:#1f2937">Other Charges</td><td style="padding:12px 14px;text-align:right;font-weight:700;font-size:13px">${fmtINR(otherChr)}</td></tr>`:''}
+      </tbody>
+      <tfoot>
+        <tr style="background:#0A4840"><td style="padding:12px 14px;font-weight:800;font-size:14px;color:#fff">TOTAL</td><td style="padding:12px 14px;text-align:right;font-weight:900;font-size:15px;color:#fbbf24">${fmtINR(logCharge+otherChr)}</td></tr>
+      </tfoot>
+    </table>
+    <div style="margin-top:24px;padding:16px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;font-size:12px;color:#374151">
+      <strong>Invoice Reference:</strong> MFG ${proj.mfg_invoice_no||'—'} + MERCH ${proj.merch_invoice_no||'—'} · Invoice Value: ${fmtINR(invoiceVal)} · Total Bill: ${fmtINR(totalBill)}
+    </div>
+    <div style="font-size:10px;color:#9ca3af;text-align:center;margin-top:20px">Sathvam Natural Products · sathvam.in · This is a computer-generated document.</div>
+    </body></html>`;
+
+    // Generate selected PDFs
+    const htmlPdf = require('html-pdf-node');
+    const pdfOpts = { format: 'A4', printBackground: true };
+    const [invoicePdf, logisticsPdf] = await Promise.all([
+      sendInvoicePdf   ? htmlPdf.generatePdf({ content: invoicePdfHtml },   pdfOpts) : Promise.resolve(null),
+      sendLogisticsPdf ? htmlPdf.generatePdf({ content: logisticsPdfHtml }, pdfOpts) : Promise.resolve(null),
+    ]);
+
+    // ── Email body ───────────────────────────────────────────────────────────
+    const emailHtml = `<div style="font-family:Arial,sans-serif;max-width:580px;margin:0 auto;color:#1f2937">
       <div style="background:linear-gradient(135deg,#0A4840,#1A6B5E);padding:24px;border-radius:12px 12px 0 0;text-align:center">
         <h2 style="color:#fff;margin:0 0 4px;font-size:20px">💳 Financial Summary</h2>
-        <p style="color:#a7f3d0;margin:0;font-size:13px">Project: ${proj.project_name || 'Your Order'} · ${order.order_no}</p>
+        <p style="color:#a7f3d0;margin:0;font-size:13px">${proj.project_name||order.order_no}</p>
       </div>
       <div style="background:#f9fafb;padding:24px;border-radius:0 0 12px 12px;border:1px solid #e5e7eb">
-        <p style="margin:0 0 20px">Dear ${customerName}${company ? ` (${company})` : ''},</p>
-        <p style="margin:0 0 16px;font-size:13px;color:#374151">Please find below the financial summary for your export order.</p>
-
-        <!-- Invoice breakdown -->
-        <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;margin-bottom:16px;overflow:hidden">
-          <thead><tr style="background:#0A4840"><th colspan="2" style="padding:10px 12px;color:#fff;font-size:12px;text-align:left;letter-spacing:.5px">INVOICE BREAKDOWN</th></tr></thead>
+        <p style="margin:0 0 16px">Dear ${customerName}${company?` (${company})`:''},</p>
+        <p style="margin:0 0 20px;font-size:13px;color:#374151">Please find attached two documents for your reference:</p>
+        <ol style="font-size:13px;color:#374151;line-height:1.8;margin:0 0 20px">
+          <li><strong>Invoice Summary</strong> — MFG (${proj.mfg_invoice_no||'—'}) + Merchandiser (${proj.merch_invoice_no||'—'}) · <strong>${fmtINR(invoiceVal)}</strong></li>
+          <li><strong>Logistics Debit Note</strong> — Sea Freight &amp; related charges · <strong>${fmtINR(logCharge+otherChr)}</strong></li>
+        </ol>
+        <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;margin-bottom:16px">
           <tbody>
-            ${mfgTotal>0?`<tr><td style="padding:7px 12px;color:#6b7280;font-size:13px">MFG Invoice (${proj.mfg_invoice_no||'—'})</td><td style="padding:7px 12px;text-align:right;font-weight:600;font-size:13px;color:#1f2937">${fmtINR(mfgTotal)}</td></tr>`:''}
-            ${mrchTotal>0?`<tr><td style="padding:7px 12px;color:#6b7280;font-size:13px">Merchandiser Invoice (${proj.merch_invoice_no||'—'})</td><td style="padding:7px 12px;text-align:right;font-weight:600;font-size:13px;color:#1f2937">${fmtINR(mrchTotal)}</td></tr>`:''}
-            ${logCharge>0?`<tr><td style="padding:7px 12px;color:#6b7280;font-size:13px">Logistics${fin.logisticsNote?` (${fin.logisticsNote})`:''}</td><td style="padding:7px 12px;text-align:right;font-weight:600;font-size:13px;color:#d97706">${fmtINR(logCharge)}</td></tr>`:''}
-            ${otherChr>0?`<tr><td style="padding:7px 12px;color:#6b7280;font-size:13px">Other Charges</td><td style="padding:7px 12px;text-align:right;font-weight:600;font-size:13px;color:#6b7280">${fmtINR(otherChr)}</td></tr>`:''}
-            <tr style="background:#f0fdf4;border-top:2px solid #0A4840"><td style="padding:10px 12px;font-weight:800;font-size:14px;color:#0A4840">Total Bill Value</td><td style="padding:10px 12px;text-align:right;font-weight:900;font-size:15px;color:#0A4840">${fmtINR(totalBill)}</td></tr>
+            <tr style="background:#f9fafb"><td style="padding:9px 14px;font-size:13px;color:#6b7280">MFG + MERCH Invoice</td><td style="padding:9px 14px;text-align:right;font-weight:700;font-size:13px">${fmtINR(invoiceVal)}</td></tr>
+            <tr><td style="padding:9px 14px;font-size:13px;color:#6b7280">Logistics &amp; Charges</td><td style="padding:9px 14px;text-align:right;font-weight:700;font-size:13px;color:#d97706">${fmtINR(logCharge+otherChr)}</td></tr>
+            <tr style="background:#0A4840"><td style="padding:11px 14px;font-weight:800;font-size:14px;color:#fff">Total Bill Value</td><td style="padding:11px 14px;text-align:right;font-weight:900;font-size:15px;color:#fbbf24">${fmtINR(totalBill)}</td></tr>
           </tbody>
         </table>
-
-        <!-- Advance payments -->
-        ${advRows?`<table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;margin-bottom:16px;overflow:hidden">
-          <thead><tr style="background:#92400e"><th colspan="2" style="padding:10px 12px;color:#fff;font-size:12px;text-align:left;letter-spacing:.5px">ADVANCE PAYMENTS RECEIVED</th></tr></thead>
-          <tbody>${advRows}<tr style="border-top:1px solid #e5e7eb"><td style="padding:7px 12px;font-weight:700;font-size:13px;color:#92400e">Total Advance Paid</td><td style="padding:7px 12px;text-align:right;font-weight:800;font-size:13px;color:#d97706">${fmtINR(totalAdv)}</td></tr></tbody>
+        ${advRows?`<table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;margin-bottom:16px">
+          <thead><tr style="background:#92400e"><th colspan="2" style="padding:9px 14px;color:#fff;font-size:11px;text-align:left;letter-spacing:.5px">ADVANCE PAYMENTS RECEIVED</th></tr></thead>
+          <tbody>${advRows}<tr style="border-top:1px solid #e5e7eb"><td style="padding:9px 14px;font-weight:700;font-size:13px;color:#92400e">Total Advance</td><td style="padding:9px 14px;text-align:right;font-weight:800;font-size:13px;color:#d97706">${fmtINR(totalAdv)}</td></tr></tbody>
         </table>`:''}
-
-        <!-- Summary -->
-        <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden">
-          <thead><tr style="background:#1f2937"><th colspan="2" style="padding:10px 12px;color:#fff;font-size:12px;text-align:left;letter-spacing:.5px">📊 SUMMARY</th></tr></thead>
-          <tbody>
-            <tr><td style="padding:8px 12px;color:#6b7280;font-size:13px">Total Bill Value</td><td style="padding:8px 12px;text-align:right;font-weight:700;font-size:13px">${fmtINR(totalBill)}</td></tr>
-            <tr><td style="padding:8px 12px;color:#6b7280;font-size:13px">Advance Paid</td><td style="padding:8px 12px;text-align:right;font-weight:700;font-size:13px;color:#d97706">${fmtINR(totalAdv)}</td></tr>
-            <tr style="background:${balance>0?'#fef2f2':'#f0fdf4'};border-top:2px solid #e5e7eb">
-              <td style="padding:10px 12px;font-weight:800;font-size:14px;color:${balance>0?'#dc2626':'#16a34a'}">${balance>0?'Amount to Receive from You':'Excess / Credit'}</td>
-              <td style="padding:10px 12px;text-align:right;font-weight:900;font-size:16px;color:${balance>0?'#dc2626':'#16a34a'}">${fmtINR(Math.abs(balance))}</td>
-            </tr>
-          </tbody>
-        </table>
-
+        <div style="background:${balance>0?'#fef2f2':'#f0fdf4'};border:2px solid ${balance>0?'#fca5a5':'#86efac'};border-radius:10px;padding:14px 18px;text-align:center">
+          <div style="font-size:12px;color:${balance>0?'#dc2626':'#16a34a'};font-weight:700;margin-bottom:4px">${balance>0?'AMOUNT TO RECEIVE FROM YOU':'EXCESS / CREDIT'}</div>
+          <div style="font-size:22px;font-weight:900;color:${balance>0?'#dc2626':'#16a34a'}">${fmtINR(Math.abs(balance))}</div>
+        </div>
         <div style="text-align:center;margin-top:20px">
           <a href="https://admin.sathvam.in/portal" style="background:#0A4840;color:#fff;padding:11px 24px;border-radius:8px;text-decoration:none;font-weight:700;font-size:13px">View in Portal →</a>
         </div>
@@ -599,11 +695,16 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
       </div>
     </div>`;
 
+    const orderRef = (order.order_no||proj.pi_no||'ORDER').replace(/[^a-zA-Z0-9-_]/g,'-');
     await mailer.sendMail({
       from: `"Sathvam Natural Products" <${process.env.SMTP_USER}>`,
       to: email,
       subject: `Financial Summary — ${proj.project_name || order.order_no}`,
-      html,
+      html: emailHtml,
+      attachments: [
+        ...(invoicePdf   ? [{ filename: `Invoice_${orderRef}.pdf`,   content: invoicePdf,   contentType: 'application/pdf' }] : []),
+        ...(logisticsPdf ? [{ filename: `Logistics_${orderRef}.pdf`, content: logisticsPdf, contentType: 'application/pdf' }] : []),
+      ],
     });
 
     res.json({ success: true, sentTo: email });
