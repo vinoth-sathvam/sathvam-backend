@@ -502,7 +502,7 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
 
     // Load linked B2B order
     const { data: order } = await supabase.from('b2b_orders')
-      .select('id,order_no,total_value,customer_id,customer_name')
+      .select('id,order_no,total_value,customer_id,buyer_name')
       .eq('id', proj.b2b_order_id).single();
     if (!order) return res.status(404).json({ error: 'Linked order not found' });
 
@@ -512,9 +512,6 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
       .eq('id', order.customer_id).single();
     const email = cust?.email;
     if (!email) return res.status(400).json({ error: 'Customer email not found' });
-    // Attach to order for template use
-    order.b2b_customers = cust;
-
     // Load b2b_payments for this order
     const { data: paymentsRow } = await supabase.from('settings').select('value').eq('key','b2b_payments').single();
     const payments = (paymentsRow?.value || {})[proj.b2b_order_id] || {};
@@ -552,8 +549,8 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
       `<tr><td style="padding:5px 12px;color:#6b7280;font-size:12px">#${i+1} · ${e.date||''}</td><td style="padding:5px 12px;text-align:right;font-weight:700;font-size:12px;color:#d97706">${fmtINR(toNum(e.amount))}</td></tr>`
     ).join('');
 
-    const customerName = order.b2b_customers.contact_name || 'Customer';
-    const company = order.b2b_customers.company_name || '';
+    const customerName = cust.contact_name || order.buyer_name || 'Customer';
+    const company = cust.company_name || '';
 
     const html = `<div style="font-family:Arial,sans-serif;max-width:580px;margin:0 auto;color:#1f2937">
       <div style="background:linear-gradient(135deg,#0A4840,#1A6B5E);padding:24px;border-radius:12px 12px 0 0;text-align:center">
