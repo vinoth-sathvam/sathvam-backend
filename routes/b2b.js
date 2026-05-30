@@ -508,7 +508,7 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
 
     // Load customer email separately
     const { data: cust } = await supabase.from('b2b_customers')
-      .select('email,contact_name,company_name,currency')
+      .select('email,contact_name,company_name,currency,address,phone,country')
       .eq('id', order.customer_id).single();
     const email = cust?.email;
     if (!email) return res.status(400).json({ error: 'Customer email not found' });
@@ -629,41 +629,138 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
       : `${logCharge>0?`<tr style="border-bottom:1px solid #f3f4f6"><td style="padding:12px 14px;font-size:13px;color:#1f2937">Logistics Charges${fin.logisticsNote?`<br><span style='font-size:11px;color:#6b7280'>${fin.logisticsNote}</span>`:''}</td><td style="padding:12px 14px;text-align:right;font-weight:700;font-size:13px">${fmtINR(logCharge)}</td></tr>`:''}
          ${otherChr>0?`<tr style="border-bottom:1px solid #f3f4f6"><td style="padding:12px 14px;font-size:13px;color:#1f2937">Other Charges</td><td style="padding:12px 14px;text-align:right;font-weight:700;font-size:13px">${fmtINR(otherChr)}</td></tr>`:''}`;
 
+    const custAddress = cust?.address || '';
+    const custPhone   = cust?.phone   || '';
+    const custCountry = cust?.country || '';
+
     const logisticsPdfHtml = `<!DOCTYPE html><html><head><meta charset="UTF-8">
-    <style>body{font-family:Arial,sans-serif;margin:0;padding:24px;color:#1f2937}table{border-collapse:collapse}</style>
+    <style>
+      body{font-family:Arial,sans-serif;margin:0;padding:28px 32px;color:#111827;font-size:13px}
+      table{border-collapse:collapse;width:100%}
+      th,td{padding:0}
+    </style>
     </head><body>
-    <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:20px;border-bottom:3px solid #0A4840;padding-bottom:16px">
-      <div>
-        <div style="font-size:22px;font-weight:900;color:#0A4840;letter-spacing:1px">SATHVAM NATURAL PRODUCTS</div>
-        <div style="font-size:11px;color:#6b7280;margin-top:2px">Cold Pressed Oils &amp; Spices · sathvam.in</div>
-      </div>
-      <div style="text-align:right">
-        <div style="font-size:18px;font-weight:800;color:#1f2937">LOGISTICS INVOICE</div>
-        ${liInvoiceNo?`<div style="font-size:13px;font-weight:700;color:#1d4ed8;margin-top:2px">#${liInvoiceNo}</div>`:''}
-        <div style="font-size:11px;color:#6b7280;margin-top:2px">Date: ${liInvoiceDate}</div>
-        <div style="font-size:11px;color:#6b7280">Order: ${order.order_no}</div>
-        <div style="font-size:11px;color:#6b7280">PI: ${proj.pi_no||'—'}</div>
-      </div>
-    </div>
-    <div style="margin-bottom:24px;padding:12px 16px;background:#f9fafb;border-radius:8px;border:1px solid #e5e7eb">
-      <div style="font-size:10px;font-weight:700;color:#9ca3af;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px">Bill To</div>
-      <div style="font-weight:700;font-size:14px;color:#1f2937">${company}</div>
-      <div style="font-size:12px;color:#6b7280">${customerName}</div>
-    </div>
-    <table style="width:100%;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden">
-      <thead><tr style="background:#0A4840">
-        <th style="padding:10px 14px;color:#fff;font-size:12px;width:70%;text-align:left">Description</th>
-        <th style="padding:10px 14px;color:#fff;font-size:12px;text-align:right">Amount</th>
-      </tr></thead>
-      <tbody>${liRowsHtml}</tbody>
+    <!-- Header -->
+    <table style="width:100%;margin-bottom:18px;border-bottom:3px solid #0A4840;padding-bottom:14px">
+      <tr>
+        <td style="vertical-align:top;width:60%">
+          <div style="font-size:26px;font-weight:900;color:#0A4840;letter-spacing:1px;line-height:1">Sathvam</div>
+          <div style="font-size:13px;font-weight:700;color:#1f2937;margin-top:3px">Sathvam Oils and Spices Pvt Ltd</div>
+          <div style="font-size:10px;color:#6b7280;margin-top:4px;line-height:1.7">
+            Plot No. 6, Anand Jothi Nagar, Near ABS Hospital, Thanthoni, Tamil Nadu 639005<br>
+            GSTIN: 33ABFCS9387K1ZN | PAN: ABFCS9387K | CIN: U15400TN2021PTC142893 | TAN: CHES61531B<br>
+            Ph: +91 70921 77092 | Email: sales@sathvam.in | www.sathvam.in
+          </div>
+        </td>
+        <td style="vertical-align:top;text-align:right">
+          <div style="font-size:20px;font-weight:900;color:#0A4840;letter-spacing:.5px">TAX INVOICE</div>
+          <div style="margin-top:8px;font-size:11px;color:#374151;line-height:1.8">
+            <strong>Invoice No:</strong> ${liInvoiceNo||'—'}<br>
+            <strong>Date:</strong> ${liInvoiceDate}<br>
+            <strong>Supply:</strong> ${custCountry&&custCountry.toLowerCase()!=='india'?'Export (Zero-rated)':'Inter-State'}<br>
+            <strong>Order:</strong> ${order.order_no}<br>
+            <strong>PI No:</strong> ${proj.pi_no||'—'}
+          </div>
+        </td>
+      </tr>
+    </table>
+
+    <!-- Bill To -->
+    <table style="width:100%;margin-bottom:18px">
+      <tr>
+        <td style="width:50%;vertical-align:top;padding-right:12px">
+          <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:12px">
+            <div style="font-size:9px;font-weight:700;color:#9ca3af;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">Bill To &amp; Ship To</div>
+            <div style="font-weight:700;font-size:14px;color:#111827">${company}</div>
+            ${customerName?`<div style="font-size:12px;color:#374151;margin-top:2px">${customerName}</div>`:''}
+            ${custAddress?`<div style="font-size:11px;color:#6b7280;margin-top:3px">${custAddress}</div>`:''}
+            ${custCountry?`<div style="font-size:11px;color:#6b7280">${custCountry}</div>`:''}
+            ${custPhone?`<div style="font-size:11px;color:#6b7280;margin-top:2px">Ph: ${custPhone}</div>`:''}
+            ${email?`<div style="font-size:11px;color:#6b7280">Email: ${email}</div>`:''}
+          </div>
+        </td>
+        <td style="width:50%;vertical-align:top;padding-left:12px">
+          <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:12px">
+            <div style="font-size:9px;font-weight:700;color:#9ca3af;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">Order &amp; Payment Info</div>
+            <div style="font-size:11px;color:#374151;line-height:1.8">
+              <strong>Order No:</strong> ${order.order_no}<br>
+              <strong>PI No:</strong> ${proj.pi_no||'—'}<br>
+              <strong>MFG Invoice:</strong> ${proj.mfg_invoice_no||'—'}<br>
+              <strong>Merch Invoice:</strong> ${proj.merch_invoice_no||'—'}<br>
+              <strong>ETD:</strong> ${proj.etd||'—'}
+            </div>
+          </div>
+        </td>
+      </tr>
+    </table>
+
+    <!-- Line items -->
+    <table style="width:100%;border:1px solid #e5e7eb;margin-bottom:0">
+      <thead>
+        <tr style="background:#0A4840">
+          <th style="padding:9px 12px;color:#fff;font-size:11px;text-align:left;width:5%">#</th>
+          <th style="padding:9px 12px;color:#fff;font-size:11px;text-align:left">Description</th>
+          <th style="padding:9px 12px;color:#fff;font-size:11px;text-align:right">Amount (${cur})</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${liItems.length>0
+          ? liItems.map((it,i)=>`<tr style="border-bottom:1px solid #f3f4f6;background:${i%2===0?'#fff':'#fafafa'}">
+              <td style="padding:10px 12px;font-size:12px;color:#6b7280">${i+1}</td>
+              <td style="padding:10px 12px;font-size:13px;color:#111827">${it.description||''}</td>
+              <td style="padding:10px 12px;text-align:right;font-weight:700;font-size:13px">${(parseFloat(it.amount)||0).toLocaleString('en-IN',{minimumFractionDigits:2})}</td>
+            </tr>`).join('')
+          : `<tr><td colspan="3" style="padding:16px 12px;text-align:center;color:#9ca3af;font-size:12px">No items</td></tr>`
+        }
+      </tbody>
       <tfoot>
-        <tr style="background:#0A4840"><td style="padding:12px 14px;font-weight:800;font-size:14px;color:#fff">TOTAL</td><td style="padding:12px 14px;text-align:right;font-weight:900;font-size:15px;color:#fbbf24">${fmtINR(liTotal)}</td></tr>
+        <tr style="background:#f9fafb;border-top:1px solid #e5e7eb">
+          <td colspan="2" style="padding:10px 12px;font-size:12px;color:#374151">Taxable Amount</td>
+          <td style="padding:10px 12px;text-align:right;font-size:12px;font-weight:700">${liTotal.toLocaleString('en-IN',{minimumFractionDigits:2})}</td>
+        </tr>
+        <tr style="background:#f9fafb">
+          <td colspan="2" style="padding:10px 12px;font-size:12px;color:#374151">GST (Export — Zero Rated)</td>
+          <td style="padding:10px 12px;text-align:right;font-size:12px;font-weight:700">0.00</td>
+        </tr>
+        <tr style="background:#0A4840">
+          <td colspan="2" style="padding:12px;font-weight:800;font-size:13px;color:#fff">TOTAL AMOUNT</td>
+          <td style="padding:12px;text-align:right;font-weight:900;font-size:15px;color:#fbbf24">${cur} ${liTotal.toLocaleString('en-IN',{minimumFractionDigits:2})}</td>
+        </tr>
       </tfoot>
     </table>
-    <div style="margin-top:24px;padding:16px;background:#fffbeb;border:1px solid #fde68a;border-radius:8px;font-size:12px;color:#374151">
-      <strong>Invoice Reference:</strong> MFG ${proj.mfg_invoice_no||'—'} + MERCH ${proj.merch_invoice_no||'—'} · Invoice Value: ${fmtINR(invoiceVal)} · Total Bill: ${fmtINR(totalBill)}
+
+    <!-- Notes -->
+    <div style="margin-top:18px;font-size:11px;color:#374151">
+      <div><strong>Payment Terms:</strong> As per agreed terms. Goods once sold will not be taken back unless defective.</div>
+      <div style="margin-top:4px"><strong>Note:</strong> This is a logistics debit note for sea freight, insurance and related charges.</div>
+      <div style="margin-top:4px">Subject to: Karur Jurisdiction</div>
     </div>
-    <div style="font-size:10px;color:#9ca3af;text-align:center;margin-top:20px">Sathvam Natural Products · sathvam.in · This is a computer-generated document.</div>
+
+    <!-- Amounts table -->
+    <table style="width:60%;margin-left:40%;margin-top:18px;border:1px solid #e5e7eb">
+      <tr style="background:#f9fafb"><td style="padding:7px 12px;font-size:12px;color:#6b7280">Invoice Value (MFG + MERCH)</td><td style="padding:7px 12px;text-align:right;font-weight:700;font-size:12px">${fmtINR(invoiceVal)}</td></tr>
+      <tr><td style="padding:7px 12px;font-size:12px;color:#6b7280">Logistics &amp; Charges</td><td style="padding:7px 12px;text-align:right;font-weight:700;font-size:12px;color:#d97706">${fmtINR(liTotal)}</td></tr>
+      <tr style="background:#0A4840"><td style="padding:8px 12px;font-weight:800;font-size:13px;color:#fff">Total Bill</td><td style="padding:8px 12px;text-align:right;font-weight:900;font-size:14px;color:#fbbf24">${fmtINR(totalBill)}</td></tr>
+    </table>
+
+    <!-- Signature -->
+    <table style="width:100%;margin-top:28px">
+      <tr>
+        <td style="width:60%;font-size:11px;color:#374151">
+          <div><strong>Payment Options:</strong></div>
+          <div>UPI: sales@sathvam.in | Phone Pay / GPay: +91 70921 77092</div>
+          <div>Bank Transfer: Contact us at sales@sathvam.in for bank details</div>
+        </td>
+        <td style="width:40%;text-align:right;vertical-align:bottom">
+          <div style="font-size:11px;color:#374151">For Sathvam Oils and Spices Pvt Ltd</div>
+          <div style="margin-top:30px;border-top:1px solid #9ca3af;padding-top:4px;font-size:11px;color:#374151">Authorised Signatory</div>
+        </td>
+      </tr>
+    </table>
+
+    <div style="font-size:9px;color:#9ca3af;text-align:center;margin-top:20px;border-top:1px solid #f3f4f6;padding-top:8px">
+      Sathvam Oils and Spices Pvt Ltd · GSTIN: 33ABFCS9387K1ZN · sathvam.in · This is a computer-generated document.
+    </div>
     </body></html>`;
 
     // Generate selected PDFs
