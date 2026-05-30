@@ -500,12 +500,20 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
 
     if (!proj.b2b_order_id) return res.status(400).json({ error: 'No linked B2B order — cannot find customer email' });
 
-    // Load linked B2B order (for customer email + payment data)
+    // Load linked B2B order
     const { data: order } = await supabase.from('b2b_orders')
-      .select('id,order_no,total_value,currency,b2b_customers(email,contact_name,company_name)')
+      .select('id,order_no,total_value,currency,customer_id,customer_name')
       .eq('id', proj.b2b_order_id).single();
-    const email = order?.b2b_customers?.email;
+    if (!order) return res.status(404).json({ error: 'Linked order not found' });
+
+    // Load customer email separately
+    const { data: cust } = await supabase.from('b2b_customers')
+      .select('email,contact_name,company_name')
+      .eq('id', order.customer_id).single();
+    const email = cust?.email;
     if (!email) return res.status(400).json({ error: 'Customer email not found' });
+    // Attach to order for template use
+    order.b2b_customers = cust;
 
     // Load b2b_payments for this order
     const { data: paymentsRow } = await supabase.from('settings').select('value').eq('key','b2b_payments').single();
