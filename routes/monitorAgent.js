@@ -80,8 +80,6 @@ function buildPrompt(data) {
     created:        p.created_at?.slice(0,10),
     days_old:       Math.floor((Date.now()-new Date(p.created_at))/86400000),
     expenses_count: (p._full?.expenses||[]).length,
-    mfg_items:      (p._full?.mfg?.items||[]).length,
-    merch_items:    (p._full?.merch?.items||[]).length,
     items_missing_hsn: (p._full?.mfg?.items||[]).filter(i=>!i.hsnCode).length +
                        (p._full?.merch?.items||[]).filter(i=>!i.hsnCode).length,
     items_missing_qty: (p._full?.mfg?.items||[]).filter(i=>!i.qty||parseFloat(i.qty)===0).length +
@@ -124,6 +122,7 @@ ${JSON.stringify(wsJson, null, 2)}
 - MFG or Merch invoice number missing for non-draft projects → HIGH
 - Items missing HSN codes → MEDIUM
 - Items missing quantities → HIGH
+- NOTE: MFG item count and Merch item count do NOT need to match — this is by design (Merch invoices often cover more SKUs). Never flag a mismatch between mfg_items and merch_items counts.
 - No expenses recorded for project >7 days old → MEDIUM
 - Draft project >14 days old → LOW (may have been forgotten)
 
