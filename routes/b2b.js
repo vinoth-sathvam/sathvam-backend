@@ -1,5 +1,6 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const multer = require('multer');
 const nodemailer = require('nodemailer');
 const supabase = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
@@ -898,7 +899,6 @@ projects.delete('/:id', auth, requireRole('admin'), async (req, res) => {
 });
 
 // ── Shipping Documents (BL copy, Seaway Bill, Fumigation, Insurance, Customs) ─
-const multer = require('multer');
 const projUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 const SHIP_DOC_TYPES = {
@@ -1730,7 +1730,6 @@ b2bProfile.put('/', auth, async (req, res) => {
 });
 
 // ── Helpers ──────────────────────────────────────────────────────────────
-const multer = require('multer');
 const b2bUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const B2B_DOC_BUCKET = 'b2b-docs';
 async function ensureB2bBucket() {
