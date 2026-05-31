@@ -2004,7 +2004,7 @@ b2bAiSummary.post('/', auth, async (req, res) => {
     // Fetch orders + payments
     const [{ data: orders, error: ordErr }, { data: pmtRow }, { data: cust }] = await Promise.all([
       supabase.from('b2b_orders')
-        .select('id,order_no,stage,total_value,currency,created_at,b2b_order_items(product_name,qty,unit)')
+        .select('id,order_no,stage,total_value,created_at,b2b_order_items(product_name,qty,unit)')
         .eq('customer_id', customerId)
         .order('created_at', { ascending: false })
         .limit(20),
@@ -2020,7 +2020,7 @@ b2bAiSummary.post('/', auth, async (req, res) => {
       const siblingIds = (sameNameCusts || []).map(c => c.id).filter(id => id !== customerId);
       if (siblingIds.length > 0) {
         const { data: byId } = await supabase.from('b2b_orders')
-          .select('id,order_no,stage,total_value,currency,created_at,b2b_order_items(product_name,qty,unit)')
+          .select('id,order_no,stage,total_value,created_at,b2b_order_items(product_name,qty,unit)')
           .in('customer_id', siblingIds)
           .order('created_at', { ascending: false })
           .limit(20);
