@@ -1126,6 +1126,196 @@ b2bOrders.get('/:id/project-docs', auth, async (req, res) => {
   }
 });
 
+// POST /api/b2b/orders/:id/email-logistics — B2B customer requests logistics invoice PDF emailed to them
+b2bOrders.post('/:id/email-logistics', auth, async (req, res) => {
+  try {
+    // Security: B2B customers can only email their own order
+    const { data: order } = await supabase.from('b2b_orders').select('id,order_no,customer_id,buyer_name').eq('id', req.params.id).single();
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (req.user.type === 'b2b_customer' && order.customer_id !== req.user.id)
+      return res.status(403).json({ error: 'Forbidden' });
+
+    const { data: cust } = await supabase.from('b2b_customers')
+      .select('email,contact_name,company_name,currency,address,phone,country')
+      .eq('id', order.customer_id).single();
+    if (!cust?.email) return res.status(400).json({ error: 'Customer email not found' });
+
+    const { data: proj } = await supabase.from('projects')
+      .select('id,project_name,pi_no,mfg_invoice_no,merch_invoice_no,etd')
+      .eq('b2b_order_id', req.params.id).maybeSingle();
+    if (!proj) return res.status(404).json({ error: 'No project linked to this order' });
+
+    const { data: fullRow } = await supabase.from('settings').select('value').eq('key', `project_full_${proj.id}`).maybeSingle();
+    const full = fullRow?.value || {};
+    const fin = full.financials || {};
+
+    const toNum = v => parseFloat(v) || 0;
+    const cur = cust.currency || 'INR';
+    const li = fin.logisticsInvoice || {};
+    const liItems = (li.items || []).filter(it => it.description || (parseFloat(it.amount) || 0) > 0);
+    const liTotal = liItems.length > 0 ? liItems.reduce((s, it) => s + (parseFloat(it.amount) || 0), 0) : toNum(fin.logisticsCharge) + toNum(fin.otherCharges);
+    const liInvoiceNo = li.invoiceNo || '';
+    const liInvoiceDate = li.invoiceDate ? new Date(li.invoiceDate).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+    const company = cust.company_name || '';
+    const customerName = cust.contact_name || order.buyer_name || '';
+    const custAddress = cust.address || '';
+    const custPhone = cust.phone || '';
+    const custCountry = cust.country || '';
+    const email = cust.email;
+    const fmtINR = v => `${cur} ${v.toLocaleString('en-IN', { minimumFractionDigits: 2 })}`;
+
+    const mfgItems = full.mfg?.items || [];
+    const mrchItems = full.merch?.items || [];
+    const calcItem = it => { const q = toNum(it.qty), r = toNum(it.rateINR || it.rate); return q * r; };
+    const mfgTotal = mfgItems.reduce((s, it) => s + (toNum(it.totalINR) || calcItem(it)), 0);
+    const mrchTotal = mrchItems.reduce((s, it) => s + (toNum(it.totalINR) || calcItem(it)), 0);
+    const invoiceVal = (mfgTotal + mrchTotal) > 0 ? (mfgTotal + mrchTotal) : toNum(order.total_value);
+
+    function numToWordsLocal(n) {
+      const ones = ['','One','Two','Three','Four','Five','Six','Seven','Eight','Nine','Ten','Eleven','Twelve','Thirteen','Fourteen','Fifteen','Sixteen','Seventeen','Eighteen','Nineteen'];
+      const tens = ['','','Twenty','Thirty','Forty','Fifty','Sixty','Seventy','Eighty','Ninety'];
+      function conv(x) {
+        if (x === 0) return '';
+        if (x < 20) return ones[x];
+        if (x < 100) return tens[Math.floor(x/10)] + (x%10 ? ' '+ones[x%10] : '');
+        if (x < 1000) return ones[Math.floor(x/100)] + ' Hundred' + (x%100 ? ' '+conv(x%100) : '');
+        if (x < 100000) return conv(Math.floor(x/1000)) + ' Thousand' + (x%1000 ? ' '+conv(x%1000) : '');
+        if (x < 10000000) return conv(Math.floor(x/100000)) + ' Lakh' + (x%100000 ? ' '+conv(x%100000) : '');
+        return conv(Math.floor(x/10000000)) + ' Crore' + (x%10000000 ? ' '+conv(x%10000000) : '');
+      }
+      const r = Math.floor(n), p = Math.round((n-r)*100);
+      return (conv(r) || 'Zero') + ' Rupees' + (p > 0 ? ' and '+conv(p)+' Paise' : '') + ' Only';
+    }
+
+    const liRowsHtml = liItems.map((it, i) => `<tr style="border-bottom:1px solid #f3f4f6;background:${i%2===0?'#fff':'#fafafa'}">
+      <td style="padding:10px 12px;font-size:12px;color:#6b7280">${i+1}</td>
+      <td style="padding:10px 12px;font-size:13px;color:#111827">${it.description||''}</td>
+      <td style="padding:10px 12px;text-align:right;font-weight:700;font-size:13px">${(parseFloat(it.amount)||0).toLocaleString('en-IN',{minimumFractionDigits:2})}</td>
+    </tr>`).join('');
+
+    const pdfHtml = `<!DOCTYPE html><html><head><meta charset="UTF-8">
+    <style>body{font-family:Arial,sans-serif;margin:0;padding:28px 32px;color:#111827;font-size:13px}table{border-collapse:collapse;width:100%}th,td{padding:0}</style>
+    </head><body>
+    <table style="width:100%;margin-bottom:18px;border-bottom:3px solid #0A4840;padding-bottom:14px"><tr>
+      <td style="vertical-align:top;width:60%">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+          <img src="https://www.sathvam.in/logo.jpg" alt="Sathvam" style="width:56px;height:56px;border-radius:10px;object-fit:cover;border:2px solid #e5e7eb"/>
+          <div style="font-size:26px;font-weight:900;color:#0A4840;letter-spacing:1px;line-height:1">Sathvam</div>
+        </div>
+        <div style="font-size:13px;font-weight:700;color:#1f2937;margin-top:2px">Sathvam Oils and Spices Pvt Ltd</div>
+        <div style="font-size:10px;color:#6b7280;margin-top:4px;line-height:1.7">Plot No. 6, Anand Jothi Nagar, Near ABS Hospital, Thanthoni, Tamil Nadu 639005<br>GSTIN: 33ABFCS9387K1ZN | PAN: ABFCS9387K | CIN: U15400TN2021PTC142893 | TAN: CHES61531B<br>Ph: +91 70921 77092 | Email: sales@sathvam.in | www.sathvam.in</div>
+      </td>
+      <td style="vertical-align:top;text-align:right">
+        <div style="font-size:20px;font-weight:900;color:#0A4840;letter-spacing:.5px">TAX INVOICE</div>
+        <div style="margin-top:8px;font-size:11px;color:#374151;line-height:1.8">
+          <strong>Invoice No:</strong> ${liInvoiceNo||'—'}<br><strong>Date:</strong> ${liInvoiceDate}<br>
+          <strong>Supply:</strong> ${custCountry&&custCountry.toLowerCase()!=='india'?'Export (Zero-rated)':'Inter-State'}<br>
+          <strong>Order:</strong> ${order.order_no}<br><strong>PI No:</strong> ${proj.pi_no||'—'}
+        </div>
+      </td>
+    </tr></table>
+    <table style="width:100%;margin-bottom:18px"><tr>
+      <td style="width:50%;vertical-align:top;padding-right:12px">
+        <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:12px">
+          <div style="font-size:9px;font-weight:700;color:#9ca3af;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">Bill To &amp; Ship To</div>
+          <div style="font-weight:700;font-size:14px;color:#111827">${company}</div>
+          ${customerName?`<div style="font-size:12px;color:#374151;margin-top:2px">${customerName}</div>`:''}
+          ${custAddress?`<div style="font-size:11px;color:#6b7280;margin-top:3px">${custAddress}</div>`:''}
+          ${custCountry?`<div style="font-size:11px;color:#6b7280">${custCountry}</div>`:''}
+          ${custPhone?`<div style="font-size:11px;color:#6b7280;margin-top:2px">Ph: ${custPhone}</div>`:''}
+          ${email?`<div style="font-size:11px;color:#6b7280">Email: ${email}</div>`:''}
+        </div>
+      </td>
+      <td style="width:50%;vertical-align:top;padding-left:12px">
+        <div style="background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;padding:12px">
+          <div style="font-size:9px;font-weight:700;color:#9ca3af;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px">Order &amp; Payment Info</div>
+          <div style="font-size:11px;color:#374151;line-height:1.8">
+            <strong>Order No:</strong> ${order.order_no}<br><strong>PI No:</strong> ${proj.pi_no||'—'}<br>
+            <strong>MFG Invoice:</strong> ${proj.mfg_invoice_no||'—'}<br><strong>Merch Invoice:</strong> ${proj.merch_invoice_no||'—'}<br>
+            <strong>ETD:</strong> ${proj.etd||'—'}
+          </div>
+        </div>
+      </td>
+    </tr></table>
+    <table style="width:100%;border:1px solid #e5e7eb;margin-bottom:0">
+      <thead><tr style="background:#0A4840">
+        <th style="padding:9px 12px;color:#fff;font-size:11px;text-align:left;width:5%">#</th>
+        <th style="padding:9px 12px;color:#fff;font-size:11px;text-align:left">Description</th>
+        <th style="padding:9px 12px;color:#fff;font-size:11px;text-align:right">Amount (${cur})</th>
+      </tr></thead>
+      <tbody>${liRowsHtml||'<tr><td colspan="3" style="padding:16px;text-align:center;color:#9ca3af">No items</td></tr>'}</tbody>
+      <tfoot>
+        <tr style="background:#f9fafb;border-top:1px solid #e5e7eb">
+          <td colspan="2" style="padding:10px 12px;font-size:12px;color:#374151">Taxable Amount</td>
+          <td style="padding:10px 12px;text-align:right;font-size:12px;font-weight:700">${liTotal.toLocaleString('en-IN',{minimumFractionDigits:2})}</td>
+        </tr>
+        <tr style="background:#f9fafb">
+          <td colspan="2" style="padding:10px 12px;font-size:12px;color:#374151">GST (Export — Zero Rated)</td>
+          <td style="padding:10px 12px;text-align:right;font-size:12px;font-weight:700">0.00</td>
+        </tr>
+        <tr style="background:#0A4840">
+          <td colspan="2" style="padding:12px;font-weight:800;font-size:13px;color:#fff">TOTAL AMOUNT</td>
+          <td style="padding:12px;text-align:right;font-weight:900;font-size:15px;color:#fbbf24">${cur} ${liTotal.toLocaleString('en-IN',{minimumFractionDigits:2})}</td>
+        </tr>
+        <tr style="background:#f0fdf4">
+          <td colspan="3" style="padding:10px 12px;font-size:12px;color:#374151;font-style:italic"><strong>Amount in Words:</strong> ${numToWordsLocal(liTotal)}</td>
+        </tr>
+      </tfoot>
+    </table>
+    <div style="margin-top:18px;font-size:11px;color:#374151">
+      <div><strong>Payment Terms:</strong> As per agreed terms.</div>
+      <div style="margin-top:4px">Subject to: Karur Jurisdiction</div>
+    </div>
+    <table style="width:60%;margin-left:40%;margin-top:18px;border:1px solid #e5e7eb">
+      <tr style="background:#f9fafb"><td style="padding:7px 12px;font-size:12px;color:#6b7280">Invoice Value (MFG + MERCH)</td><td style="padding:7px 12px;text-align:right;font-weight:700;font-size:12px">${fmtINR(invoiceVal)}</td></tr>
+      <tr><td style="padding:7px 12px;font-size:12px;color:#6b7280">Logistics &amp; Charges</td><td style="padding:7px 12px;text-align:right;font-weight:700;font-size:12px;color:#d97706">${fmtINR(liTotal)}</td></tr>
+    </table>
+    <table style="width:100%;margin-top:28px"><tr>
+      <td style="width:60%;font-size:11px;color:#374151">
+        <div><strong>Payment Options:</strong></div>
+        <div>UPI: sales@sathvam.in | Phone Pay / GPay: +91 70921 77092</div>
+        <div>Bank Transfer: Contact us at sales@sathvam.in for bank details</div>
+      </td>
+      <td style="width:40%;text-align:right;vertical-align:bottom">
+        <div style="font-size:11px;color:#374151">For Sathvam Oils and Spices Pvt Ltd</div>
+        <div style="margin-top:30px;border-top:1px solid #9ca3af;padding-top:4px;font-size:11px;color:#374151">Authorised Signatory</div>
+      </td>
+    </tr></table>
+    <div style="font-size:9px;color:#9ca3af;text-align:center;margin-top:20px;border-top:1px solid #f3f4f6;padding-top:8px">
+      Sathvam Oils and Spices Pvt Ltd · GSTIN: 33ABFCS9387K1ZN · sathvam.in · This is a computer-generated document.
+    </div></body></html>`;
+
+    const htmlPdf = require('html-pdf-node');
+    const pdfBuf = await htmlPdf.generatePdf({ content: pdfHtml }, { format: 'A4', printBackground: true });
+
+    await mailer.sendMail({
+      from: process.env.SMTP_FROM || `"Sathvam Oils and Spices" <${process.env.SMTP_USER}>`,
+      to: email,
+      subject: `Logistics Invoice ${liInvoiceNo ? '#'+liInvoiceNo : ''} — Order ${order.order_no}`,
+      html: `<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;color:#1f2937">
+        <div style="background:linear-gradient(135deg,#0A4840,#1A6B5E);padding:24px;border-radius:12px 12px 0 0;text-align:center">
+          <h2 style="color:#fff;margin:0;font-size:18px">🚢 Logistics Invoice</h2>
+        </div>
+        <div style="background:#f9fafb;padding:24px;border-radius:0 0 12px 12px;border:1px solid #e5e7eb">
+          <p style="margin:0 0 12px">Dear ${customerName}${company?' ('+company+')':''},</p>
+          <p style="margin:0 0 16px;font-size:13px;color:#374151">Please find your logistics invoice PDF attached for order <strong>${order.order_no}</strong>.</p>
+          <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;margin-bottom:16px">
+            <tr style="background:#f9fafb"><td style="padding:9px 14px;font-size:13px;color:#6b7280">Invoice No</td><td style="padding:9px 14px;text-align:right;font-weight:700;font-size:13px">${liInvoiceNo||'—'}</td></tr>
+            <tr><td style="padding:9px 14px;font-size:13px;color:#6b7280">Logistics Amount</td><td style="padding:9px 14px;text-align:right;font-weight:700;font-size:13px;color:#d97706">${fmtINR(liTotal)}</td></tr>
+          </table>
+          <p style="margin:0;font-size:11px;color:#9ca3af">For queries, contact: sales@sathvam.in | +91 70921 77092</p>
+        </div>
+      </div>`,
+      attachments: [{ filename: `Sathvam_Logistics_${order.order_no}_${liInvoiceNo||'INV'}.pdf`, content: pdfBuf, contentType: 'application/pdf' }],
+    });
+
+    res.json({ success: true, sentTo: email });
+  } catch (err) {
+    console.error('[b2b-email-logistics]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Document Vault ────────────────────────────────────────────────────────────
 const b2bDocs = express.Router();
 b2bDocs.get('/:orderId', auth, async (req, res) => {
