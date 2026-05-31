@@ -893,7 +893,81 @@ projects.delete('/:id', auth, requireRole('admin'), async (req, res) => {
   await supabase.from('project_expenses').delete().eq('project_id', req.params.id);
   await supabase.from('projects').delete().eq('id', req.params.id);
   await supabase.from('settings').delete().eq('key', `project_full_${req.params.id}`);
+  await supabase.from('settings').delete().eq('key', `project_shipping_docs_${req.params.id}`);
   res.json({ message: 'Deleted' });
+});
+
+// ── Shipping Documents (BL copy, Seaway Bill, Fumigation, Insurance, Customs) ─
+const multer = require('multer');
+const projUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
+
+const SHIP_DOC_TYPES = {
+  bl_copy:          'BL Copy',
+  seaway_bill:      'Seaway Bill',
+  fumigation_cert:  'Fumigation Certificate',
+  insurance:        'Insurance Certificate',
+  customs_copy:     'Indian Customs Copy',
+};
+
+// GET — list uploaded shipping docs for a project
+projects.get('/:id/shipping-docs', auth, async (req, res) => {
+  const { data } = await supabase.from('settings').select('value').eq('key', `project_shipping_docs_${req.params.id}`).maybeSingle();
+  res.json(data?.value || {});
+});
+
+// POST — upload a shipping document (one per type, replaces existing)
+projects.post('/:id/shipping-docs', auth, requireRole('admin','manager'), projUpload.single('file'), async (req, res) => {
+  try {
+    const { type } = req.body;
+    if (!SHIP_DOC_TYPES[type]) return res.status(400).json({ error: 'Invalid document type' });
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    const ext = req.file.originalname.split('.').pop().toLowerCase();
+    const path = `shipping-docs/${req.params.id}/${type}.${ext}`;
+
+    // Ensure bucket exists
+    const { data: buckets } = await supabase.storage.listBuckets();
+    if (!buckets?.find(b => b.name === 'documents')) {
+      await supabase.storage.createBucket('documents', { public: true, fileSizeLimit: 20 * 1024 * 1024 });
+    }
+
+    // Upload (upsert = replace)
+    const { error: upErr } = await supabase.storage.from('documents')
+      .upload(path, req.file.buffer, { contentType: req.file.mimetype, upsert: true });
+    if (upErr) return res.status(500).json({ error: upErr.message });
+
+    const { data: { publicUrl } } = supabase.storage.from('documents').getPublicUrl(path);
+
+    // Load existing docs, upsert this type
+    const { data: existing } = await supabase.from('settings').select('value').eq('key', `project_shipping_docs_${req.params.id}`).maybeSingle();
+    const docs = existing?.value || {};
+    docs[type] = { label: SHIP_DOC_TYPES[type], url: publicUrl, fileName: req.file.originalname, uploadedAt: new Date().toISOString(), uploadedBy: req.user.name || req.user.username || 'Admin' };
+
+    await supabase.from('settings').upsert({ key: `project_shipping_docs_${req.params.id}`, value: docs, updated_at: new Date() });
+    res.json({ success: true, doc: docs[type] });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE — remove a shipping document by type
+projects.delete('/:id/shipping-docs/:type', auth, requireRole('admin','manager'), async (req, res) => {
+  try {
+    const { type } = req.params;
+    const { data: existing } = await supabase.from('settings').select('value').eq('key', `project_shipping_docs_${req.params.id}`).maybeSingle();
+    const docs = existing?.value || {};
+    if (docs[type]) {
+      // Remove from storage (try both pdf and common extensions)
+      for (const ext of ['pdf','jpg','jpeg','png']) {
+        await supabase.storage.from('documents').remove([`shipping-docs/${req.params.id}/${type}.${ext}`]);
+      }
+      delete docs[type];
+      await supabase.from('settings').upsert({ key: `project_shipping_docs_${req.params.id}`, value: docs, updated_at: new Date() });
+    }
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── Item-level production progress (stored in settings table as key-value) ──
@@ -1154,9 +1228,13 @@ b2bOrders.get('/:id/project-docs', auth, async (req, res) => {
     // Find the project linked to this order
     const { data: project } = await supabase.from('projects').select('id,project_name,status,mfg_invoice_no,merch_invoice_no').eq('b2b_order_id', req.params.id).maybeSingle();
     if (!project) return res.json({ project: null });
-    // Return full project blob
-    const { data: setting } = await supabase.from('settings').select('value').eq('key', `project_full_${project.id}`).maybeSingle();
+    // Return full project blob + shipping docs
+    const [{ data: setting }, { data: shipDocRow }] = await Promise.all([
+      supabase.from('settings').select('value').eq('key', `project_full_${project.id}`).maybeSingle(),
+      supabase.from('settings').select('value').eq('key', `project_shipping_docs_${project.id}`).maybeSingle(),
+    ]);
     const full = setting?.value ? { ...setting.value, id: project.id } : { id: project.id, projectName: project.project_name, status: project.status };
+    full._shippingDocs = shipDocRow?.value || {};
     res.json({ project: full });
   } catch (e) {
     res.status(500).json({ error: 'Failed to load project documents' });
