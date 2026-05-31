@@ -2027,8 +2027,8 @@ b2bAiSummary.post('/', auth, async (req, res) => {
     : (req.body?.customerId || null);
   if (!customerId) return res.status(400).json({ error: 'customerId required' });
   try {
-    // Fetch orders + payments
-    const [{ data: orders, error: ordErr }, { data: pmtRow }, { data: cust }] = await Promise.all([
+    // Fetch orders + payments + customer + projects (for ETD/BL/container on active orders)
+    const [{ data: orders }, { data: pmtRow }, { data: cust }, { data: projectRows }] = await Promise.all([
       supabase.from('b2b_orders')
         .select('id,order_no,stage,total_value,created_at,b2b_order_items(product_name,qty,unit)')
         .eq('customer_id', customerId)
@@ -2036,6 +2036,7 @@ b2bAiSummary.post('/', auth, async (req, res) => {
         .limit(20),
       supabase.from('settings').select('value').eq('key', 'b2b_payments').single(),
       supabase.from('b2b_customers').select('company_name,contact_name,country,currency').eq('id', customerId).single(),
+      supabase.from('projects').select('b2b_order_id,etd,bl_no,container_no,status').order('created_at', { ascending: false }).limit(50),
     ]);
     // Fallback: if no orders found by customer_id, find sibling records with same company name
     // (handles duplicate b2b_customer entries — orders may be linked to a different record ID)
@@ -2057,41 +2058,58 @@ b2bAiSummary.post('/', auth, async (req, res) => {
     const payments = pmtRow?.value || {};
     const today = new Date().toISOString().slice(0, 10);
 
+    // Build project lookup by b2b_order_id for ETD/BL info
+    const projectByOrder = {};
+    (projectRows || []).forEach(p => { if (p.b2b_order_id) projectByOrder[p.b2b_order_id] = p; });
+
     const orderSummaries = allOrders.map(o => {
       const pmt = payments[o.id] || {};
-      const items = (o.b2b_order_items || []).length;
+      const proj = projectByOrder[o.id] || {};
+      const items = o.b2b_order_items || [];
       const advPaid = parseFloat(pmt.advance_paid || 0);
       const finPaid = parseFloat(pmt.remaining_paid || 0);
       const logiPaid = parseFloat(pmt.logistics_paid || 0);
       const totalPaid = advPaid + finPaid + logiPaid;
       const orderVal = parseFloat(o.total_value || 0);
       const outstanding = Math.max(0, orderVal - totalPaid);
-      return {
+      // Summarise products: e.g. "Sesame Oil 500ml × 120, Groundnut Oil 1L × 60"
+      const productSummary = items.slice(0, 5).map(it => `${it.product_name} × ${it.qty}${it.unit ? ' ' + it.unit : ''}`).join(', ') + (items.length > 5 ? ` + ${items.length - 5} more` : '');
+      const summary = {
         order_no: o.order_no,
         stage: o.stage,
-        date: (o.created_at || '').slice(0, 10),
-        items,
+        order_date: (o.created_at || '').slice(0, 10),
+        total_items: items.length,
+        products: productSummary || 'N/A',
         order_value: orderVal > 0 ? `₹${orderVal.toLocaleString('en-IN')}` : 'TBD',
         advance_paid: advPaid > 0 ? `₹${advPaid.toLocaleString('en-IN')}` : 'None',
-        outstanding: outstanding > 0 ? `₹${outstanding.toLocaleString('en-IN')}` : 'Nil',
+        final_paid: finPaid > 0 ? `₹${finPaid.toLocaleString('en-IN')}` : 'None',
+        outstanding_balance: outstanding > 0 ? `₹${outstanding.toLocaleString('en-IN')} still due` : 'Fully paid',
         payment_status: pmt.payment_status || 'unpaid',
       };
+      if (proj.etd) summary.expected_delivery = proj.etd;
+      if (proj.bl_no) summary.bl_number = proj.bl_no;
+      if (proj.container_no) summary.container = proj.container_no;
+      return summary;
     });
+
+    // Total business volume
+    const totalBusinessVal = allOrders.reduce((s, o) => s + parseFloat(o.total_value || 0), 0);
 
     const prompt = `You are a friendly and professional export account manager for Sathvam Natural Products Pvt Ltd, a premium cold-pressed oil and spice exporter from India.
 
-Today is ${today}. The customer is ${cust?.company_name || 'Valued Buyer'} (${cust?.contact_name || ''}) from ${cust?.country || 'International'}.
+Today is ${today}. The customer is ${cust?.company_name || 'Valued Buyer'} (Contact: ${cust?.contact_name || 'N/A'}) from ${cust?.country || 'International'}. Total lifetime business: ₹${totalBusinessVal.toLocaleString('en-IN')}.
 
-Here are their recent B2B export orders:
+Here are their B2B export orders with full details:
 ${JSON.stringify(orderSummaries, null, 2)}
 
 Write a concise, warm, and professional account summary for this customer. Include:
-1. A brief greeting and overall account health (1 sentence)
-2. Status of active/in-progress orders with any action items (payments due, approvals needed)
-3. Any completed/delivered orders (brief mention)
-4. One encouraging closing line about the business relationship
+1. A brief personalised greeting mentioning their name and country (1 sentence)
+2. For each active order: stage, key products, outstanding payment if any, and ETD/BL number if available
+3. Any clear action items (e.g. "confirm order", "transfer balance ₹X before delivery")
+4. Lifetime business value as a trust signal
+5. One warm closing line
 
-Keep it under 120 words. Use natural, friendly language — not bullet points. No markdown headers. Direct and actionable.`;
+Keep it under 150 words. Use natural, friendly language — not bullet points. No markdown headers. Be specific and actionable — mention actual amounts, product names, and dates.`;
 
     const msg = await _aiClient.messages.create({
       model: 'claude-haiku-4-5-20251001',
