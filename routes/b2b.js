@@ -1994,13 +1994,17 @@ const _aiClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const b2bAiSummary = express.Router();
 b2bAiSummary.post('/', auth, async (req, res) => {
-  if (req.user.type !== 'b2b_customer') return res.status(403).json({ error: 'B2B customers only' });
-  const customerId = req.user.id;
+  // B2B customers use sathvam_b2b cookie; admins previewing portal use sathvam_admin.
+  // Accept both: b2b_customer uses their own ID; admin must pass customerId in body.
+  const customerId = req.user.type === 'b2b_customer'
+    ? req.user.id
+    : (req.body?.customerId || null);
+  if (!customerId) return res.status(400).json({ error: 'customerId required' });
   try {
     // Fetch orders + payments
     const [{ data: orders }, { data: pmtRow }, { data: cust }] = await Promise.all([
       supabase.from('b2b_orders')
-        .select('id,order_no,stage,total_value,currency,created_at,b2b_order_items(product_name,quantity,unit)')
+        .select('id,order_no,stage,total_value,currency,created_at,b2b_order_items(product_name,qty,unit)')
         .eq('customer_id', customerId)
         .order('created_at', { ascending: false })
         .limit(20),
