@@ -27,7 +27,7 @@ router.get('/', auth, async (req, res) => {
       { data: sales },
       { data: vendors },
       { data: b2bCustomers },
-      { data: b2bOrders },
+      { data: b2bOrdersRaw },
       { data: projects },
       { data: projectMetas },
       { data: stockLedger },
@@ -38,6 +38,7 @@ router.get('/', auth, async (req, res) => {
       { data: packingInv },
       { data: settingsRows },
       { data: users },
+      { data: b2bPaymentsRow },
     ] = await Promise.all([
       supabase.from('products').select('*').eq('active', true).order('name'),
       supabase.from('batches').select('*').order('date', { ascending: false }).limit(300),
@@ -56,7 +57,36 @@ router.get('/', auth, async (req, res) => {
       supabase.from('packing_materials').select('id,name,category,product_name,size,unit,current_stock,min_stock,unit_price,avg_cost,supplier,active').order('name'),
       supabase.from('settings').select('key,value').in('key', SETTINGS_KEYS),
       supabase.from('users').select('id,username,name,email,phone,role,active,totp_enabled,created_at'),
+      supabase.from('settings').select('value').eq('key', 'b2b_payments').single(),
     ]);
+
+    // Merge b2b_payments into orders so payment fields are available in admin
+    const b2bPayments = b2bPaymentsRow?.value || {};
+    let b2bOrders = (b2bOrdersRaw || []).map(o => ({ ...o, ...(b2bPayments[o.id] || {}) }));
+
+    // Attach _invoiceVal from project MFG+MERCH totals (total_value is often 0 for export orders)
+    if (projects && projects.length > 0 && projectMetas && projectMetas.length > 0) {
+      const toNum = v => parseFloat(v) || 0;
+      const calcItem = it => toNum(it.qty) * toNum(it.rateINR || it.rate);
+      const fullMap = {};
+      projectMetas.forEach(r => { fullMap[r.key] = r.value; });
+      const invoiceMap = {};
+      projects.forEach(p => {
+        const full = fullMap[`project_full_${p.id}`] || {};
+        const mfgItems = full.mfg?.items || [];
+        const mrchItems = full.merch?.items || [];
+        const mfgTotal = mfgItems.reduce((s, it) => s + (toNum(it.totalINR) || calcItem(it)), 0);
+        const mrchTotal = mrchItems.reduce((s, it) => s + (toNum(it.totalINR) || calcItem(it)), 0);
+        if (p.b2b_order_id && (mfgTotal + mrchTotal) > 0) {
+          invoiceMap[p.b2b_order_id] = {
+            _invoiceVal: mfgTotal + mrchTotal,
+            _logisticsCharge: toNum(full.financials?.logisticsCharge),
+            _otherCharges: toNum(full.financials?.otherCharges),
+          };
+        }
+      });
+      b2bOrders = b2bOrders.map(o => invoiceMap[o.id] ? { ...o, ...invoiceMap[o.id] } : o);
+    }
 
     // Merge project meta blobs into project rows
     const metaMap = {};

@@ -130,9 +130,9 @@ b2bOrders.get('/', auth, async (req, res) => {
   const payments = pmtSettings?.value || {};
   let merged = (data || []).map(o => ({ ...o, ...(payments[o.id] || {}) }));
 
-  // For B2B customers: attach _invoiceVal from linked project MFG+MERCH totals
-  // so the customer portal shows accurate invoice values even when total_value is 0
-  if (req.user.type === 'b2b_customer' && merged.length > 0) {
+  // Attach _invoiceVal from linked project MFG+MERCH totals for all users
+  // so the portal shows accurate invoice values even when total_value is 0
+  if (merged.length > 0) {
     const orderIds = merged.map(o => o.id);
     const { data: projects } = await supabase.from('projects')
       .select('id,b2b_order_id').in('b2b_order_id', orderIds);
