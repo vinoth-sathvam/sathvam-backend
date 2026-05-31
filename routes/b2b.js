@@ -2002,7 +2002,7 @@ b2bAiSummary.post('/', auth, async (req, res) => {
   if (!customerId) return res.status(400).json({ error: 'customerId required' });
   try {
     // Fetch orders + payments
-    const [{ data: orders }, { data: pmtRow }, { data: cust }] = await Promise.all([
+    const [{ data: orders, error: ordErr }, { data: pmtRow }, { data: cust }] = await Promise.all([
       supabase.from('b2b_orders')
         .select('id,order_no,stage,total_value,currency,created_at,b2b_order_items(product_name,qty,unit)')
         .eq('customer_id', customerId)
@@ -2011,10 +2011,27 @@ b2bAiSummary.post('/', auth, async (req, res) => {
       supabase.from('settings').select('value').eq('key', 'b2b_payments').single(),
       supabase.from('b2b_customers').select('company_name,contact_name,country,currency').eq('id', customerId).single(),
     ]);
+    // Fallback: if no orders found by customer_id, find sibling records with same company name
+    // (handles duplicate b2b_customer entries — orders may be linked to a different record ID)
+    let allOrders = orders || [];
+    if (allOrders.length === 0 && cust?.company_name) {
+      const { data: sameNameCusts } = await supabase.from('b2b_customers')
+        .select('id').ilike('company_name', cust.company_name);
+      const siblingIds = (sameNameCusts || []).map(c => c.id).filter(id => id !== customerId);
+      if (siblingIds.length > 0) {
+        const { data: byId } = await supabase.from('b2b_orders')
+          .select('id,order_no,stage,total_value,currency,created_at,b2b_order_items(product_name,qty,unit)')
+          .in('customer_id', siblingIds)
+          .order('created_at', { ascending: false })
+          .limit(20);
+        if (byId?.length) allOrders = byId;
+      }
+    }
+
     const payments = pmtRow?.value || {};
     const today = new Date().toISOString().slice(0, 10);
 
-    const orderSummaries = (orders || []).map(o => {
+    const orderSummaries = allOrders.map(o => {
       const pmt = payments[o.id] || {};
       const items = (o.b2b_order_items || []).length;
       const advPaid = parseFloat(pmt.advance_paid || 0);
