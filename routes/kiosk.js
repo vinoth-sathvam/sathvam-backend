@@ -182,7 +182,7 @@ router.delete('/register-face/:employee_id', auth, requireRole('admin'), async (
 
 // ── POST /api/kiosk/checkin ───────────────────────────────────────────────────
 router.post('/checkin', kioskAuth, async (req, res) => {
-  const { image } = req.body;
+  const { image, offlineTimestamp } = req.body;
   if (!image) return res.status(400).json({ error: 'image is required' });
 
   await ensureCollection();
@@ -223,7 +223,18 @@ router.post('/checkin', kioskAuth, async (req, res) => {
 
   if (!emp) return res.status(404).json({ error: 'Employee not found or inactive' });
 
-  const { date, time, mmdd } = getIST();
+  // Use offlineTimestamp if provided (queued scan) — must be within last 24h
+  let { date, time, mmdd } = getIST();
+  if (offlineTimestamp) {
+    const ts = new Date(offlineTimestamp);
+    const ageMs = Date.now() - ts.getTime();
+    if (!isNaN(ts.getTime()) && ageMs >= 0 && ageMs <= 86400000) {
+      const ist = new Date(ts.getTime() + 5.5 * 60 * 60 * 1000);
+      date = ist.toISOString().substring(0, 10);
+      time = ist.toISOString().substring(11, 19);
+      mmdd = ist.toISOString().substring(5, 10);
+    }
+  }
   const isBirthday = emp.date_of_birth ? emp.date_of_birth.substring(5, 10) === mmdd : false;
 
   const { data: existing } = await supabase
