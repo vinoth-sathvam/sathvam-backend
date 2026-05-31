@@ -548,6 +548,23 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
     const cur = cust?.currency || 'INR';
     const fmtINR = v => `${cur} ${v.toLocaleString('en-IN',{minimumFractionDigits:2})}`;
 
+    function numToWords(n) {
+      const ones = ['','One','Two','Three','Four','Five','Six','Seven','Eight','Nine',
+        'Ten','Eleven','Twelve','Thirteen','Fourteen','Fifteen','Sixteen','Seventeen','Eighteen','Nineteen'];
+      const tens = ['','','Twenty','Thirty','Forty','Fifty','Sixty','Seventy','Eighty','Ninety'];
+      function conv(x) {
+        if(x===0) return '';
+        if(x<20) return ones[x];
+        if(x<100) return tens[Math.floor(x/10)]+(x%10?' '+ones[x%10]:'');
+        if(x<1000) return ones[Math.floor(x/100)]+' Hundred'+(x%100?' '+conv(x%100):'');
+        if(x<100000) return conv(Math.floor(x/1000))+' Thousand'+(x%1000?' '+conv(x%1000):'');
+        if(x<10000000) return conv(Math.floor(x/100000))+' Lakh'+(x%100000?' '+conv(x%100000):'');
+        return conv(Math.floor(x/10000000))+' Crore'+(x%10000000?' '+conv(x%10000000):'');
+      }
+      const r=Math.floor(n), p=Math.round((n-r)*100);
+      return (conv(r)||'Zero')+' Rupees'+(p>0?' and '+conv(p)+' Paise':'')+' Only';
+    }
+
     const advRows = advEntries.map((e,i) =>
       `<tr><td style="padding:5px 12px;color:#6b7280;font-size:12px">#${i+1} · ${e.date||''}</td><td style="padding:5px 12px;text-align:right;font-weight:700;font-size:12px;color:#d97706">${fmtINR(toNum(e.amount))}</td></tr>`
     ).join('');
@@ -644,8 +661,11 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
     <table style="width:100%;margin-bottom:18px;border-bottom:3px solid #0A4840;padding-bottom:14px">
       <tr>
         <td style="vertical-align:top;width:60%">
-          <div style="font-size:26px;font-weight:900;color:#0A4840;letter-spacing:1px;line-height:1">Sathvam</div>
-          <div style="font-size:13px;font-weight:700;color:#1f2937;margin-top:3px">Sathvam Oils and Spices Pvt Ltd</div>
+          <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+            <img src="https://www.sathvam.in/logo.jpg" alt="Sathvam" style="width:56px;height:56px;border-radius:10px;object-fit:cover;border:2px solid #e5e7eb"/>
+            <div style="font-size:26px;font-weight:900;color:#0A4840;letter-spacing:1px;line-height:1">Sathvam</div>
+          </div>
+          <div style="font-size:13px;font-weight:700;color:#1f2937;margin-top:2px">Sathvam Oils and Spices Pvt Ltd</div>
           <div style="font-size:10px;color:#6b7280;margin-top:4px;line-height:1.7">
             Plot No. 6, Anand Jothi Nagar, Near ABS Hospital, Thanthoni, Tamil Nadu 639005<br>
             GSTIN: 33ABFCS9387K1ZN | PAN: ABFCS9387K | CIN: U15400TN2021PTC142893 | TAN: CHES61531B<br>
@@ -725,6 +745,11 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
         <tr style="background:#0A4840">
           <td colspan="2" style="padding:12px;font-weight:800;font-size:13px;color:#fff">TOTAL AMOUNT</td>
           <td style="padding:12px;text-align:right;font-weight:900;font-size:15px;color:#fbbf24">${cur} ${liTotal.toLocaleString('en-IN',{minimumFractionDigits:2})}</td>
+        </tr>
+        <tr style="background:#f0fdf4">
+          <td colspan="3" style="padding:10px 12px;font-size:12px;color:#374151;font-style:italic">
+            <strong>Amount in Words:</strong> ${numToWords(liTotal)}
+          </td>
         </tr>
       </tfoot>
     </table>
