@@ -128,7 +128,44 @@ b2bOrders.get('/', auth, async (req, res) => {
   ]);
   if (error) return res.status(500).json({ error: 'Failed to load orders' });
   const payments = pmtSettings?.value || {};
-  const merged = (data || []).map(o => ({ ...o, ...(payments[o.id] || {}) }));
+  let merged = (data || []).map(o => ({ ...o, ...(payments[o.id] || {}) }));
+
+  // For B2B customers: attach _invoiceVal from linked project MFG+MERCH totals
+  // so the customer portal shows accurate invoice values even when total_value is 0
+  if (req.user.type === 'b2b_customer' && merged.length > 0) {
+    const orderIds = merged.map(o => o.id);
+    const { data: projects } = await supabase.from('projects')
+      .select('id,b2b_order_id').in('b2b_order_id', orderIds);
+    if (projects && projects.length > 0) {
+      const projIds = projects.map(p => p.id);
+      const { data: fullRows } = await supabase.from('settings')
+        .select('key,value').in('key', projIds.map(id => `project_full_${id}`));
+      const fullMap = {};
+      (fullRows || []).forEach(r => { fullMap[r.key] = r.value; });
+      const toNum = v => parseFloat(v) || 0;
+      const calcItem = it => { const q = toNum(it.qty), r = toNum(it.rateINR || it.rate); return q * r; };
+      // Build orderId → _invoiceVal map
+      const invoiceMap = {};
+      projects.forEach(proj => {
+        const full = fullMap[`project_full_${proj.id}`] || {};
+        const mfgItems = full.mfg?.items || [];
+        const mrchItems = full.merch?.items || [];
+        const mfgTotal = mfgItems.reduce((s, it) => s + (toNum(it.totalINR) || calcItem(it)), 0);
+        const mrchTotal = mrchItems.reduce((s, it) => s + (toNum(it.totalINR) || calcItem(it)), 0);
+        const logCharge = toNum(full.financials?.logisticsCharge);
+        const otherChr = toNum(full.financials?.otherCharges);
+        if ((mfgTotal + mrchTotal) > 0) {
+          invoiceMap[proj.b2b_order_id] = {
+            _invoiceVal: mfgTotal + mrchTotal,
+            _logisticsCharge: logCharge,
+            _otherCharges: otherChr,
+          };
+        }
+      });
+      merged = merged.map(o => invoiceMap[o.id] ? { ...o, ...invoiceMap[o.id] } : o);
+    }
+  }
+
   res.json(merged);
 });
 b2bOrders.post('/', auth, async (req, res) => {
