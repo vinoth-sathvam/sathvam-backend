@@ -1674,6 +1674,32 @@ b2bOrders.post('/:id/advance-claim', auth, async (req, res) => {
   res.json({ ok: true, claim });
 });
 
+// POST /api/b2b/orders/:id/balance-claim — customer submits final/balance payment details (notification to admin)
+b2bOrders.post('/:id/balance-claim', auth, async (req, res) => {
+  if (req.user.type === 'b2b_customer' && !(await ownsOrder(req.user.id, req.params.id)))
+    return res.status(403).json({ error: 'Forbidden' });
+  const { amount, txnRef, date, notes } = req.body;
+  if (!amount || parseFloat(amount) <= 0) return res.status(400).json({ error: 'Amount is required' });
+  const SETTINGS_KEY = 'b2b_payments';
+  const all = await getSettingsBlob(SETTINGS_KEY);
+  const claim = { amount: parseFloat(amount), txnRef: txnRef||'', date: date||new Date().toISOString().slice(0,10), notes: notes||'', submittedAt: new Date().toISOString(), status: 'pending_verification' };
+  all[req.params.id] = { ...(all[req.params.id]||{}), customer_balance_claim: claim };
+  await saveSettingsBlob(SETTINGS_KEY, all);
+  // WhatsApp notification to admin
+  try {
+    const { data: order } = await supabase.from('b2b_orders').select('order_no,b2b_customers(company_name,contact_name)').eq('id', req.params.id).single();
+    const company = order?.b2b_customers?.company_name || 'Customer';
+    const wa = process.env.WA_ADMIN_PHONE1||process.env.ADMIN_WHATSAPP_PHONE;
+    if (wa) {
+      await fetch(`${process.env.BOTSAILOR_API_URL||'https://app.botsailor.com'}/api/whatsapp/quick-message`, {
+        method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${process.env.BOTSAILOR_API_TOKEN}`},
+        body: JSON.stringify({ phone: wa, message: `🏦 Balance Payment Claim\n${order?.order_no||req.params.id} · ${company}\nAmount: ₹${parseFloat(amount).toLocaleString('en-IN')}\nRef: ${txnRef||'—'}\nDate: ${date||'Today'}\n\nPlease verify and record the final payment in the admin panel.` })
+      }).catch(()=>{});
+    }
+  } catch(_) {}
+  res.json({ ok: true, claim });
+});
+
 // POST /api/b2b/orders/:id/payment — admin records advance, remaining, or logistics payment
 b2bOrders.post('/:id/payment', auth, requireRole('admin','manager','ceo'), async (req, res) => {
   const { type, amount, date, ref, notes } = req.body;
