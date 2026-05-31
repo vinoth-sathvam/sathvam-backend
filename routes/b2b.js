@@ -902,7 +902,6 @@ projects.delete('/:id', auth, requireRole('admin'), async (req, res) => {
 const projUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 } });
 
 const SHIP_DOC_TYPES = {
-  bl_copy:          'BL Copy',
   seaway_bill:      'Seaway Bill',
   fumigation_cert:  'Fumigation Certificate',
   insurance:        'Insurance Certificate',
@@ -915,15 +914,16 @@ projects.get('/:id/shipping-docs', auth, async (req, res) => {
   res.json(data?.value || {});
 });
 
-// POST — upload a shipping document (one per type, replaces existing)
+// POST — upload a shipping document (multiple per type supported)
 projects.post('/:id/shipping-docs', auth, requireRole('admin','manager'), projUpload.single('file'), async (req, res) => {
   try {
     const { type } = req.body;
     if (!SHIP_DOC_TYPES[type]) return res.status(400).json({ error: 'Invalid document type' });
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
+    const fileId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
     const ext = req.file.originalname.split('.').pop().toLowerCase();
-    const path = `shipping-docs/${req.params.id}/${type}.${ext}`;
+    const path = `shipping-docs/${req.params.id}/${type}_${fileId}.${ext}`;
 
     // Ensure bucket exists
     const { data: buckets } = await supabase.storage.listBuckets();
@@ -931,39 +931,62 @@ projects.post('/:id/shipping-docs', auth, requireRole('admin','manager'), projUp
       await supabase.storage.createBucket('documents', { public: true, fileSizeLimit: 20 * 1024 * 1024 });
     }
 
-    // Upload (upsert = replace)
     const { error: upErr } = await supabase.storage.from('documents')
-      .upload(path, req.file.buffer, { contentType: req.file.mimetype, upsert: true });
+      .upload(path, req.file.buffer, { contentType: req.file.mimetype, upsert: false });
     if (upErr) return res.status(500).json({ error: upErr.message });
 
     const { data: { publicUrl } } = supabase.storage.from('documents').getPublicUrl(path);
 
-    // Load existing docs, upsert this type
     const { data: existing } = await supabase.from('settings').select('value').eq('key', `project_shipping_docs_${req.params.id}`).maybeSingle();
     const docs = existing?.value || {};
-    docs[type] = { label: SHIP_DOC_TYPES[type], url: publicUrl, fileName: req.file.originalname, uploadedAt: new Date().toISOString(), uploadedBy: req.user.name || req.user.username || 'Admin' };
+
+    // Normalise: if old single-object format exists, convert to array
+    const existing_arr = Array.isArray(docs[type]) ? docs[type]
+      : docs[type] ? [docs[type]] : [];
+
+    const newDoc = { id: fileId, label: SHIP_DOC_TYPES[type], url: publicUrl, path, fileName: req.file.originalname, uploadedAt: new Date().toISOString(), uploadedBy: req.user.name || req.user.username || 'Admin' };
+    docs[type] = [...existing_arr, newDoc];
 
     await supabase.from('settings').upsert({ key: `project_shipping_docs_${req.params.id}`, value: docs, updated_at: new Date() });
-    res.json({ success: true, doc: docs[type] });
+    res.json({ success: true, doc: newDoc, files: docs[type] });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// DELETE — remove a shipping document by type
+// DELETE — remove a specific file by type + fileId
+projects.delete('/:id/shipping-docs/:type/:fileId', auth, requireRole('admin','manager'), async (req, res) => {
+  try {
+    const { type, fileId } = req.params;
+    const { data: existing } = await supabase.from('settings').select('value').eq('key', `project_shipping_docs_${req.params.id}`).maybeSingle();
+    const docs = existing?.value || {};
+    const arr = Array.isArray(docs[type]) ? docs[type] : docs[type] ? [docs[type]] : [];
+    const target = arr.find(f => f.id === fileId);
+    if (target?.path) {
+      await supabase.storage.from('documents').remove([target.path]);
+    }
+    const remaining = arr.filter(f => f.id !== fileId);
+    if (remaining.length === 0) delete docs[type];
+    else docs[type] = remaining;
+    await supabase.from('settings').upsert({ key: `project_shipping_docs_${req.params.id}`, value: docs, updated_at: new Date() });
+    res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// DELETE — legacy: remove all files for a type (keep for backward compat)
 projects.delete('/:id/shipping-docs/:type', auth, requireRole('admin','manager'), async (req, res) => {
   try {
     const { type } = req.params;
     const { data: existing } = await supabase.from('settings').select('value').eq('key', `project_shipping_docs_${req.params.id}`).maybeSingle();
     const docs = existing?.value || {};
-    if (docs[type]) {
-      // Remove from storage (try both pdf and common extensions)
-      for (const ext of ['pdf','jpg','jpeg','png']) {
-        await supabase.storage.from('documents').remove([`shipping-docs/${req.params.id}/${type}.${ext}`]);
-      }
-      delete docs[type];
-      await supabase.from('settings').upsert({ key: `project_shipping_docs_${req.params.id}`, value: docs, updated_at: new Date() });
+    const arr = Array.isArray(docs[type]) ? docs[type] : docs[type] ? [docs[type]] : [];
+    for (const f of arr) {
+      if (f.path) await supabase.storage.from('documents').remove([f.path]);
     }
+    delete docs[type];
+    await supabase.from('settings').upsert({ key: `project_shipping_docs_${req.params.id}`, value: docs, updated_at: new Date() });
     res.json({ success: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -1625,6 +1648,32 @@ b2bAnalytics.get('/', auth, requireRole('admin','manager','ceo'), async (req, re
   }});
 });
 
+// POST /api/b2b/orders/:id/advance-claim — customer submits advance payment details (notification to admin)
+b2bOrders.post('/:id/advance-claim', auth, async (req, res) => {
+  if (req.user.type === 'b2b_customer' && !(await ownsOrder(req.user.id, req.params.id)))
+    return res.status(403).json({ error: 'Forbidden' });
+  const { amount, txnRef, date, notes } = req.body;
+  if (!amount || parseFloat(amount) <= 0) return res.status(400).json({ error: 'Amount is required' });
+  const SETTINGS_KEY = 'b2b_payments';
+  const all = await getSettingsBlob(SETTINGS_KEY);
+  const claim = { amount: parseFloat(amount), txnRef: txnRef||'', date: date||new Date().toISOString().slice(0,10), notes: notes||'', submittedAt: new Date().toISOString(), status: 'pending_verification' };
+  all[req.params.id] = { ...(all[req.params.id]||{}), customer_advance_claim: claim };
+  await saveSettingsBlob(SETTINGS_KEY, all);
+  // WhatsApp notification to admin
+  try {
+    const { data: order } = await supabase.from('b2b_orders').select('order_no,b2b_customers(company_name,contact_name)').eq('id', req.params.id).single();
+    const company = order?.b2b_customers?.company_name || 'Customer';
+    const wa = process.env.WA_ADMIN_PHONE1||process.env.ADMIN_WHATSAPP_PHONE;
+    if (wa) {
+      await fetch(`${process.env.BOTSAILOR_API_URL||'https://app.botsailor.com'}/api/whatsapp/quick-message`, {
+        method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${process.env.BOTSAILOR_API_TOKEN}`},
+        body: JSON.stringify({ phone: wa, message: `💰 Advance Payment Claim\n${order?.order_no||req.params.id} · ${company}\nAmount: ₹${parseFloat(amount).toLocaleString('en-IN')}\nRef: ${txnRef||'—'}\nDate: ${date||'Today'}\n\nPlease verify and record the payment in the admin panel.` })
+      }).catch(()=>{});
+    }
+  } catch(_) {}
+  res.json({ ok: true, claim });
+});
+
 // POST /api/b2b/orders/:id/payment — admin records advance, remaining, or logistics payment
 b2bOrders.post('/:id/payment', auth, requireRole('admin','manager','ceo'), async (req, res) => {
   const { type, amount, date, ref, notes } = req.body;
@@ -1939,4 +1988,76 @@ b2bNotifications.get('/:customerId', auth, async (req, res) => {
   res.json(notifications.slice(0, 40));
 });
 
-module.exports = { b2bCustomers, b2bOrders, projects, b2bItemProgress, b2bStatement, b2bStock, b2bCustomPrices, b2bQuotes, b2bDocs, b2bSamples, b2bMessages, b2bAnalytics, b2bProfile, b2bNotifications, b2bModRequests, b2bCancelRequests, b2bDisputes, b2bPaymentProof, b2bCustomerDocs, b2bAccount };
+// ── AI Account Summary ────────────────────────────────────────────────────────
+const Anthropic = require('@anthropic-ai/sdk');
+const _aiClient = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+const b2bAiSummary = express.Router();
+b2bAiSummary.post('/', auth, async (req, res) => {
+  if (req.user.type !== 'b2b_customer') return res.status(403).json({ error: 'B2B customers only' });
+  const customerId = req.user.id;
+  try {
+    // Fetch orders + payments
+    const [{ data: orders }, { data: pmtRow }, { data: cust }] = await Promise.all([
+      supabase.from('b2b_orders')
+        .select('id,order_no,stage,total_value,currency,created_at,b2b_order_items(product_name,quantity,unit)')
+        .eq('customer_id', customerId)
+        .order('created_at', { ascending: false })
+        .limit(20),
+      supabase.from('settings').select('value').eq('key', 'b2b_payments').single(),
+      supabase.from('b2b_customers').select('company_name,contact_name,country,currency').eq('id', customerId).single(),
+    ]);
+    const payments = pmtRow?.value || {};
+    const today = new Date().toISOString().slice(0, 10);
+
+    const orderSummaries = (orders || []).map(o => {
+      const pmt = payments[o.id] || {};
+      const items = (o.b2b_order_items || []).length;
+      const advPaid = parseFloat(pmt.advance_paid || 0);
+      const finPaid = parseFloat(pmt.remaining_paid || 0);
+      const logiPaid = parseFloat(pmt.logistics_paid || 0);
+      const totalPaid = advPaid + finPaid + logiPaid;
+      const orderVal = parseFloat(o.total_value || 0);
+      const outstanding = Math.max(0, orderVal - totalPaid);
+      return {
+        order_no: o.order_no,
+        stage: o.stage,
+        date: (o.created_at || '').slice(0, 10),
+        items,
+        order_value: orderVal > 0 ? `₹${orderVal.toLocaleString('en-IN')}` : 'TBD',
+        advance_paid: advPaid > 0 ? `₹${advPaid.toLocaleString('en-IN')}` : 'None',
+        outstanding: outstanding > 0 ? `₹${outstanding.toLocaleString('en-IN')}` : 'Nil',
+        payment_status: pmt.payment_status || 'unpaid',
+      };
+    });
+
+    const prompt = `You are a friendly and professional export account manager for Sathvam Natural Products Pvt Ltd, a premium cold-pressed oil and spice exporter from India.
+
+Today is ${today}. The customer is ${cust?.company_name || 'Valued Buyer'} (${cust?.contact_name || ''}) from ${cust?.country || 'International'}.
+
+Here are their recent B2B export orders:
+${JSON.stringify(orderSummaries, null, 2)}
+
+Write a concise, warm, and professional account summary for this customer. Include:
+1. A brief greeting and overall account health (1 sentence)
+2. Status of active/in-progress orders with any action items (payments due, approvals needed)
+3. Any completed/delivered orders (brief mention)
+4. One encouraging closing line about the business relationship
+
+Keep it under 120 words. Use natural, friendly language — not bullet points. No markdown headers. Direct and actionable.`;
+
+    const msg = await _aiClient.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const summary = msg.content[0]?.text?.trim() || 'Unable to generate summary.';
+    res.json({ summary, generated_at: new Date().toISOString() });
+  } catch (err) {
+    console.error('B2B AI summary error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+module.exports = { b2bCustomers, b2bOrders, projects, b2bItemProgress, b2bStatement, b2bStock, b2bCustomPrices, b2bQuotes, b2bDocs, b2bSamples, b2bMessages, b2bAnalytics, b2bProfile, b2bNotifications, b2bModRequests, b2bCancelRequests, b2bDisputes, b2bPaymentProof, b2bCustomerDocs, b2bAccount, b2bAiSummary };
