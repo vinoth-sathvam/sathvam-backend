@@ -1000,7 +1000,7 @@ procurement.post('/:id/attach-bill', auth, requireRole('admin','manager'), procU
   try {
     await ensurePOBillsBucket();
     const { vendor_bill_no } = req.body;
-    const updates = { updated_at: new Date().toISOString() };
+    const updates = {};
 
     if (vendor_bill_no !== undefined) updates.vendor_bill_no = vendor_bill_no.trim();
 
