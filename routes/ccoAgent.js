@@ -122,39 +122,28 @@ async function runCCOCheck(txn) {
 }
 
 /**
- * Daily batch CCO scan — expense spikes, weekend entries, missing narrations in bulk.
+ * Daily batch CCO scan — queries source tables directly, not money_ledger.
  */
 async function runCCODailyScan() {
-  const today     = new Date().toISOString().slice(0, 10);
-  const findings  = [];
-
-  // A. Expense spike — category spend this month vs 3-month avg >40%
+  const today      = new Date().toISOString().slice(0, 10);
   const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().slice(0, 10);
-  const threeAgo   = new Date(new Date().setMonth(new Date().getMonth() - 3)).toISOString().slice(0, 10);
+  const threeAgo   = new Date(new Date().getFullYear(), new Date().getMonth() - 3, 1).toISOString().slice(0, 10);
+  const findings   = [];
 
+  // ── A. Expense spike — category this month vs 3-month avg >40% ──────────
   const { data: thisMonthExp } = await supabase
-    .from('money_ledger')
-    .select('subcategory,amount')
-    .eq('direction', 'out')
-    .eq('category', 'expense')
-    .gte('txn_date', monthStart);
-
+    .from('company_expenses').select('category,amount').is('deleted_at', null).gte('date', monthStart);
   const { data: prevExp } = await supabase
-    .from('money_ledger')
-    .select('subcategory,amount')
-    .eq('direction', 'out')
-    .eq('category', 'expense')
-    .gte('txn_date', threeAgo)
-    .lt('txn_date', monthStart);
+    .from('company_expenses').select('category,amount').is('deleted_at', null)
+    .gte('date', threeAgo).lt('date', monthStart);
 
   const thisByCat = {}, prevByCat = {};
   for (const r of (thisMonthExp || [])) {
-    thisByCat[r.subcategory] = (thisByCat[r.subcategory] || 0) + (parseFloat(r.amount) || 0);
+    thisByCat[r.category] = (thisByCat[r.category] || 0) + (parseFloat(r.amount) || 0);
   }
   for (const r of (prevExp || [])) {
-    prevByCat[r.subcategory] = (prevByCat[r.subcategory] || 0) + (parseFloat(r.amount) || 0);
+    prevByCat[r.category] = (prevByCat[r.category] || 0) + (parseFloat(r.amount) || 0);
   }
-
   for (const [cat, thisAmt] of Object.entries(thisByCat)) {
     const avg3 = (prevByCat[cat] || 0) / 3;
     if (avg3 > 0 && thisAmt > avg3 * 1.4 && thisAmt > 5000) {
@@ -163,26 +152,21 @@ async function runCCODailyScan() {
         severity:    'medium',
         category:    'expense_spike',
         title:       `Expense spike in "${cat}" — ${pct}% above 3-month avg`,
-        description: `"${cat}" expenses this month: ₹${thisAmt.toLocaleString('en-IN')} vs 3-month avg of ₹${avg3.toLocaleString('en-IN')}. ${pct}% higher. Review if increase is justified.`,
+        description: `"${cat}" expenses this month: ₹${thisAmt.toLocaleString('en-IN')} vs 3-month avg ₹${avg3.toLocaleString('en-IN')} (+${pct}%). Review if justified.`,
         amount:      thisAmt,
       });
     }
   }
 
-  // B. Cash payments >₹40A(3) threshold (₹10K per vendor per day) that weren't flagged real-time
-  const { data: cashBig } = await supabase
-    .from('money_ledger')
-    .select('txn_date,party,amount,id,email_sent')
-    .eq('payment_mode', 'cash')
-    .eq('direction', 'out')
-    .gte('amount', 10000)
-    .gte('txn_date', monthStart);
+  // ── B. Sec 40A(3) — cash expenses >₹10K per vendor per day ─────────────
+  const { data: cashExp } = await supabase
+    .from('company_expenses').select('date,vendor_name,amount')
+    .is('deleted_at', null).eq('payment_mode', 'cash').gte('amount', 10000).gte('date', monthStart);
 
-  // Group by vendor+date
   const cashGroups = {};
-  for (const r of (cashBig || [])) {
-    const key = `${r.txn_date}_${r.party}`;
-    if (!cashGroups[key]) cashGroups[key] = { date: r.txn_date, party: r.party, total: 0 };
+  for (const r of (cashExp || [])) {
+    const key = `${r.date}_${r.vendor_name || 'unknown'}`;
+    if (!cashGroups[key]) cashGroups[key] = { date: r.date, party: r.vendor_name || 'unknown', total: 0 };
     cashGroups[key].total += parseFloat(r.amount) || 0;
   }
   for (const g of Object.values(cashGroups)) {
@@ -191,36 +175,122 @@ async function runCCODailyScan() {
         severity:    'high',
         category:    'sec_40a3',
         title:       `Sec 40A(3) risk — Cash ₹${g.total.toLocaleString('en-IN')} to "${g.party}" on ${g.date}`,
-        description: `Total cash payments to "${g.party}" on ${g.date} = ₹${g.total.toLocaleString('en-IN')}, exceeding ₹10K limit under Sec 40A(3). These expenses may be disallowed in ITR.`,
+        description: `Cash payments to "${g.party}" on ${g.date} total ₹${g.total.toLocaleString('en-IN')}, exceeding ₹10K Sec 40A(3) limit. May be disallowed in ITR.`,
         amount:      g.total,
       });
     }
   }
 
-  // C. Large transactions without narration (catch anything missed in real-time)
-  const { data: noNarr } = await supabase
-    .from('money_ledger')
-    .select('id,txn_date,amount,direction,party')
-    .gte('amount', ALERT_THRESHOLD)
-    .or('narration.is.null,narration.eq.')
-    .gte('txn_date', monthStart);
-
-  for (const r of (noNarr || [])) {
+  // ── C. Sec 269ST — cash expense >₹2L ────────────────────────────────────
+  const { data: bigCash } = await supabase
+    .from('company_expenses').select('date,vendor_name,amount')
+    .is('deleted_at', null).eq('payment_mode', 'cash').gte('amount', 200000).gte('date', monthStart);
+  for (const r of (bigCash || [])) {
     findings.push({
-      severity:    'low',
-      category:    'missing_narration',
-      title:       `No narration — ₹${parseFloat(r.amount).toLocaleString('en-IN')} on ${r.txn_date}`,
-      description: `Transaction ID #${r.id} — ₹${parseFloat(r.amount).toLocaleString('en-IN')} ${r.direction} to/from "${r.party || 'unknown'}" has no narration.`,
-      txn_ref:     String(r.id),
+      severity:    'critical',
+      category:    'cash_limit',
+      title:       `Sec 269ST violation — Cash ₹${parseFloat(r.amount).toLocaleString('en-IN')} to "${r.vendor_name || 'party'}"`,
+      description: `Cash expense of ₹${parseFloat(r.amount).toLocaleString('en-IN')} on ${r.date} violates Sec 269ST (max ₹2L cash). Penalty: 100% of amount. Switch to bank transfer.`,
       amount:      parseFloat(r.amount),
     });
   }
 
-  // Remove duplicates — check if same title was already saved today
+  // ── D. Expenses with missing/vague description (amount >₹5K) ────────────
+  const { data: noDesc } = await supabase
+    .from('company_expenses').select('id,date,amount,category,vendor_name,description')
+    .is('deleted_at', null).gte('amount', 5000).gte('date', monthStart);
+  for (const r of (noDesc || [])) {
+    if ((r.description || '').trim().length < 5) {
+      findings.push({
+        severity:    'low',
+        category:    'missing_narration',
+        title:       `Missing description — ₹${parseFloat(r.amount).toLocaleString('en-IN')} expense on ${r.date}`,
+        description: `Expense #${r.id} (${r.category}, vendor: ${r.vendor_name || 'none'}) has no description. All expenses >₹5K need a clear purpose for audit trail.`,
+        txn_ref:     String(r.id),
+        amount:      parseFloat(r.amount),
+      });
+    }
+  }
+
+  // ── E. Duplicate expenses — same vendor, same amount, within 7 days ─────
+  const { data: allExps } = await supabase
+    .from('company_expenses').select('id,date,amount,vendor_name')
+    .is('deleted_at', null).gte('date', monthStart);
+  const expSeen = {};
+  for (const r of (allExps || [])) {
+    const key = `${r.vendor_name || ''}_${Math.round(parseFloat(r.amount))}`;
+    if (!expSeen[key]) { expSeen[key] = r; continue; }
+    const prev = expSeen[key];
+    const daysDiff = Math.abs(new Date(r.date) - new Date(prev.date)) / 86400000;
+    if (daysDiff <= 7) {
+      findings.push({
+        severity:    'high',
+        category:    'duplicate',
+        title:       `Possible duplicate — ₹${parseFloat(r.amount).toLocaleString('en-IN')} to "${r.vendor_name || 'vendor'}" twice in ${Math.round(daysDiff)} days`,
+        description: `Expenses #${prev.id} (${prev.date}) and #${r.id} (${r.date}) have the same amount ₹${parseFloat(r.amount).toLocaleString('en-IN')} to the same vendor. Verify not a duplicate.`,
+        txn_ref:     `#${prev.id} & #${r.id}`,
+        amount:      parseFloat(r.amount),
+      });
+      delete expSeen[key];
+    } else {
+      expSeen[key] = r;
+    }
+  }
+
+  // ── F. Round-number large expenses (potential fake entries) ──────────────
+  const { data: roundExps } = await supabase
+    .from('company_expenses').select('id,date,amount,category,vendor_name')
+    .is('deleted_at', null).gte('amount', 100000).gte('date', monthStart);
+  for (const r of (roundExps || [])) {
+    const amt = parseFloat(r.amount);
+    if (amt % 100000 === 0) {
+      findings.push({
+        severity:    'medium',
+        category:    'round_number',
+        title:       `Round-number expense ₹${(amt/100000).toFixed(0)}L — verify invoice`,
+        description: `₹${amt.toLocaleString('en-IN')} ${r.category} expense on ${r.date} to "${r.vendor_name || 'unknown'}" is exact round figure — common audit flag. Ensure original invoice is attached.`,
+        txn_ref:     String(r.id),
+        amount:      amt,
+      });
+    }
+  }
+
+  // ── G. Large procurement orders without supplier name ────────────────────
+  const { data: procs } = await supabase
+    .from('procurements').select('id,date,ordered_qty,ordered_price_per_kg,supplier').gte('date', monthStart);
+  for (const p of (procs || [])) {
+    const amt = (parseFloat(p.ordered_qty) || 0) * (parseFloat(p.ordered_price_per_kg) || 0);
+    if (amt > 25000 && !p.supplier) {
+      findings.push({
+        severity:    'medium',
+        category:    'new_party',
+        title:       `Procurement ₹${amt.toLocaleString('en-IN')} on ${p.date} — no vendor recorded`,
+        description: `PO #${p.id} worth ₹${amt.toLocaleString('en-IN')} has no supplier recorded. Vendor name and PAN required for procurement >₹25K.`,
+        txn_ref:     String(p.id),
+        amount:      amt,
+      });
+    }
+  }
+
+  // ── H. Paid webstore orders stuck >5 days without dispatch ───────────────
+  const fiveDaysAgo = new Date(Date.now() - 5 * 86400000).toISOString().slice(0, 10);
+  const { data: stuckOrders } = await supabase
+    .from('webstore_orders').select('order_no,total,date')
+    .in('status', ['new','confirmed']).eq('payment_status', 'paid').lte('date', fiveDaysAgo).limit(10);
+  if ((stuckOrders || []).length > 0) {
+    const total = stuckOrders.reduce((s, r) => s + (parseFloat(r.total) || 0), 0);
+    findings.push({
+      severity:    'high',
+      category:    'operational',
+      title:       `${stuckOrders.length} paid order(s) not dispatched for >5 days`,
+      description: `Orders: ${stuckOrders.map(o => o.order_no).join(', ')}. Total ₹${total.toLocaleString('en-IN')}. Customer satisfaction risk — check dispatch queue.`,
+      amount:      total,
+    });
+  }
+
+  // ── Deduplicate vs today's already-saved findings ────────────────────────
   const { data: todayFindings } = await supabase
-    .from('cco_findings')
-    .select('title')
-    .gte('found_at', today + 'T00:00:00Z');
+    .from('cco_findings').select('title').gte('found_at', today + 'T00:00:00Z');
   const existingTitles = new Set((todayFindings || []).map(f => f.title));
   const newFindings = findings.filter(f => !existingTitles.has(f.title));
 
