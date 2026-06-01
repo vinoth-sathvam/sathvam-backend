@@ -24,84 +24,122 @@ async function buildSnapshot() {
   const next30     = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
   const snap       = {};
 
-  // Cash in bank
+  // ── Cash position ─────────────────────────────────────────────────────────
   const { data: banks } = await supabase.from('bank_accounts').select('current_balance,name').eq('is_active', true);
-  snap.bankCash = (banks || []).reduce((s, b) => s + (parseFloat(b.current_balance) || 0), 0);
+  snap.bankCash     = (banks || []).reduce((s, b) => s + (parseFloat(b.current_balance) || 0), 0);
   snap.bankAccounts = (banks || []).map(b => ({ name: b.name, balance: parseFloat(b.current_balance) || 0 }));
 
-  // Petty cash
   const { data: pc } = await supabase.from('petty_cash_log').select('direction,amount');
   snap.pettyCash = (pc || []).reduce((s, r) =>
     s + (r.direction === 'in' ? parseFloat(r.amount) : -parseFloat(r.amount)), 0);
-
   snap.totalCash = snap.bankCash + snap.pettyCash;
 
-  // This month revenue (money_ledger)
-  const { data: thisRev } = await supabase.from('money_ledger')
-    .select('amount').eq('direction','in').gte('txn_date', monthStart);
-  snap.revenueThisMonth = (thisRev || []).reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
+  // ── Revenue — query source tables directly ────────────────────────────────
+  const { data: posSales } = await supabase.from('sales')
+    .select('final_amount').in('status', ['delivered','dispatched']).gte('date', monthStart);
+  const posRevThisMonth = (posSales || []).reduce((s, r) => s + (parseFloat(r.final_amount) || 0), 0);
 
-  // Last month revenue
-  const { data: lastRev } = await supabase.from('money_ledger')
-    .select('amount').eq('direction','in').gte('txn_date', lastStart).lte('txn_date', lastEnd);
-  snap.revenueLastMonth = (lastRev || []).reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
-  snap.revenueGrowth    = snap.revenueLastMonth > 0
+  const { data: posSalesLast } = await supabase.from('sales')
+    .select('final_amount').in('status', ['delivered','dispatched']).gte('date', lastStart).lte('date', lastEnd);
+  const posRevLastMonth = (posSalesLast || []).reduce((s, r) => s + (parseFloat(r.final_amount) || 0), 0);
+
+  const { data: wsOrders } = await supabase.from('webstore_orders')
+    .select('total').eq('payment_status', 'paid').gte('date', monthStart);
+  const wsRevThisMonth = (wsOrders || []).reduce((s, r) => s + (parseFloat(r.total) || 0), 0);
+
+  const { data: wsOrdersLast } = await supabase.from('webstore_orders')
+    .select('total').eq('payment_status', 'paid').gte('date', lastStart).lte('date', lastEnd);
+  const wsRevLastMonth = (wsOrdersLast || []).reduce((s, r) => s + (parseFloat(r.total) || 0), 0);
+
+  const b2bPaidStages = ['delivered','payment_received','invoice_sent'];
+  const { data: b2bPaid } = await supabase.from('b2b_orders')
+    .select('total_value').in('stage', b2bPaidStages).gte('created_at', monthStart + 'T00:00:00');
+  const b2bRevThisMonth = (b2bPaid || []).reduce((s, r) => s + (parseFloat(r.total_value) || 0), 0);
+
+  const { data: b2bPaidLast } = await supabase.from('b2b_orders')
+    .select('total_value').in('stage', b2bPaidStages)
+    .gte('created_at', lastStart + 'T00:00:00').lte('created_at', lastEnd + 'T23:59:59');
+  const b2bRevLastMonth = (b2bPaidLast || []).reduce((s, r) => s + (parseFloat(r.total_value) || 0), 0);
+
+  snap.revenueThisMonth = posRevThisMonth + wsRevThisMonth + b2bRevThisMonth;
+  snap.revenueLastMonth = posRevLastMonth + wsRevLastMonth + b2bRevLastMonth;
+  snap.revenueBreakdown = [
+    { channel: 'POS Sales',       amount: posRevThisMonth, count: (posSales || []).length },
+    { channel: 'Webstore',        amount: wsRevThisMonth,  count: (wsOrders || []).length },
+    { channel: 'B2B / Wholesale', amount: b2bRevThisMonth, count: (b2bPaid || []).length },
+  ].filter(c => c.amount > 0);
+  snap.revenueGrowth = snap.revenueLastMonth > 0
     ? ((snap.revenueThisMonth - snap.revenueLastMonth) / snap.revenueLastMonth * 100).toFixed(1)
     : null;
 
-  // This month expenses
-  const { data: thisExp } = await supabase.from('money_ledger')
-    .select('amount,subcategory').eq('direction','out').gte('txn_date', monthStart);
-  snap.expensesThisMonth = (thisExp || []).reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
-  snap.netPnl = snap.revenueThisMonth - snap.expensesThisMonth;
+  // ── Expenses — query source tables directly ───────────────────────────────
+  const { data: exps } = await supabase.from('company_expenses')
+    .select('amount,category').is('deleted_at', null).gte('date', monthStart);
+  snap.expensesThisMonth = (exps || []).reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
 
-  // Expense by category
   const expByCat = {};
-  for (const r of (thisExp || [])) {
-    const k = r.subcategory || 'other';
+  for (const r of (exps || [])) {
+    const k = r.category || 'Other';
     expByCat[k] = (expByCat[k] || 0) + (parseFloat(r.amount) || 0);
   }
   snap.expenseByCategory = Object.entries(expByCat)
-    .sort((a,b) => b[1]-a[1]).slice(0, 5)
+    .sort((a, b) => b[1] - a[1]).slice(0, 6)
     .map(([cat, amt]) => ({ cat, amt }));
 
-  // Overdue receivables — B2B orders not yet paid (stage not delivered/payment_received)
+  const { data: sals } = await supabase.from('salary_payments')
+    .select('amount').gte('payment_date', monthStart);
+  snap.salaryThisMonth = (sals || []).reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
+
+  snap.totalExpensesThisMonth = snap.expensesThisMonth + snap.salaryThisMonth;
+  snap.netPnl = snap.revenueThisMonth - snap.totalExpensesThisMonth;
+
+  // ── AR: B2B open receivables ───────────────────────────────────────────────
   const openStages = ['shipped','sailing','in_transit','arrived_at_port','customs_clearance','invoice_sent','overdue'];
   const { data: b2bOv } = await supabase.from('b2b_orders')
     .select('order_no,customer_name,total_value,created_at,stage')
-    .in('stage', openStages)
-    .order('created_at', { ascending: true })
-    .limit(8);
+    .in('stage', openStages).order('created_at', { ascending: true }).limit(10);
   snap.overdueAR = (b2bOv || []).map(r => {
     const age = Math.floor((Date.now() - new Date(r.created_at).getTime()) / 86400000);
     return { party: r.customer_name, amount: parseFloat(r.total_value) || 0, daysOld: age, ref: r.order_no };
   });
   snap.totalAR = snap.overdueAR.reduce((s, r) => s + r.amount, 0);
 
-  // Upcoming payables — vendor bills due in next 30 days
+  // Pending webstore dispatches (paid, not yet shipped)
+  const { data: wsPending } = await supabase.from('webstore_orders')
+    .select('order_no,total,status').in('status', ['new','confirmed','packed']).eq('payment_status', 'paid').limit(10);
+  snap.pendingDispatch = (wsPending || []).map(r => ({ ref: r.order_no, amount: parseFloat(r.total) || 0, status: r.status }));
+
+  // ── AP: vendor bills due next 30 days ─────────────────────────────────────
   const { data: bills } = await supabase.from('vendor_bills')
-    .select('vendor_name,amount,due_date,bill_no')
-    .eq('status', 'unpaid')
-    .gte('due_date', today)
-    .lte('due_date', next30)
-    .order('due_date', { ascending: true })
-    .limit(8);
+    .select('vendor_name,amount,due_date,bill_no').eq('status', 'unpaid')
+    .gte('due_date', today).lte('due_date', next30).order('due_date', { ascending: true }).limit(10);
   snap.upcomingAP = (bills || []).map(b => ({
-    party:  b.vendor_name, amount: parseFloat(b.amount) || 0,
-    dueDate: b.due_date, ref: b.bill_no,
+    party: b.vendor_name, amount: parseFloat(b.amount) || 0, dueDate: b.due_date, ref: b.bill_no,
   }));
   snap.totalAP = snap.upcomingAP.reduce((s, r) => s + r.amount, 0);
 
-  // 30-day cash flow forecast
-  const { data: inflow30 } = await supabase.from('money_ledger')
-    .select('amount').eq('direction','in').gte('txn_date', today).lte('txn_date', next30);
-  const confirmedIn = (inflow30 || []).reduce((s, r) => s + (parseFloat(r.amount) || 0), 0);
-  const avgMonthlyExp = snap.expensesThisMonth; // use this month as proxy
+  // Pending procurement orders (not yet paid to suppliers)
+  const { data: pendProcs } = await supabase.from('procurements')
+    .select('supplier,ordered_qty,ordered_price_per_kg,date')
+    .eq('status', 'ordered').order('date', { ascending: false }).limit(10);
+  snap.pendingProcPayments = (pendProcs || [])
+    .map(p => ({
+      party: p.supplier,
+      amount: (parseFloat(p.ordered_qty) || 0) * (parseFloat(p.ordered_price_per_kg) || 0),
+      date: p.date,
+    })).filter(p => p.amount > 0);
+  snap.totalPendingProcurement = snap.pendingProcPayments.reduce((s, r) => s + r.amount, 0);
+
+  // ── Cash forecast (rest of month) ─────────────────────────────────────────
+  const daysElapsed     = new Date(today).getDate();
+  const daysInMonth     = new Date(new Date().getFullYear(), new Date().getMonth() + 1, 0).getDate();
+  const daysLeft        = daysInMonth - daysElapsed;
+  const dailyRevRate    = daysElapsed > 0 ? snap.revenueThisMonth / daysElapsed : 0;
   snap.forecast = {
-    startCash:      snap.totalCash,
-    confirmedIn,
-    estimatedOut:   avgMonthlyExp + snap.totalAP,
-    projectedEnd:   snap.totalCash + confirmedIn - (avgMonthlyExp + snap.totalAP),
+    startCash:        snap.totalCash,
+    projectedRevenue: Math.round(dailyRevRate * daysLeft),
+    estimatedOut:     snap.totalAP + snap.totalPendingProcurement,
+    projectedEnd:     snap.totalCash + Math.round(dailyRevRate * daysLeft) - snap.totalAP - snap.totalPendingProcurement,
   };
   snap.forecastStatus = snap.forecast.projectedEnd > 200000 ? 'healthy'
                       : snap.forecast.projectedEnd > 0      ? 'tight'
@@ -125,22 +163,30 @@ CASH POSITION
 - Total Cash: ₹${snap.totalCash.toLocaleString('en-IN')}
 
 ${snap.monthName.toUpperCase()} P&L
-- Revenue: ₹${snap.revenueThisMonth.toLocaleString('en-IN')} (${snap.revenueGrowth !== null ? (snap.revenueGrowth > 0 ? '+' : '') + snap.revenueGrowth + '% vs last month' : 'no prior data'})
-- Expenses: ₹${snap.expensesThisMonth.toLocaleString('en-IN')}
+- Revenue: ₹${snap.revenueThisMonth.toLocaleString('en-IN')} (${snap.revenueGrowth !== null ? (snap.revenueGrowth > 0 ? '+' : '') + snap.revenueGrowth + '% vs last month' : 'first month of data'})
+${(snap.revenueBreakdown||[]).map(c => `  · ${c.channel}: ₹${c.amount.toLocaleString('en-IN')} (${c.count} orders)`).join('\n')}
+- Operating Expenses: ₹${snap.expensesThisMonth.toLocaleString('en-IN')}
+- Salary/Payroll: ₹${(snap.salaryThisMonth||0).toLocaleString('en-IN')}
+- Total Outflow: ₹${snap.totalExpensesThisMonth.toLocaleString('en-IN')}
 - Net P&L: ₹${snap.netPnl.toLocaleString('en-IN')} (${snap.netPnl >= 0 ? 'PROFIT' : 'LOSS'})
 
 TOP EXPENSE CATEGORIES
-${snap.expenseByCategory.map(e => `- ${e.cat}: ₹${e.amt.toLocaleString('en-IN')}`).join('\n') || '- No data'}
+${snap.expenseByCategory.map(e => `- ${e.cat}: ₹${e.amt.toLocaleString('en-IN')}`).join('\n') || '- No expenses recorded this month'}
 
-OVERDUE RECEIVABLES (₹${snap.totalAR.toLocaleString('en-IN')} total)
+PENDING PROCUREMENT PAYMENTS (suppliers not yet paid)
+${(snap.pendingProcPayments||[]).slice(0,5).map(p => `- ${p.party}: ₹${p.amount.toLocaleString('en-IN')}`).join('\n') || '- None'}
+Total pending: ₹${(snap.totalPendingProcurement||0).toLocaleString('en-IN')}
+
+OVERDUE RECEIVABLES / B2B (₹${snap.totalAR.toLocaleString('en-IN')} total)
 ${snap.overdueAR.slice(0,5).map(r => `- ${r.party}: ₹${r.amount.toLocaleString('en-IN')} (${r.daysOld} days old)`).join('\n') || '- None outstanding'}
 
 PAYABLES DUE NEXT 30 DAYS (₹${snap.totalAP.toLocaleString('en-IN')} total)
 ${snap.upcomingAP.slice(0,5).map(p => `- ${p.party}: ₹${p.amount.toLocaleString('en-IN')} by ${p.dueDate}`).join('\n') || '- None due'}
 
-30-DAY CASH FORECAST
+REST-OF-MONTH CASH FORECAST
 - Starting cash: ₹${snap.forecast.startCash.toLocaleString('en-IN')}
-- Estimated outflows: ₹${snap.forecast.estimatedOut.toLocaleString('en-IN')}
+- Projected revenue (rest of month at current run rate): ₹${(snap.forecast.projectedRevenue||0).toLocaleString('en-IN')}
+- Estimated outflows (bills + pending procurement): ₹${snap.forecast.estimatedOut.toLocaleString('en-IN')}
 - Projected end balance: ₹${snap.forecast.projectedEnd.toLocaleString('en-IN')}
 - Status: ${snap.forecastStatus.toUpperCase()}
 
