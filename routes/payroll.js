@@ -3,6 +3,7 @@ const router  = express.Router();
 const axios   = require('axios');
 const { auth, requireRole } = require('../middleware/auth');
 const supabase = require('../config/supabase');
+const { insertLedger } = require('../utils/ledger');
 
 // ── Zoho Payroll token (separate scope from Books) ────────────────────────────
 const PAYROLL_BASE = 'https://payroll.zoho.in/api/v1';
@@ -134,7 +135,23 @@ router.get('/attendance/monthly', auth, async (req, res) => {
 });
 
 // GET /api/payroll/attendance?date=YYYY-MM-DD
-router.get('/attendance', auth, async (req, res) => {
+// Also accepts kiosk token (X-Kiosk-Token header) for the attendance panel on the kiosk phone
+async function authOrKiosk(req, res, next) {
+  const kioskToken = req.headers['x-kiosk-token'];
+  if (kioskToken) {
+    const { data } = await supabase.from('settings').select('value').eq('key','kiosk_device_token').single();
+    if (data?.value === kioskToken) return next();
+    return res.status(401).json({ error: 'Invalid kiosk token' });
+  }
+  // Fall back to normal admin auth
+  const jwt = require('jsonwebtoken');
+  const token = req.cookies?.sathvam_admin || req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Not authenticated' });
+  try { req.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
+  catch { res.status(401).json({ error: 'Session expired' }); }
+}
+
+router.get('/attendance', authOrKiosk, async (req, res) => {
   const date = req.query.date || new Date().toISOString().slice(0, 10);
   const [{ data: emps }, { data: att }] = await Promise.all([
     supabase.from('employees').select('id,name,role,daily_rate').eq('active', true).order('name'),
@@ -489,6 +506,25 @@ router.post('/salary-payments', auth, requireRole('admin', 'manager'), async (re
     paid_by: req.user?.name || '',
   }, { onConflict: 'employee_id,month' }).select().single();
   if (error) return res.status(400).json({ error: error.message });
+
+  // Auto-feed money_ledger
+  const pAmt = parseFloat(amount) || 0;
+  insertLedger({
+    txn_date:     data.payment_date,
+    direction:    'out',
+    amount:       pAmt,
+    category:     'payroll',
+    subcategory:  'salary',
+    party:        employee_name || '',
+    party_type:   'employee',
+    payment_mode: payment_mode || 'cash',
+    narration:    `Salary ${month} — ${employee_name || ''}`,
+    reference_no: reference_no || '',
+    source_table: 'salary_payments',
+    source_id:    String(data.id),
+    created_by:   req.user?.name || '',
+  }).catch(() => {});
+
   res.status(201).json(data);
 });
 

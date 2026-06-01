@@ -1,7 +1,8 @@
 const express = require('express');
-const router  = express.Router();
+const router  = require('express').Router();
 const { auth, requireRole } = require('../middleware/auth');
 const supabase = require('../config/supabase');
+const { insertLedger } = require('../utils/ledger');
 
 const DEFAULT_CATEGORIES = [
   { name:'Raw Materials',  icon:'🌾', color:'#d97706' },
@@ -114,6 +115,34 @@ router.post('/', auth, requireRole('admin', 'manager'), async (req, res) => {
     updated_at:   new Date().toISOString(),
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
+
+  // Auto-feed money_ledger + CCO check for large amounts
+  insertLedger({
+    txn_date:     date,
+    direction:    'out',
+    amount:       parsed,
+    category:     'expense',
+    subcategory:  category,
+    party:        vendor_name || '',
+    party_type:   'vendor',
+    payment_mode: payment_mode || 'cash',
+    narration:    description.trim(),
+    reference_no: reference_no || '',
+    source_table: 'company_expenses',
+    source_id:    String(data.id),
+    created_by:   req.user?.name || '',
+  }).then(async () => {
+    if (parsed >= 10000) {
+      try {
+        const ledgerRow = await supabase.from('money_ledger').select('*').eq('source_table','company_expenses').eq('source_id',String(data.id)).single();
+        if (ledgerRow.data) {
+          const { runCCOCheck } = require('./ccoAgent');
+          runCCOCheck(ledgerRow.data).catch(()=>{});
+        }
+      } catch(_) {}
+    }
+  }).catch(() => {});
+
   res.status(201).json(data);
 });
 

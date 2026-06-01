@@ -81,7 +81,7 @@ app.use(morgan('combined'));
 app.use(require('./middleware/auditLog'));
 
 const { products, procurement, vendors, sales, settings, users } = require('./routes/core');
-const { b2bCustomers, b2bOrders, projects, b2bItemProgress, b2bStatement, b2bStock, b2bCustomPrices, b2bQuotes, b2bDocs, b2bSamples, b2bMessages, b2bAnalytics, b2bProfile, b2bNotifications, b2bModRequests, b2bCancelRequests, b2bDisputes, b2bPaymentProof, b2bCustomerDocs, b2bAccount } = require('./routes/b2b');
+const { b2bCustomers, b2bOrders, projects, b2bItemProgress, b2bStatement, b2bStock, b2bCustomPrices, b2bQuotes, b2bDocs, b2bSamples, b2bMessages, b2bAnalytics, b2bProfile, b2bNotifications, b2bModRequests, b2bCancelRequests, b2bDisputes, b2bPaymentProof, b2bCustomerDocs, b2bAccount, b2bAiSummary } = require('./routes/b2b');
 const b2bAuth = require('./routes/b2bAuth');
 const purchases = require('./routes/purchases');
 const flourBatches = require('./routes/flourBatches');
@@ -129,6 +129,7 @@ app.use('/api/b2b/disputes',         b2bDisputes);
 app.use('/api/b2b/payment-proof',    b2bPaymentProof);
 app.use('/api/b2b/customer-docs',    b2bCustomerDocs);
 app.use('/api/b2b/account',          b2bAccount);
+app.use('/api/b2b/ai-summary',      b2bAiSummary);
 app.use('/api/admin/init',     require('./routes/adminInit'));
 app.use('/api/analytics', require('./routes/analytics'));
 app.use('/api/shipping', require('./routes/shipping'));
@@ -152,6 +153,7 @@ app.use('/api/recurring-expenses',   require('./routes/recurringExpenses'));
 app.use('/api/compliance',           require('./routes/compliance'));
 app.use('/api/finance',           require('./routes/finance'));
 app.use('/api/leave',             require('./routes/leave'));
+app.use('/api/kiosk',            require('./routes/kiosk'));
 app.use('/api/returns',           require('./routes/returns'));
 app.use('/api/delivery',          require('./routes/delivery'));
 app.use('/api/credit-notes',      require('./routes/creditNotes'));
@@ -165,7 +167,9 @@ app.use('/api/payouts',           require('./routes/payouts'));
 app.use('/api/campaigns',         require('./routes/campaigns'));
 app.use('/api/messages',          require('./routes/messages'));
 app.use('/api/calls',             rateLimit({ windowMs: 60*1000, max: 200, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests' }, ...rateLimitOpts }), require('./routes/calls'));
-app.use('/api/guest-call',        require('./routes/guestCall'));
+// guest-call: public routes have per-route rate limits inside guestCall.js;
+// add a general outer limit here as defence-in-depth
+app.use('/api/guest-call', rateLimit({ windowMs: 60*1000, max: 60, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests' }, ...rateLimitOpts }), require('./routes/guestCall'));
 app.use('/api/blog',              require('./routes/blog'));
 app.use('/api/notifications',     require('./routes/notifications'));
 app.use('/api/whatsapp',          require('./routes/whatsapp'));      // WhatsApp Business API (Meta direct)
@@ -181,9 +185,35 @@ app.use('/api/google-ads',        require('./routes/googleAds'));
 app.use('/api/deploy-notify',     require('./routes/deployNotify'));
 app.use('/api/manager-daily',     require('./routes/managerDaily'));
 
+// ── Finance Intelligence — Universal Ledger + CFO + CCO ───────────────────────
+app.use('/api/ledger',            require('./routes/ledger'));
+app.use('/api/cfo',               require('./routes/cfoAgent'));
+app.use('/api/cco',               require('./routes/ccoAgent'));
+
 // ── Weekly report manual trigger ──────────────────────────────────────────────
 const { startScheduler, buildWeeklyReport } = require('./config/scheduler');
 startScheduler();
+
+// ── CFO daily briefing — 8:00 AM IST (2:30 UTC) ───────────────────────────────
+const cron = require('node-cron');
+cron.schedule('30 2 * * *', async () => {
+  console.log('[CFO] Running daily briefing...');
+  try {
+    const { runCFO } = require('./routes/cfoAgent');
+    const result = await runCFO();
+    console.log('[CFO] Done:', result?.skipped ? 'skipped (already ran)' : 'email sent');
+  } catch (e) { console.error('[CFO] Error:', e.message); }
+}, { timezone: 'UTC' });
+
+// ── CCO daily anomaly scan — 8:30 AM IST (3:00 UTC) ──────────────────────────
+cron.schedule('0 3 * * *', async () => {
+  console.log('[CCO] Running daily scan...');
+  try {
+    const { runCCODailyScan } = require('./routes/ccoAgent');
+    const result = await runCCODailyScan();
+    console.log(`[CCO] Done: ${result.findings} new findings`);
+  } catch (e) { console.error('[CCO] Error:', e.message); }
+}, { timezone: 'UTC' });
 
 // ── Abandoned cart + failed-payment automation (cron every 2h) ────────────────
 try { require('./scripts/automation-service'); } catch(e) { console.error('[AUTOMATION] Failed to load:', e.message); }
