@@ -218,26 +218,24 @@ products.put('/batch', auth, requireRole('admin', 'manager'), async (req, res) =
 });
 products.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const p = req.body;
-  const { data, error } = await supabase.from('products').update({
+  const raw = {
     name:p.name, sku:p.sku, cat:p.cat, unit:p.unit,
     pack_size:p.packSize, pack_unit:p.packUnit, oil_type_key:p.oilTypeKey,
-    cake_type_key:p.cakeTypeKey!==undefined?p.cakeTypeKey:undefined,
-    reorder:p.reorder, gst:p.gst, price:p.price,
+    cake_type_key:p.cakeTypeKey, reorder:p.reorder, gst:p.gst, price:p.price,
     retail_price:p.retailPrice, website_price:p.websitePrice,
     intl_price:p.intlPrice, retail_profit_pct:p.retailProfitPct,
     web_profit_pct:p.webProfitPct, web_courier_charge:p.webCourierCharge,
     intl_profit_pct:p.intlProfitPct, intl_carton_key:p.intlCartonKey,
     label_cost:p.labelCost, pkg_type_key:p.pkgTypeKey,
-    packing_links:p.packingLinks!==undefined?p.packingLinks:undefined,
-    featured:p.featured,
-    image_url:p.imageUrl!==undefined?p.imageUrl:undefined,
-    description:p.description!==undefined?p.description:undefined,
-    hsn_code:p.hsnCode!==undefined?p.hsnCode:undefined,
-    offer_label:p.offer_label!==undefined?p.offer_label:undefined,
-    offer_price:p.offer_price!==undefined?p.offer_price:undefined,
-    offer_ends_at:p.offer_ends_at!==undefined?p.offer_ends_at:undefined,
-    commodity_id:p.commodityId!==undefined?p.commodityId:undefined,
-  }).eq('id', req.params.id).select().single();
+    packing_links:p.packingLinks, featured:p.featured,
+    image_url:p.imageUrl, description:p.description, hsn_code:p.hsnCode,
+    offer_label:p.offer_label, offer_price:p.offer_price,
+    offer_ends_at:p.offer_ends_at, commodity_id:p.commodityId,
+  };
+  // Remove undefined keys so Supabase only updates fields actually provided
+  const fields = Object.fromEntries(Object.entries(raw).filter(([,v]) => v !== undefined));
+  if (!Object.keys(fields).length) return res.status(400).json({ error: 'No fields to update' });
+  const { data, error } = await supabase.from('products').update(fields).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
 });
@@ -1100,6 +1098,99 @@ Rules:
         parsed.vendorId = matched.id;
         parsed.vendor = matched.display_name || matched.company_name;
       }
+    }
+
+    res.json(parsed);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /procurement/parse-invoice — extract PO fields from uploaded PDF/image ──
+procurement.post('/parse-invoice', auth, requireRole('admin','manager'), procUpload.single('invoice_pdf'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    const mime = req.file.mimetype;
+    const allowed = ['application/pdf','image/jpeg','image/jpg','image/png','image/webp'];
+    if (!allowed.includes(mime)) return res.status(400).json({ error: 'Only PDF or image files allowed' });
+
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: 'AI not configured' });
+
+    const today = new Date().toISOString().slice(0, 10);
+    const { data: vendorList } = await supabase
+      .from('vendors').select('id, display_name, company_name').eq('active', true).limit(300);
+    const vendorNames = (vendorList || []).map(v => v.display_name || v.company_name).filter(Boolean).join(', ');
+
+    const base64 = req.file.buffer.toString('base64');
+    const fileContent = mime === 'application/pdf'
+      ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64 } }
+      : { type: 'image',    source: { type: 'base64', media_type: mime, data: base64 } };
+
+    const systemPrompt = `You are a procurement assistant for Sathvam Natural Products, a cold-pressed oil factory in Tamil Nadu.
+Extract purchase order / supplier invoice details from the document and return ONLY a valid JSON object — no explanation, no markdown, no code fences.
+
+Known vendors: ${vendorNames || 'none on file'}
+Today: ${today}
+
+Return this exact JSON structure:
+{
+  "vendor": "supplier/vendor name",
+  "date": "YYYY-MM-DD (invoice date or today if not found)",
+  "invoiceNo": "invoice or PO number from document, or empty string",
+  "paymentTerms": "payment terms if mentioned, else empty string",
+  "notes": "any relevant notes or empty string",
+  "items": [
+    {
+      "commodityName": "item/commodity name",
+      "orderedQty": <number in kg>,
+      "orderedPricePerKg": <price per kg as number, 0 if not found>,
+      "gst": <GST% as number: 0/5/12/18, 0 if not stated>
+    }
+  ]
+}
+
+Rules:
+- Extract ALL line items from the invoice.
+- Match vendor name to known vendors (fuzzy).
+- Convert quantities to kg (1 quintal = 100 kg, 1 tonne = 1000 kg).
+- Price per unit: if invoice shows total ÷ qty to get rate/kg.
+- GST: if invoice shows CGST+SGST combine them (e.g. 2.5+2.5 = 5%).
+- invoiceNo: use invoice number / bill number / challan number from document.
+- If date not found use today (${today}).`;
+
+    const aiRes = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json',
+        'anthropic-beta': 'pdfs-2024-09-25' },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-6',
+        max_tokens: 2048,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: [
+          fileContent,
+          { type: 'text', text: 'Extract all purchase order details from this invoice document.' }
+        ]}],
+      }),
+    });
+    const aiJson = await aiRes.json();
+    if (!aiRes.ok) return res.status(502).json({ error: aiJson?.error?.message || 'AI error' });
+
+    const raw = aiJson.content?.[0]?.text || '';
+    const match = raw.match(/\{[\s\S]*\}/);
+    if (!match) return res.status(422).json({ error: 'Could not parse AI response', raw });
+
+    const parsed = JSON.parse(match[0]);
+
+    // Fuzzy match vendor to vendor master
+    if (parsed.vendor && vendorList?.length) {
+      const lower = parsed.vendor.toLowerCase();
+      const matched = vendorList.find(v => {
+        const dn = (v.display_name || '').toLowerCase();
+        const cn = (v.company_name || '').toLowerCase();
+        return dn.includes(lower) || lower.includes(dn) || cn.includes(lower) || lower.includes(cn);
+      });
+      if (matched) { parsed.vendorId = matched.id; parsed.vendor = matched.display_name || matched.company_name; }
     }
 
     res.json(parsed);
