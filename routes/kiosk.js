@@ -278,8 +278,9 @@ router.post('/checkin', kioskAuth, async (req, res) => {
     }
 
   } else if (!existing?.time_out) {
-    // ── Check-out (leaving) ───────────────────────────────────────────────
-    action = 'check_out';
+    // ── Check-out (leaving) — detect lunch break ──────────────────────────
+    const isLunchTime = time >= '11:30:00' && time <= '14:30:00';
+    action = isLunchTime ? 'break_out' : 'check_out';
     upsertRow = {
       employee_id: employeeId, date, status: 'present',
       time_in: existing.time_in, time_out: time,
@@ -287,26 +288,30 @@ router.post('/checkin', kioskAuth, async (req, res) => {
       change_reason: '',
     };
 
-    // Overtime alert
-    if (time > overtimeThreshold) {
+    // Overtime alert (only for full check_out, not break)
+    if (action === 'check_out' && time > overtimeThreshold) {
       sendWhatsAppToAdmin(
         `🕕 *Overtime Alert*\n${emp.name} checked out at *${time} IST* (after ${cfg.overtime_after || '18:00'}).\nChecked in: ${existing.time_in}`
       ).catch(() => {});
     }
 
-    // Early departure alert
-    if (time < earlyThreshold) {
+    // Early departure alert (only for full check_out, not break)
+    if (action === 'check_out' && time < earlyThreshold) {
       sendWhatsAppToAdmin(
         `🚪 *Early Departure*\n${emp.name} left at *${time} IST* (before ${cfg.early_before || '17:00'}).\nChecked in: ${existing.time_in}`
       ).catch(() => {});
     }
 
-    // Fetch leave balance for checkout display
-    leaveBalance = await getLeaveBalance(employeeId).catch(() => null);
+    // Fetch leave balance for checkout display (full checkout only)
+    if (action === 'check_out') {
+      leaveBalance = await getLeaveBalance(employeeId).catch(() => null);
+    }
 
   } else {
-    // ── Back-in (returned after break) ────────────────────────────────────
-    action = 'back_in';
+    // ── Back-in (returned after break or out) ─────────────────────────────
+    // Check if previous checkout was during lunch (break_out)
+    const wasBreak = existing.time_out >= '11:30:00' && existing.time_out <= '14:30:00';
+    action = wasBreak ? 'break_in' : 'back_in';
     upsertRow = {
       employee_id: employeeId, date, status: 'present',
       time_in: existing.time_in, time_out: null,
@@ -354,6 +359,22 @@ router.get('/today-summary', kioskAuth, async (req, res) => {
     time_out: attMap[String(e.id)]?.time_out || null,
   }));
   res.json({ date, total, present, absent: total - present, list });
+});
+
+// ── POST /api/kiosk/visitor ───────────────────────────────────────────────────
+router.post('/visitor', kioskAuth, async (req, res) => {
+  const { name, purpose, phone } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'Visitor name required' });
+  const { date, time } = getIST();
+  const entry = { name: name.trim(), purpose: (purpose || 'General Visit').trim(), phone: phone || '', time, id: Date.now() };
+
+  const { data: existing } = await supabase.from('settings').select('value').eq('key', `kiosk_visitors_${date}`).single();
+  const visitors = Array.isArray(existing?.value) ? existing.value : [];
+  visitors.push(entry);
+  await supabase.from('settings').upsert({ key: `kiosk_visitors_${date}`, value: visitors }, { onConflict: 'key' });
+
+  sendWhatsAppToAdmin(`🚶 *Visitor Arrived — Sathvam*\n*${entry.name}*\nPurpose: ${entry.purpose}${entry.phone ? '\nPhone: ' + entry.phone : ''}\nTime: ${time} IST`).catch(() => {});
+  res.json({ success: true, message: `Welcome, ${entry.name}!`, time });
 });
 
 // ── GET /api/kiosk/admin-summary ─────────────────────────────────────────────
