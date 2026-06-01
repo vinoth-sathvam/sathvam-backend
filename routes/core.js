@@ -702,6 +702,7 @@ procurement.post('/', auth, requireRole('admin','manager'), async (req, res) => 
     supplier:p.supplier, vendor_id:p.vendorId||null,
     ordered_qty:p.orderedQty, ordered_price_per_kg:p.orderedPricePerKg,
     gst:parseFloat(p.gst)||0,
+    hsn_code: p.hsnCode||p.hsn_code||null,
     received_qty:p.receivedQty||null, cleaned_qty:p.cleanedQty||null,
     status:p.status||'ordered', notes:p.notes||'',
     purchase_order_id:p.purchase_order_id||null, invoice_no:p.invoice_no||null,
@@ -1145,7 +1146,8 @@ Return this exact JSON structure:
       "commodityName": "item/commodity name",
       "orderedQty": <number in kg>,
       "orderedPricePerKg": <price per kg as number, 0 if not found>,
-      "gst": <GST% as number: 0/5/12/18, 0 if not stated>
+      "gst": <GST% as number: 0/5/12/18, 0 if not stated>,
+      "hsnCode": "HSN/SAC code string if found on invoice, else empty string"
     }
   ]
 }
