@@ -377,6 +377,39 @@ router.post('/visitor', kioskAuth, async (req, res) => {
   res.json({ success: true, message: `Welcome, ${entry.name}!`, time });
 });
 
+// ── GET /api/kiosk/unchecked ──────────────────────────────────────────────────
+// Returns employees who have no check-in yet today (for 9AM roll call)
+router.get('/unchecked', kioskAuth, async (req, res) => {
+  const { date } = getIST();
+  const [{ data: allEmps }, { data: attRecs }] = await Promise.all([
+    supabase.from('employees').select('id, name').eq('active', true).order('name'),
+    supabase.from('attendance').select('employee_id, time_in').eq('date', date),
+  ]);
+  if (!allEmps) return res.json([]);
+  const checkedIds = new Set((attRecs || []).filter(r => r.time_in).map(r => String(r.employee_id)));
+  const unchecked = (allEmps || []).filter(e => !checkedIds.has(String(e.id)));
+  res.json(unchecked);
+});
+
+// ── POST /api/kiosk/rollcall-mark ────────────────────────────────────────────
+// Mark an employee present or absent from roll call (no face scan needed)
+router.post('/rollcall-mark', kioskAuth, async (req, res) => {
+  const { employee_id, status } = req.body; // status: 'present' or 'absent'
+  if (!employee_id || !['present','absent'].includes(status)) {
+    return res.status(400).json({ error: 'employee_id and status (present|absent) required' });
+  }
+  const { date, time } = getIST();
+  const upsert = {
+    employee_id, date, status,
+    time_in: status === 'present' ? time : null,
+    notes: `Roll call — ${status} marked at ${time} IST`,
+    change_reason: 'Roll call',
+  };
+  const { error } = await supabase.from('attendance').upsert(upsert, { onConflict: 'employee_id,date' });
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
 // ── GET /api/kiosk/admin-summary ─────────────────────────────────────────────
 // Same as today-summary but for admin (cookie auth). Used by live feed panel.
 router.get('/admin-summary', auth, async (req, res) => {
