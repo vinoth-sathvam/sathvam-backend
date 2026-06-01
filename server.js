@@ -235,4 +235,18 @@ app.use((err, req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => console.log(`\n🫙 Sathvam API v1.1.0 on port ${PORT}\n`));
+const server = app.listen(PORT, () => console.log(`\n🫙 Sathvam API v1.1.0 on port ${PORT}\n`));
+
+// Graceful shutdown — let in-flight requests finish before container stops
+process.on('SIGTERM', () => {
+  console.log('[shutdown] SIGTERM received — draining connections...');
+  server.close(() => {
+    console.log('[shutdown] All connections closed. Exiting.');
+    process.exit(0);
+  });
+  // Force exit after 15s if requests are still hanging
+  setTimeout(() => {
+    console.error('[shutdown] Timeout — forcing exit.');
+    process.exit(1);
+  }, 15000);
+});
