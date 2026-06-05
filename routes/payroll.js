@@ -217,6 +217,14 @@ router.get('/report', auth, async (req, res) => {
   const end   = new Date(year, month, 0).toISOString().slice(0, 10); // last day of month
   const daysInMonth = new Date(year, month, 0).getDate();
 
+  // Count Mon–Sat working days in the month
+  let workingDays = 0;
+  const wd = new Date(year, month - 1, 1);
+  while (wd.getMonth() === month - 1) {
+    if (wd.getDay() !== 0) workingDays++; // 0 = Sunday
+    wd.setDate(wd.getDate() + 1);
+  }
+
   // Fetch all employees (including inactive — they may have records this month)
   const { data: emps, error: empErr } = await supabase.from('employees').select('id,name,role,daily_rate,monthly_salary,pay_type,active').order('name');
   if (empErr) return res.status(500).json({ error: empErr.message });
@@ -283,7 +291,7 @@ router.get('/report', auth, async (req, res) => {
     total_half:    rows.reduce((s, r) => s + r.days_half, 0),
   };
 
-  res.json({ year, month, start, end, days_in_month: daysInMonth, employees: rows, totals });
+  res.json({ year, month, start, end, days_in_month: daysInMonth, working_days: workingDays, employees: rows, totals });
 });
 
 // ── GET /api/payroll/zoho-employees — list from Zoho Payroll (preview) ────────
