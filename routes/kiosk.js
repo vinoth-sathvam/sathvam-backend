@@ -468,7 +468,9 @@ router.get('/shift-config', async (req, res) => {
     if (!token) return res.status(401).json({ error: 'Not authenticated' });
     try { jwt.verify(token, process.env.JWT_SECRET); } catch { return res.status(401).json({ error: 'Session expired' }); }
   }
-  const cfg = await getShiftConfig();
+  // Always read fresh from DB (not cache) — avoids stale values across multiple backend replicas
+  const { data } = await supabase.from('settings').select('value').eq('key', 'kiosk_shift_config').single();
+  const cfg = { ...DEFAULT_SHIFT, ...(data?.value || {}) };
   res.json(cfg);
 });
 
