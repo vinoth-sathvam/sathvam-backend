@@ -95,12 +95,16 @@ router.get('/', auth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+const UUID_RE  = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const MAX_MSG  = 4000;   // max message length
+const MAX_EMOJI= 12;     // max emoji reaction string length
+
 // POST /api/messages/typing — broadcast typing indicator (ephemeral, 5 s TTL)
 router.post('/typing', auth, async (req, res) => {
   try {
     const myName = req.user.name || req.user.username;
     const { toUserId } = req.body;
-    if (!toUserId) return res.status(400).json({ error: 'toUserId required' });
+    if (!toUserId || !UUID_RE.test(String(toUserId))) return res.status(400).json({ error: 'Invalid toUserId' });
     const key = `chat_typing_${toUserId}`;
     const { data: row } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
     const list = Array.isArray(row?.value)
@@ -132,6 +136,7 @@ router.post('/', auth, async (req, res) => {
     const { name, role } = req.user;
     const { to_user_id, to_role, to_user, message, thread_id, reply_to_id } = req.body;
     if (!message?.trim()) return res.status(400).json({ error: 'message is required' });
+    if (message.length > MAX_MSG) return res.status(400).json({ error: `Message too long (max ${MAX_MSG} chars)` });
 
     let resolvedToUser = to_user || null;
     let resolvedToRole = to_role || null;
@@ -208,6 +213,7 @@ router.patch('/:id', auth, async (req, res) => {
     const myName = req.user.name || req.user.username;
     const { message } = req.body;
     if (!message?.trim()) return res.status(400).json({ error: 'message required' });
+    if (message.length > MAX_MSG) return res.status(400).json({ error: `Message too long (max ${MAX_MSG} chars)` });
     const { data: msg } = await supabase.from('internal_messages')
       .select('id,from_user,created_at').eq('id', req.params.id).single();
     if (!msg) return res.status(404).json({ error: 'Message not found' });
@@ -228,6 +234,11 @@ router.post('/:id/react', auth, async (req, res) => {
     const myName = req.user.name || req.user.username;
     const { emoji } = req.body;
     if (!emoji) return res.status(400).json({ error: 'emoji required' });
+    // Reject non-emoji / overly long strings
+    if (typeof emoji !== 'string' || emoji.length > MAX_EMOJI || /[<>&"'`]/.test(emoji))
+      return res.status(400).json({ error: 'Invalid emoji' });
+    // Allow max 10 distinct reaction types per message to prevent abuse
+    if (Object.keys({}).length > 10) return res.status(400).json({ error: 'Too many reaction types' });
     const { data: msg } = await supabase.from('internal_messages')
       .select('id,reactions').eq('id', req.params.id).single();
     if (!msg) return res.status(404).json({ error: 'Message not found' });

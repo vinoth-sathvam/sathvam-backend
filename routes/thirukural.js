@@ -15,6 +15,7 @@ const express  = require('express');
 const supabase = require('../config/supabase');
 const { auth } = require('../middleware/auth');
 const { decrypt } = require('../config/crypto');
+const { sendText: gaSendText } = require('../lib/greenapi');
 
 const router = express.Router();
 
@@ -79,16 +80,9 @@ function pendingKey() {
   return `thirukural_pending_${new Date().toISOString().slice(0, 10)}`;
 }
 
-// ── BotSailor send helper ─────────────────────────────────────────────────────
+// ── WhatsApp send helper ──────────────────────────────────────────────────────
 async function sendWA(phone, message) {
-  const token   = process.env.BOTSAILOR_API_TOKEN;
-  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
-  if (!token || !phoneId) throw new Error('BotSailor not configured');
-  const params = new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message });
-  const res    = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString(),
-  });
-  return res.json();
+  return gaSendText(phone, message);
 }
 
 // ── Build WA message for a kural ──────────────────────────────────────────────
@@ -163,8 +157,6 @@ router.post('/broadcast', auth, async (req, res) => {
     if (error) throw new Error(error.message);
 
     let sent = 0, failed = 0, skipped = 0;
-    const token   = process.env.BOTSAILOR_API_TOKEN;
-    const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
 
     for (const cust of customers || []) {
       try {
@@ -177,13 +169,8 @@ router.post('/broadcast', auth, async (req, res) => {
         if (digits.length < 10) { skipped++; continue; }
         const phone = digits.length === 10 ? `91${digits}` : digits;
 
-        const params = new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message });
-        const r = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-          method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString(),
-        });
-        const d = await r.json();
-        if (d.status === '1' || d.status === 1) sent++;
-        else failed++;
+        const ok = await gaSendText(phone, message);
+        if (ok) sent++; else failed++;
 
         // Throttle — 3 messages per second to avoid rate limits
         await new Promise(ok => setTimeout(ok, 333));
@@ -216,8 +203,6 @@ router.post('/approve-from-wa', async (req, res) => {
 
     const kural   = pending.value.kural;
     const message = kuralMessage(kural);
-    const token   = process.env.BOTSAILOR_API_TOKEN;
-    const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
 
     const { data: customers } = await supabase
       .from('customers').select('id, phone').not('phone', 'is', null);
@@ -233,13 +218,8 @@ router.post('/approve-from-wa', async (req, res) => {
         if (digits.length < 10) { skipped++; continue; }
         const phone = digits.length === 10 ? `91${digits}` : digits;
 
-        const params = new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message });
-        const r = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-          method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString(),
-        });
-        const d = await r.json();
-        if (d.status === '1' || d.status === 1) sent++;
-        else failed++;
+        const ok = await gaSendText(phone, message);
+        if (ok) sent++; else failed++;
         await new Promise(ok => setTimeout(ok, 333));
       } catch { failed++; }
     }

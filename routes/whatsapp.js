@@ -18,6 +18,7 @@ const crypto     = require('crypto');
 const Razorpay   = require('razorpay');
 const { createClient } = require('@supabase/supabase-js');
 const { auth } = require('../middleware/auth');
+const { sendText: gaSendText } = require('../lib/greenapi');
 
 const router    = express.Router();
 const supabase  = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -245,23 +246,9 @@ async function generateFlowOrderNo() {
   return `${prefix}-${String(seq).padStart(2, '0')}`;
 }
 
-// ── Flow: BotSailor send helper ───────────────────────────────────────────────
+// ── Flow: send helper via Green API ──────────────────────────────────────────
 async function sendFlowViaBotSailor(phone, message) {
-  const token   = process.env.BOTSAILOR_API_TOKEN;
-  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
-  if (!token || !phoneId) return false;
-  try {
-    const res = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body:    new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message }).toString(),
-    });
-    const data = await res.json();
-    return data.status === '1' || data.status === 1;
-  } catch (e) {
-    console.error('Flow BotSailor send error:', e.message);
-    return false;
-  }
+  return gaSendText(phone, message);
 }
 
 // ── Flow: handle nfm_reply submission ────────────────────────────────────────

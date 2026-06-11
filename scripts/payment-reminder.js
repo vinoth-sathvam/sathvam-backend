@@ -14,33 +14,15 @@
 
 require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
 const { createClient } = require('@supabase/supabase-js');
+const { sendText: gaSendText } = require('../lib/greenapi');
 
-const supabase  = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const BS_TOKEN  = process.env.BOTSAILOR_API_TOKEN;
-const BS_PID    = process.env.BOTSAILOR_PHONE_NUMBER_ID;
-const BS_TPL_ID = process.env.BOTSAILOR_PAYMENT_REMINDER_TEMPLATE_ID; // optional template fallback
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 async function sendWA(phone, message) {
-  const params = new URLSearchParams({ apiToken: BS_TOKEN, phone_number_id: BS_PID, phone_number: phone, message });
-  const r = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: params.toString(),
-  });
-  const d = await r.json();
-  if ((d.status !== '1' && d.status !== 1) && BS_TPL_ID) {
-    // fallback to template
-    const tp = new URLSearchParams({
-      apiToken: BS_TOKEN, phoneNumberID: BS_PID,
-      botTemplateID: BS_TPL_ID, sendToPhoneNumber: phone,
-    });
-    await fetch(`https://botsailor.com/api/v1/whatsapp/send/template?${tp.toString()}`, { method: 'POST' });
-  }
-  return d;
+  return gaSendText(phone, message);
 }
 
 async function run() {
-  if (!BS_TOKEN || !BS_PID) { console.error('BOTSAILOR_API_TOKEN or BOTSAILOR_PHONE_NUMBER_ID not set'); process.exit(1); }
 
   const now      = new Date();
   const from     = new Date(now - 3 * 24 * 60 * 60 * 1000).toISOString(); // 3 days ago

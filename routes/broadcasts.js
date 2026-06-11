@@ -26,6 +26,7 @@ const path           = require('path');
 const supabase       = require('../config/supabase');
 const { auth }       = require('../middleware/auth');
 const { decrypt }    = require('../config/crypto');
+const { sendText: gaSendText, sendFile: gaSendFile } = require('../lib/greenapi');
 
 // In-memory broadcast progress store (broadcastId → { sent, failed, skipped, total, done, error })
 const broadcastProgress = new Map();
@@ -531,24 +532,10 @@ async function uploadCardImage(buf, prefix) {
   return data.publicUrl;
 }
 
-// ── BotSailor send (text only OR image+caption) ──────────────────────────────
+// ── WhatsApp send (text only OR image+caption) ───────────────────────────────
 async function sendViaBotSailor(phone, message, imageUrl = null) {
-  const token   = process.env.BOTSAILOR_API_TOKEN;
-  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
-  if (!token || !phoneId) throw new Error('BotSailor not configured');
-  const res = imageUrl
-    ? await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ apiToken: token, phone_number_id: phoneId, phone_number: phone, type: 'image', url: imageUrl, message }),
-      })
-    : await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message }).toString(),
-      });
-  const d = await res.json();
-  return d.status === '1' || d.status === 1;
+  if (imageUrl) return gaSendFile(phone, imageUrl, 'sathvam.jpg', message);
+  return gaSendText(phone, message);
 }
 
 async function broadcastToAllCustomers(message, imageUrl = null, broadcastMeta = {}, broadcastId = null) {
@@ -585,7 +572,7 @@ async function broadcastToAllCustomers(message, imageUrl = null, broadcastMeta =
       const phone = digits.length === 10 ? `91${digits}` : digits;
       const ok = await sendViaBotSailor(phone, message, imageUrl);
       if (ok) { sent++; logs.push({ broadcast_id: broadcastId, customer_id: cust.id, customer_name: cust.name || null, phone, status: 'sent', sent_at: sentAt, ...broadcastMeta }); }
-      else     { failed++; logs.push({ broadcast_id: broadcastId, customer_id: cust.id, customer_name: cust.name || null, phone, status: 'failed', reason: 'botsailor_error', sent_at: sentAt, ...broadcastMeta }); }
+      else     { failed++; logs.push({ broadcast_id: broadcastId, customer_id: cust.id, customer_name: cust.name || null, phone, status: 'failed', reason: 'send_error', sent_at: sentAt, ...broadcastMeta }); }
       broadcastProgress.set(broadcastId, { sent, failed, skipped, total, done: false });
       await new Promise(r => setTimeout(r, 333)); // 3/sec throttle
     } catch(e) {

@@ -7,10 +7,8 @@ const nodemailer = require('nodemailer');
 const supabase   = require('../config/supabase');
 const router     = express.Router();
 
+const { sendText: gaSendText } = require('../lib/greenapi');
 const SERVICE_KEY   = process.env.SCHEDULER_SECRET || process.env.SUPABASE_SERVICE_KEY?.slice(-16);
-const BOT_TOKEN     = process.env.BOTSAILOR_API_TOKEN;
-const BOT_PHONE_ID  = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
-const BOTSAILOR_URL = 'https://botsailor.com/api/v1/whatsapp/send';
 const STORE_URL     = 'https://sathvam.in';
 
 const mailer = nodemailer.createTransport({
@@ -106,12 +104,8 @@ Order fresh cold-pressed oils now 👇
 }
 
 async function sendWA(phone, message) {
-  if (!BOT_TOKEN || !BOT_PHONE_ID || !phone) return;
-  const ph = String(phone).replace(/\D/g, '');
-  const num = ph.length === 10 ? '91' + ph : ph;
-  const params = new URLSearchParams({ apiToken: BOT_TOKEN, phone_number_id: BOT_PHONE_ID, phone_number: num, message });
-  const res = await fetch(BOTSAILOR_URL, { method: 'POST', body: params });
-  return res.json();
+  if (!phone) return;
+  return gaSendText(phone, message);
 }
 
 // Service key middleware

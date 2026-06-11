@@ -132,7 +132,8 @@ router.post('/invite', auth, async (req, res) => {
       updated_at: new Date().toISOString(),
     });
 
-    const link = `${process.env.PORTAL_URL}/call/join/${token}`;
+    const baseUrl = (process.env.PORTAL_URL || '').replace(/\/portal\/?$/, '');
+    const link = `${baseUrl}/call/join/${token}`;
     res.json({ token, link, roomId, expiresInHours, callType, hasPin: !!pin });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

@@ -15,6 +15,7 @@ require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
 const cron     = require('node-cron');
 const nodemailer = require('nodemailer');
 const { createClient } = require('@supabase/supabase-js');
+const { sendFile: gaSendFile } = require('../lib/greenapi');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
@@ -614,15 +615,9 @@ async function runCartFollowUps() {
 
         if (waSent && touch === 1) {
           const imageUrl = cart.items?.[0]?.image_url;
-          const bsToken  = process.env.BOTSAILOR_API_TOKEN;
-          if (imageUrl && bsToken) {
-            const normalized = phone.replace(/\D/g, '');
-            const to = normalized.length === 10 ? '91' + normalized : normalized;
-            fetch('https://app.botsailor.com/api/whatsapp-service/quick-send-image', {
-              method:  'POST',
-              headers: { Authorization: `Bearer ${bsToken}`, 'Content-Type': 'application/json' },
-              body:    JSON.stringify({ phone: to, image: imageUrl, caption: 'Your cart item from Sathvam 🌿' }),
-            }).catch(e => console.error('[CART-IMG] Failed:', e.message));
+          if (imageUrl) {
+            gaSendFile(phone, imageUrl, 'sathvam.jpg', 'Your cart item from Sathvam 🌿')
+              .catch(e => console.error('[CART-IMG] Failed:', e.message));
           }
         }
       }
@@ -738,7 +733,7 @@ async function runFailedPaymentFollowUps() {
 
   try {
     // Load all checkout sessions
-    const { data: csSessions } = await supabase.from('store_analytics').select('key,data').like('key', '_cs_%').order('id', { ascending: false }).limit(500);
+    const { data: csSessions } = await supabase.from('store_analytics').select('key,data').like('key', '_cs_%').order('key', { ascending: false }).limit(500);
     const sessions = (csSessions || []).filter(r => r.data?.customer_name || r.data?.customer_phone || r.data?.customer_email);
 
     // Load webstore orders to filter out converted sessions

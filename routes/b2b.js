@@ -5,6 +5,7 @@ const nodemailer = require('nodemailer');
 const supabase = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
 const { createInvoice, recordPayment, zoho } = require('../config/zoho');
+const { sendText: gaSendText } = require('../lib/greenapi');
 
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -309,7 +310,7 @@ b2bOrders.put('/:id/stage', auth, requireRole('admin','manager','ceo'), async (r
       if (!order) return;
       const { data: cust } = await supabase.from('b2b_customers').select('phone,contact_name,company_name').eq('id', order.customer_id).maybeSingle();
       const phone = cust?.phone;
-      if (!phone || !process.env.BOTSAILOR_API_TOKEN) return;
+      if (!phone) return;
       const stageLabels = {
         order_placed: 'Order Placed', confirmed: 'Order Confirmed', in_production: 'In Production',
         quality_check: 'Quality Check', ready_to_ship: 'Ready to Ship', shipped: 'Shipped',
@@ -320,13 +321,7 @@ b2bOrders.put('/:id/stage', auth, requireRole('admin','manager','ceo'), async (r
       const stageLabel = stageLabels[stage] || stage;
       const trackingLine = carrierTrackingUrl ? `\nTracking: ${carrierTrackingUrl}` : '';
       const msg = `🌿 *Sathvam Organics – Order Update*\n\nDear ${cust?.contact_name || order.buyer_name || 'Customer'},\n\nYour order *${order.order_no}* has been updated to:\n*${stageLabel}*${trackingLine}\n\n${note ? `Note: ${note}\n\n` : ''}For queries, reply to this message.\n_sathvam.in_`;
-      const cleanPhone = phone.replace(/\D/g,'');
-      const waPhone = cleanPhone.startsWith('91') ? cleanPhone : '91' + cleanPhone;
-      await fetch(`https://app.botsailor.com/api/whatsapp-business/send-message`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${process.env.BOTSAILOR_API_TOKEN}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone_number_id: process.env.BOTSAILOR_PHONE_NUMBER_ID, to: waPhone, type: 'text', text: { body: msg } })
-      });
+      await gaSendText(phone, msg);
     } catch(e) { console.error('[B2B-WA-STAGE]', e.message); }
   });
 
@@ -1200,18 +1195,13 @@ b2bQuotes.put('/:id', auth, async (req, res) => {
   res.json(data);
 
   // Auto-WhatsApp buyer when quote is responded to
-  if (q.status === 'quoted' && process.env.BOTSAILOR_API_TOKEN) {
+  if (q.status === 'quoted') {
     setImmediate(async () => {
       try {
         const { data: cust } = await supabase.from('b2b_customers').select('phone,contact_name').eq('id', existing.customer_id).single();
         if (!cust?.phone) return;
-        const cleanPhone = cust.phone.replace(/\D/g,'');
-        const waPhone = cleanPhone.startsWith('91') ? cleanPhone : '91'+cleanPhone;
         const msg = `🌿 *Sathvam Organics – Quotation Ready*\n\nDear ${cust.contact_name},\n\nYour quotation request has been responded to. Please login to your portal to review and accept.\n\n_sathvam.in/b2b_`;
-        await fetch('https://app.botsailor.com/api/whatsapp-business/send-message', {
-          method:'POST', headers:{'Authorization':`Bearer ${process.env.BOTSAILOR_API_TOKEN}`,'Content-Type':'application/json'},
-          body: JSON.stringify({ phone_number_id: process.env.BOTSAILOR_PHONE_NUMBER_ID, to: waPhone, type:'text', text:{ body: msg } })
-        });
+        await gaSendText(cust.phone, msg);
       } catch(e) { console.error('[B2B-WA-QUOTE]', e.message); }
     });
   }
@@ -1665,10 +1655,7 @@ b2bOrders.post('/:id/advance-claim', auth, async (req, res) => {
     const company = order?.b2b_customers?.company_name || 'Customer';
     const wa = process.env.WA_ADMIN_PHONE1||process.env.ADMIN_WHATSAPP_PHONE;
     if (wa) {
-      await fetch(`${process.env.BOTSAILOR_API_URL||'https://app.botsailor.com'}/api/whatsapp/quick-message`, {
-        method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${process.env.BOTSAILOR_API_TOKEN}`},
-        body: JSON.stringify({ phone: wa, message: `💰 Advance Payment Claim\n${order?.order_no||req.params.id} · ${company}\nAmount: ₹${parseFloat(amount).toLocaleString('en-IN')}\nRef: ${txnRef||'—'}\nDate: ${date||'Today'}\n\nPlease verify and record the payment in the admin panel.` })
-      }).catch(()=>{});
+      gaSendText(wa, `💰 Advance Payment Claim\n${order?.order_no||req.params.id} · ${company}\nAmount: ₹${parseFloat(amount).toLocaleString('en-IN')}\nRef: ${txnRef||'—'}\nDate: ${date||'Today'}\n\nPlease verify and record the payment in the admin panel.`).catch(()=>{});
     }
   } catch(_) {}
   res.json({ ok: true, claim });
@@ -1691,10 +1678,7 @@ b2bOrders.post('/:id/balance-claim', auth, async (req, res) => {
     const company = order?.b2b_customers?.company_name || 'Customer';
     const wa = process.env.WA_ADMIN_PHONE1||process.env.ADMIN_WHATSAPP_PHONE;
     if (wa) {
-      await fetch(`${process.env.BOTSAILOR_API_URL||'https://app.botsailor.com'}/api/whatsapp/quick-message`, {
-        method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${process.env.BOTSAILOR_API_TOKEN}`},
-        body: JSON.stringify({ phone: wa, message: `🏦 Balance Payment Claim\n${order?.order_no||req.params.id} · ${company}\nAmount: ₹${parseFloat(amount).toLocaleString('en-IN')}\nRef: ${txnRef||'—'}\nDate: ${date||'Today'}\n\nPlease verify and record the final payment in the admin panel.` })
-      }).catch(()=>{});
+      gaSendText(wa, `🏦 Balance Payment Claim\n${order?.order_no||req.params.id} · ${company}\nAmount: ₹${parseFloat(amount).toLocaleString('en-IN')}\nRef: ${txnRef||'—'}\nDate: ${date||'Today'}\n\nPlease verify and record the final payment in the admin panel.`).catch(()=>{});
     }
   } catch(_) {}
   res.json({ ok: true, claim });
@@ -1756,16 +1740,10 @@ b2bOrders.post('/:id/payment', auth, requireRole('admin','manager','ceo'), async
       if (!order) return;
       const { data: cust } = await supabase.from('b2b_customers').select('phone,contact_name').eq('id', order.customer_id).maybeSingle();
       const phone = cust?.phone;
-      if (!phone || !process.env.BOTSAILOR_API_TOKEN) return;
+      if (!phone) return;
       const typeLabel = type === 'advance' ? 'Advance Payment' : type === 'remaining' ? 'Final Payment' : 'Logistics Payment';
       const msg = `🌿 *Sathvam Organics – Payment Received*\n\nDear ${cust?.contact_name || order.buyer_name || 'Customer'},\n\nWe have received your *${typeLabel}* of *₹${amount}* for order *${order.order_no}*.\n\nReference: ${ref || 'N/A'} · Date: ${date}\n\nThank you!\n_sathvam.in_`;
-      const cleanPhone = phone.replace(/\D/g,'');
-      const waPhone = cleanPhone.startsWith('91') ? cleanPhone : '91' + cleanPhone;
-      await fetch(`https://app.botsailor.com/api/whatsapp-business/send-message`, {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${process.env.BOTSAILOR_API_TOKEN}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ phone_number_id: process.env.BOTSAILOR_PHONE_NUMBER_ID, to: waPhone, type: 'text', text: { body: msg } })
-      });
+      await gaSendText(phone, msg);
     } catch(e) { console.error('[B2B-WA-PAYMENT]', e.message); }
   });
 });

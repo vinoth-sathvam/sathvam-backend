@@ -7,6 +7,7 @@ const nodemailer = require('nodemailer');
 const supabase = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
 const { createInvoice, recordPayment } = require('../config/zoho');
+const { sendText: gaSendText } = require('../lib/greenapi');
 const { bustCache } = require('./public');
 
 const procUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -1347,16 +1348,8 @@ sales.post('/', auth, async (req, res) => {
         `${s.discount ? `  |  🎁 Discount: ₹${s.discount}` : ''}\n\n` +
         `📊 admin.sathvam.in → Sales`;
 
-      const sendViaBS = async (phone, message) => {
-        const token   = process.env.BOTSAILOR_API_TOKEN;
-        const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
-        if (!token || !phoneId) return;
-        const params = new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message });
-        await fetch('https://botsailor.com/api/v1/whatsapp/send', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString() });
-      };
-
       for (const phone of adminNumbers) {
-        try { await sendViaBS(phone, alertText); } catch {}
+        try { await gaSendText(phone, alertText); } catch {}
       }
     } catch (waErr) {
       console.error('POS sale WA alert error:', waErr.message);

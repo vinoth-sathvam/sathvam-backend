@@ -114,8 +114,8 @@ router.post('/track', async (req, res) => {
           date: today,
           updated_at: new Date().toISOString(),
         };
-        const { data: existing } = await supabase.from('store_analytics').select('id').eq('key', key).single();
-        if (existing?.id) {
+        const { data: existing } = await supabase.from('store_analytics').select('key').eq('key', key).single();
+        if (existing?.key) {
           await supabase.from('store_analytics').update({ data: sessionData }).eq('key', key);
         } else {
           await supabase.from('store_analytics').insert({ key, data: sessionData });
@@ -128,8 +128,8 @@ router.post('/track', async (req, res) => {
       // Mark checkout session as recovered
       if (session_id) {
         const key = `_cs_${session_id}`;
-        const { data: existing } = await supabase.from('store_analytics').select('id,data').eq('key', key).single();
-        if (existing?.id) {
+        const { data: existing } = await supabase.from('store_analytics').select('key,data').eq('key', key).single();
+        if (existing?.key) {
           await supabase.from('store_analytics').update({
             data: { ...existing.data, recovered: true, order_no: order_no || null }
           }).eq('key', key);
@@ -180,7 +180,7 @@ router.get('/', auth, async (req, res) => {
       getAKey('visits_by_city', {}),
       supabase.from('abandoned_carts').select('*').eq('recovered', false)
         .order('updated_at', { ascending: false }).limit(200),
-      supabase.from('store_analytics').select('key,data').like('key', '_cs_%').order('id', { ascending: false }).limit(100),
+      supabase.from('store_analytics').select('key,data').like('key', '_cs_%').order('key', { ascending: false }).limit(100),
       supabase.from('webstore_orders').select('items').gte('date', thirtyDaysAgoStr)
         .in('status', ['confirmed','shipped','delivered','paid']).limit(500),
     ]);
@@ -694,7 +694,7 @@ router.get('/carts', auth, async (req, res) => {
 
     const [{ data: allCarts }, { data: csSessions }] = await Promise.all([
       supabase.from('abandoned_carts').select('*').order('updated_at', { ascending: false }).limit(500),
-      supabase.from('store_analytics').select('key,data').like('key', '_cs_%').order('id', { ascending: false }).limit(200),
+      supabase.from('store_analytics').select('key,data').like('key', '_cs_%').order('key', { ascending: false }).limit(200),
     ]);
 
     const carts = allCarts || [];

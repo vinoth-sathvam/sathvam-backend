@@ -6,6 +6,7 @@ const nodemailer = require('nodemailer');
 const { OAuth2Client } = require('google-auth-library');
 const make2FA    = require('./twoFactor');
 const { encrypt, decrypt, hmac, encryptCustomer, decryptCustomer } = require('../config/crypto');
+const { sendText: gaSendText } = require('../lib/greenapi');
 const router     = express.Router();
 
 const mailer = nodemailer.createTransport({
@@ -18,32 +19,14 @@ const mailer = nodemailer.createTransport({
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) { console.error('FATAL: JWT_SECRET not set'); process.exit(1); }
 
-// ── Admin WhatsApp notifier (both numbers, template fallback) ─────────────────
+// ── Admin WhatsApp notifier ────────────────────────────────────────────────────
 const cartNotifyThrottle = new Map(); // custId → timestamp, throttle cart alerts to 1/hr
 async function notifyAdmins(message) {
-  const token   = process.env.BOTSAILOR_API_TOKEN;
-  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
-  if (!token || !phoneId) return;
   const numbers = [process.env.WA_ADMIN_PHONE1, process.env.WA_ADMIN_PHONE2]
     .filter(Boolean).map(n => n.replace(/\D/g, '')).filter((v,i,a) => v && a.indexOf(v)===i);
   for (const phone of numbers) {
     try {
-      // Try free text
-      const params = new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message });
-      const r = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-        method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: params.toString(),
-      });
-      const d = await r.json();
-      if (d.status === '1' || d.status === 1) continue;
-      // Fallback to template (strip newlines for Meta compliance)
-      const tp = new URLSearchParams({
-        apiToken: token, phoneNumberID: phoneId, botTemplateID: '356870',
-        sendToPhoneNumber: phone,
-        'templateVariable-1': 'Admin',
-        'templateVariable-2': message.replace(/\n/g, ' | ').replace(/\*|_/g, '').slice(0, 150),
-        'templateVariable-3': '—', 'templateVariable-4': 'admin.sathvam.in', 'templateVariable-5': '—',
-      });
-      await fetch(`https://botsailor.com/api/v1/whatsapp/send/template?${tp.toString()}`, { method: 'POST' });
+      await gaSendText(phone, message);
     } catch (e) { console.error('notifyAdmins WA error:', e.message); }
   }
 }
@@ -799,6 +782,69 @@ router.get('/admin/list', auth, async (req, res) => {
   } catch (err) {
     console.error('admin/list customers:', err.message);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/customer/forgot-password  — send reset link to email
+router.post('/forgot-password', async (req, res) => {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'Email is required' });
+  try {
+    const { data: rows } = await supabase
+      .from('customers')
+      .select('id, name, email')
+      .ilike('email', email.trim())
+      .limit(1);
+    // Always return ok to avoid email enumeration
+    if (!rows || rows.length === 0) return res.json({ ok: true });
+    const cust = decryptCustomer(rows[0]);
+    const token = jwt.sign(
+      { id: cust.id, purpose: 'pw-reset' },
+      JWT_SECRET,
+      { expiresIn: '30m' }
+    );
+    const resetLink = `${process.env.FRONTEND_URL || 'https://www.sathvam.in'}/reset-password?token=${token}`;
+    await mailer.sendMail({
+      from: process.env.SMTP_FROM || `Sathvam Natural Products <${process.env.SMTP_USER}>`,
+      to: cust.email,
+      subject: 'Reset your Sathvam password',
+      html: `<div style="font-family:sans-serif;max-width:480px;margin:0 auto">
+        <h2 style="color:#052e16">Password Reset</h2>
+        <p>Hi ${cust.name || 'there'},</p>
+        <p>Click the button below to reset your password. The link expires in <strong>30 minutes</strong>.</p>
+        <a href="${resetLink}" style="display:inline-block;background:#052e16;color:#fff;padding:12px 28px;border-radius:8px;text-decoration:none;font-weight:700;margin:16px 0">Reset Password</a>
+        <p style="color:#6b7280;font-size:13px">If you didn't request this, you can safely ignore this email.</p>
+        <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0"/>
+        <p style="color:#9ca3af;font-size:12px">Sathvam Natural Products · Tirunelveli, Tamil Nadu</p>
+      </div>`,
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('forgot-password:', err.message);
+    res.status(500).json({ error: 'Failed to send reset email' });
+  }
+});
+
+// POST /api/customer/reset-password  — verify token + set new password
+router.post('/reset-password', async (req, res) => {
+  const { token, password } = req.body || {};
+  if (!token || !password) return res.status(400).json({ error: 'Token and password are required' });
+  if (password.length < 6) return res.status(400).json({ error: 'Password must be at least 6 characters' });
+  try {
+    let payload;
+    try { payload = jwt.verify(token, JWT_SECRET); }
+    catch { return res.status(400).json({ error: 'Reset link is invalid or expired. Please request a new one.' }); }
+    if (payload.purpose !== 'pw-reset') return res.status(400).json({ error: 'Invalid reset token' });
+    const hash = await bcrypt.hash(password, 10);
+    const { error } = await supabase
+      .from('customers')
+      .update({ password_hash: hash })
+      .eq('id', payload.id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('reset-password:', err.message);
+    res.status(500).json({ error: 'Failed to reset password' });
   }
 });
 

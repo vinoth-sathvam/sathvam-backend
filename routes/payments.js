@@ -7,6 +7,7 @@ const { createInvoice, recordPayment } = require('../config/zoho');
 const { sendCustomerInvoice, sendInvoiceWhatsApp } = require('./webstoreOrders');
 const { auth, requireRole } = require('../middleware/auth');
 const { encrypt, hmac, encryptCustomer } = require('../config/crypto');
+const { sendText: gaSendText, sendFile: gaSendFile } = require('../lib/greenapi');
 
 // ── Email transporter ─────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -66,26 +67,12 @@ async function sendOrderEmail(order, paymentId) {
   } catch (e) { console.error('Order email failed:', e.message); }
 }
 
-// ── BotSailor send helper ─────────────────────────────────────────────────────
+// ── WhatsApp send helper ──────────────────────────────────────────────────────
 const SATHVAM_LOGO_URL = 'https://sathvam.in/logo.jpg';
 
 async function sendViaBotSailor(phone, message, imageUrl = SATHVAM_LOGO_URL) {
-  const token   = process.env.BOTSAILOR_API_TOKEN;
-  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
-  if (!token || !phoneId) return false;
-  const res = imageUrl
-    ? await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ apiToken: token, phone_number_id: phoneId, phone_number: phone, type: 'image', url: imageUrl, message }),
-      })
-    : await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body:    new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message }).toString(),
-      });
-  const data = await res.json();
-  return data.status === '1' || data.status === 1;
+  if (imageUrl) return gaSendFile(phone, imageUrl, 'sathvam.jpg', message);
+  return gaSendText(phone, message);
 }
 
 // ── WhatsApp order alert (to admin) ──────────────────────────────────────────
@@ -113,28 +100,9 @@ async function sendWhatsAppAlert(order) {
     `✅ Payment: ${order.paymentId || order.payment_id || 'Online'}\n\n` +
     `📦 Action: admin.sathvam.in → Webstore Orders`;
 
-  const token   = process.env.BOTSAILOR_API_TOKEN;
-  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
-
   for (const phone of adminNumbers) {
     try {
-      // Try free text first
-      const ok = await sendViaBotSailor(phone, text, null);
-      if (ok) continue;
-
-      // Fallback to template (bypasses 24h window) — template 356870
-      const tplParams = new URLSearchParams({
-        apiToken:          token,
-        phoneNumberID:     phoneId,
-        botTemplateID:     '356870',
-        sendToPhoneNumber: phone,
-        'templateVariable-1': 'Admin',
-        'templateVariable-2': (order.items || []).map(i => `${i.name} × ${i.qty}`).join(', '),
-        'templateVariable-3': `₹${total}`,
-        'templateVariable-4': [cust.name, cust.phone, cust.city, cust.state].filter(Boolean).join(', '),
-        'templateVariable-5': orderNo,
-      });
-      await fetch(`https://botsailor.com/api/v1/whatsapp/send/template?${tplParams.toString()}`, { method: 'POST' });
+      await sendViaBotSailor(phone, text, null);
     } catch (e) {
       console.error('Admin WA alert failed:', e.message);
     }
@@ -180,7 +148,7 @@ async function sendCustomerOrderWhatsApp(order) {
 
   try {
     const ok = await sendViaBotSailor(phone, text);
-    if (!ok) console.error('Customer WA confirmation: BotSailor returned non-success for', phone.slice(0,4)+'****'+phone.slice(-3));
+    if (!ok) console.error('Customer WA confirmation: send failed for', phone.slice(0,4)+'****'+phone.slice(-3));
   } catch (e) {
     console.error('Customer WA confirmation error:', e.message);
   }

@@ -1,6 +1,7 @@
 const cron       = require('node-cron');
 const nodemailer = require('nodemailer');
 const supabase   = require('./supabase');
+const { sendText: gaSendText } = require('../lib/greenapi');
 
 const mailer = nodemailer.createTransport({
   host:   process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -443,16 +444,7 @@ function startScheduler() {
       if (!bCustomers?.length) return;
 
       const sendBirthdayWA = async (phone, msg) => {
-        const token   = process.env.BOTSAILOR_API_TOKEN;
-        const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
-        if (!token || !phoneId) return;
-        try {
-          await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message: msg }).toString(),
-          });
-        } catch(e) { console.error('Birthday WA failed:', e.message); }
+        try { await gaSendText(phone, msg); } catch(e) { console.error('Birthday WA failed:', e.message); }
       };
 
       for (const c of bCustomers) {

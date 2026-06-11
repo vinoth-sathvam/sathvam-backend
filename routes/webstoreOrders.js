@@ -9,6 +9,7 @@ const supabase     = require('../config/supabase');
 const { auth }     = require('../middleware/auth');
 const rateLimit    = require('express-rate-limit');
 const { decryptCustomer, hmac, encryptCustomer } = require('../config/crypto');
+const { sendText: gaSendText, sendFile: gaSendFile } = require('../lib/greenapi');
 const router       = express.Router();
 
 // Embed logo as base64 so wkhtmltoimage doesn't need network access
@@ -172,22 +173,8 @@ async function uploadCardImage(buf, prefix) {
 }
 
 async function sendViaBotSailor(phone, message, imageUrl = null) {
-  const token   = process.env.BOTSAILOR_API_TOKEN;
-  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
-  if (!token || !phoneId) return false;
-  const body = imageUrl
-    ? JSON.stringify({ apiToken: token, phone_number_id: phoneId, phone_number: phone, type: 'image', url: imageUrl, message })
-    : null;
-  const formBody = !imageUrl
-    ? new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message }).toString()
-    : null;
-  const res = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-    method:  'POST',
-    headers: { 'Content-Type': imageUrl ? 'application/json' : 'application/x-www-form-urlencoded' },
-    body:    imageUrl ? body : formBody,
-  });
-  const data = await res.json();
-  return data.status === '1' || data.status === 1;
+  if (imageUrl) return gaSendFile(phone, imageUrl, 'sathvam.jpg', message);
+  return gaSendText(phone, message);
 }
 
 // Decrypt the customer JSONB field of a single order
@@ -396,7 +383,7 @@ function buildInvoiceHtml(o, autoPrint = false) {
 </body></html>`;
 }
 
-// POST /api/webstore-orders/:id/send-whatsapp-invoice — generate PDF invoice & send via BotSailor
+// POST /api/webstore-orders/:id/send-whatsapp-invoice — generate PDF invoice & send via WhatsApp
 router.post('/:id/send-whatsapp-invoice', auth, async (req, res) => {
   try {
     const { data: rawO, error } = await supabase
@@ -408,10 +395,6 @@ router.post('/:id/send-whatsapp-invoice', auth, async (req, res) => {
     const digits = (cust.phone || '').replace(/\D/g, '');
     if (!digits) return res.status(400).json({ error: 'Customer has no phone number' });
     const phone = digits.length === 10 ? `91${digits}` : digits;
-
-    const token   = process.env.BOTSAILOR_API_TOKEN;
-    const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
-    if (!token || !phoneId) return res.status(500).json({ error: 'BotSailor not configured' });
 
     // ── 1. Generate PDF from existing invoice HTML ──────────────────────────
     const html    = buildInvoiceHtml(o, false);
@@ -430,7 +413,7 @@ router.post('/:id/send-whatsapp-invoice', auth, async (req, res) => {
     const { data: urlData } = supabase.storage.from('invoices').getPublicUrl(fileName);
     const pdfUrl = urlData.publicUrl;
 
-    // ── 3. Send text message + PDF link via BotSailor ───────────────────────
+    // ── 3. Send text message + PDF link via Green API ───────────────────────
     const subtotal = parseFloat(o.subtotal || 0);
     const gst      = parseFloat(o.gst_amount || o.gst || 0);
     const shipping = parseFloat(o.shipping || 0);
@@ -445,57 +428,8 @@ router.post('/:id/send-whatsapp-invoice', auth, async (req, res) => {
       `📄 *Download Invoice PDF:*\n${pdfUrl}\n\n` +
       `For any queries: *+91 70921 77092*`;
 
-    const params = new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message });
-    const bsRes  = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-      method:  'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body:    params.toString(),
-    });
-    const bsData = await bsRes.json();
-    if (bsData.status !== '1' && bsData.status !== 1) {
-      const msg   = bsData.message || 'BotSailor send failed';
-      const is24h = msg.toLowerCase().includes('24 hour') || msg.toLowerCase().includes('template');
-
-      if (is24h) {
-        // ── 3b. Fallback: send via BotSailor template (bypasses 24h window) ──
-        const tplId = process.env.BOTSAILOR_INVOICE_TEMPLATE_ID;
-        if (!tplId) {
-          return res.status(400).json({
-            error: `WhatsApp 24h window expired. Set BOTSAILOR_INVOICE_TEMPLATE_ID in env to enable auto-fallback to template sending.`,
-          });
-        }
-        const tplParams = new URLSearchParams({
-          apiToken:          token,
-          phoneNumberID:     phoneId,
-          botTemplateID:     tplId,
-          sendToPhoneNumber: phone,
-          'templateVariable-order_no':   o.order_no || '',
-          'templateVariable-name':       cust.name  || 'Customer',
-          'templateVariable-total':      `₹${total.toFixed(2)}`,
-          'templateVariable-pdf_url':    pdfUrl,
-        });
-        const tplRes  = await fetch(`https://botsailor.com/api/v1/whatsapp/send/template?${tplParams.toString()}`, { method: 'POST' });
-        const tplData = await tplRes.json();
-        if (tplData.status !== '1' && tplData.status !== 1) {
-          return res.status(400).json({ error: tplData.message || 'Template send failed' });
-        }
-
-        await supabase.from('whatsapp_messages').insert({
-          phone,
-          contact_name: `${cust.name || ''} | ${o.order_no}`,
-          direction:    'outbound',
-          type:         'template',
-          content:      message,
-          status:       'sent',
-          sent_by:      `invoice:${o.order_no}`,
-          timestamp:    new Date().toISOString(),
-        });
-
-        return res.json({ success: true, phone, pdfUrl, via: 'template' });
-      }
-
-      return res.status(400).json({ error: msg });
-    }
+    const ok = await gaSendText(phone, message);
+    if (!ok) return res.status(500).json({ error: 'Green API send failed — check GREENAPI_INSTANCE_ID and GREENAPI_API_TOKEN' });
 
     // ── 4. Log the sent message ──────────────────────────────────────────────
     await supabase.from('whatsapp_messages').insert({
@@ -684,10 +618,6 @@ async function generateInvoicePdfUrl(order) {
 }
 
 async function sendStatusWhatsApp(order, newStatus, cancelReason) {
-  const token   = process.env.BOTSAILOR_API_TOKEN;
-  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
-  if (!token || !phoneId) return;
-
   const cust   = order.customer || {};
   const digits = (cust.phone || '').replace(/\D/g, '');
   if (!digits) return;
@@ -1181,7 +1111,7 @@ router.post('/botsailor/track', async (req, res) => {
 
     res.json({ message, order_no: order.order_no, status: order.status });
   } catch (e) {
-    console.error('BotSailor track error:', e.message);
+    console.error('WhatsApp track error:', e.message);
     res.json({ message: 'Sorry, could not fetch order status. Please contact us at +91 70921 77092.' });
   }
 });
@@ -1344,7 +1274,7 @@ async function sendCustomerInvoice(order, paymentId) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// sendInvoiceWhatsApp(order) — generate PDF invoice and send to customer via BotSailor
+// sendInvoiceWhatsApp(order) — generate PDF invoice and send to customer via Green API
 // Called automatically after payment verification (payments.js)
 // ─────────────────────────────────────────────────────────────────────────────
 async function sendInvoiceWhatsApp(order) {
@@ -1353,10 +1283,6 @@ async function sendInvoiceWhatsApp(order) {
     const digits = (cust.phone || '').replace(/\D/g, '');
     if (!digits) return;
     const phone = digits.length === 10 ? `91${digits}` : digits;
-
-    const token   = process.env.BOTSAILOR_API_TOKEN;
-    const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
-    if (!token || !phoneId) return;
 
     // Generate PDF
     const html   = buildInvoiceHtml(order, false);
@@ -1384,32 +1310,8 @@ async function sendInvoiceWhatsApp(order) {
       `📄 *Download Invoice PDF:*\n${pdfUrl}\n\n` +
       `For any queries: *+91 70921 77092*`;
 
-    const params = new URLSearchParams({ apiToken: token, phone_number_id: phoneId, phone_number: phone, message });
-    const bsRes  = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString(),
-    });
-    const bsData = await bsRes.json();
-
-    if (bsData.status !== '1' && bsData.status !== 1) {
-      // Fallback to template if 24h window expired
-      const tplId = process.env.BOTSAILOR_INVOICE_TEMPLATE_ID;
-      if (tplId) {
-        const tplParams = new URLSearchParams({
-          apiToken:          token,
-          phoneNumberID:     phoneId,
-          botTemplateID:     tplId,
-          sendToPhoneNumber: phone,
-          'templateVariable-order_no': order.order_no || '',
-          'templateVariable-name':     cust.name  || 'Customer',
-          'templateVariable-total':    `₹${total.toFixed(2)}`,
-          'templateVariable-pdf_url':  pdfUrl,
-        });
-        await fetch(`https://botsailor.com/api/v1/whatsapp/send/template?${tplParams.toString()}`, { method: 'POST' });
-      }
-      return;
-    }
+    const ok = await gaSendText(phone, message);
+    if (!ok) { console.error('sendInvoiceWhatsApp: Green API send failed'); return; }
 
     await supabase.from('whatsapp_messages').insert({
       phone, contact_name: `${cust.name || ''} | ${order.order_no}`,

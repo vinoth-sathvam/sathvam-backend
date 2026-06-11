@@ -7,6 +7,7 @@ const { RekognitionClient, CreateCollectionCommand, IndexFacesCommand,
         SearchFacesByImageCommand, DeleteFacesCommand } = require('@aws-sdk/client-rekognition');
 const supabase   = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
+const { sendText: gaSendText } = require('../lib/greenapi');
 
 const COLLECTION_ID = 'sathvam-employees';
 const MATCH_THRESHOLD = 90; // % confidence required
@@ -61,26 +62,12 @@ async function getShiftConfig() {
 
 function invalidateShiftCache() { _shiftCfgAt = 0; }
 
-// ── WhatsApp helper (BotSailor) ───────────────────────────────────────────────
+// ── WhatsApp helper ───────────────────────────────────────────────────────────
 async function sendWhatsAppToAdmin(message) {
-  const token   = process.env.BOTSAILOR_API_TOKEN;
-  const phoneId = process.env.BOTSAILOR_PHONE_NUMBER_ID || process.env.WA_PHONE_NUMBER_ID;
-  const phone   = process.env.WA_ADMIN_PHONE1;
-  if (!token || !phoneId || !phone) {
-    console.warn('[kiosk] WhatsApp env vars missing — skipping alert');
-    return;
-  }
+  const phone = process.env.WA_ADMIN_PHONE1;
+  if (!phone) { console.warn('[kiosk] WA_ADMIN_PHONE1 not set — skipping alert'); return; }
   try {
-    const params = new URLSearchParams({
-      apiToken: token, phone_number_id: phoneId, phone_number: phone, message,
-    });
-    const r = await fetch('https://botsailor.com/api/v1/whatsapp/send', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body:   params.toString(),
-    });
-    const d = await r.json();
-    if (d.status !== '1' && d.status !== 1) console.warn('[kiosk] WA send issue:', JSON.stringify(d));
+    await gaSendText(phone, message);
   } catch (e) { console.error('[kiosk] WA error:', e.message); }
 }
 
