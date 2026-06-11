@@ -18,7 +18,7 @@ const crypto     = require('crypto');
 const Razorpay   = require('razorpay');
 const { createClient } = require('@supabase/supabase-js');
 const { auth } = require('../middleware/auth');
-const { sendText: gaSendText } = require('../lib/greenapi');
+const { sendText: gaSendText, sendFile: gaSendFile } = require('../lib/greenapi');
 
 const router    = express.Router();
 const supabase  = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -669,43 +669,22 @@ router.post('/send', auth, async (req, res) => {
     const to = normalisePhone(phone);
     if (to.length < 10) return res.status(400).json({ error: 'Invalid phone number' });
 
-    let payload;
-    if (type === 'template' && template) {
-      payload = {
-        messaging_product: 'whatsapp',
-        to,
-        type: 'template',
-        template: {
-          name:     template.name,
-          language: { code: template.language || 'en' },
-          ...(template.components?.length ? { components: template.components } : {}),
-        },
-      };
-    } else {
-      if (!text?.trim()) return res.status(400).json({ error: 'text required' });
-      payload = {
-        messaging_product: 'whatsapp',
-        to,
-        type: 'text',
-        text: { body: text.trim() },
-      };
-    }
+    if (!text?.trim()) return res.status(400).json({ error: 'text required' });
 
-    const result = await waRequest('/messages', 'POST', payload);
-    const msgId  = result.messages?.[0]?.id;
+    const ok = await gaSendText(to, text.trim());
+    if (!ok) return res.status(500).json({ error: 'Failed to send via Green API' });
 
     await storeMessage({
-      wa_message_id: msgId,
-      phone: to,
-      direction:     'outbound',
-      type,
-      content:       type === 'template' ? `[Template: ${template?.name}]` : text.trim(),
-      status:        'sent',
-      timestamp:     new Date().toISOString(),
-      sent_by:       req.user?.username || req.user?.name || 'admin',
+      phone:     to,
+      direction: 'outbound',
+      type:      'text',
+      content:   text.trim(),
+      status:    'sent',
+      timestamp: new Date().toISOString(),
+      sent_by:   req.user?.username || req.user?.name || 'admin',
     });
 
-    res.json({ ok: true, message_id: msgId });
+    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -715,19 +694,8 @@ router.post('/send', auth, async (req, res) => {
 // GET /api/whatsapp/templates  — Fetch approved templates from Meta
 // ─────────────────────────────────────────────────────────────────────────────
 router.get('/templates', auth, async (req, res) => {
-  try {
-    const wabaId = process.env.WA_WABA_ID;
-    const token  = process.env.WA_ACCESS_TOKEN;
-    if (!wabaId || !token) return res.json({ templates: [], error: 'WA_WABA_ID or WA_ACCESS_TOKEN not set' });
-
-    const r    = await fetch(`${WA_BASE}/${wabaId}/message_templates?limit=50&status=APPROVED`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    const data = await r.json();
-    res.json({ templates: data.data || [], error: data.error?.message || null });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+  // Green API does not use pre-approved templates — send plain text messages freely
+  res.json({ templates: [], note: 'Green API does not require pre-approved templates. Use plain text messages.' });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -738,26 +706,20 @@ router.post('/notify/order', auth, async (req, res) => {
     const { phone, orderNo, event = 'confirmed', templateName } = req.body;
     if (!phone || !orderNo) return res.status(400).json({ error: 'phone and orderNo required' });
 
-    const to    = normalisePhone(phone);
-    const tName = templateName || process.env.WA_ORDER_TEMPLATE;
-    if (!tName) return res.status(400).json({ error: 'templateName required (or set WA_ORDER_TEMPLATE in env)' });
+    const to  = normalisePhone(phone);
+    const msg = `🛍️ *Order Update — ${orderNo}*\n\nYour order status has been updated to: *${event}*.\n\nFor details visit: https://sathvam.in\nQueries: +91 70921 77092`;
 
-    const result = await waRequest('/messages', 'POST', {
-      messaging_product: 'whatsapp',
-      to,
-      type:     'template',
-      template: { name: tName, language: { code: 'en' } },
-    });
+    const ok = await gaSendText(to, msg);
+    if (!ok) return res.status(500).json({ error: 'Failed to send via Green API' });
 
     await storeMessage({
-      wa_message_id: result.messages?.[0]?.id,
-      phone:   to,
+      phone:     to,
       direction: 'outbound',
-      type:    'template',
-      content: `[Order ${event}: ${orderNo}] Template: ${tName}`,
-      status:  'sent',
+      type:      'text',
+      content:   msg,
+      status:    'sent',
       timestamp: new Date().toISOString(),
-      sent_by: 'system',
+      sent_by:   'system',
     });
 
     res.json({ ok: true });
