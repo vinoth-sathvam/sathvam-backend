@@ -489,7 +489,7 @@ function buildCartEmailHtml(cart, touch, waMsg, discountPct = 0) {
     1: `Your fresh, cold-pressed goodness is just one click away! We saved your cart so you can pick up right where you left off. 🌿`,
     2: discountPct > 0
       ? `We really don't want you to miss out on our pure cold-pressed oils! As a special offer, here's <strong>${discountPct}% off</strong> your order — just use code <strong>SAVE${discountPct}</strong> at checkout.`
-      : `We noticed you're still thinking about your order — can we help? Our team is happy to answer any questions. Just reply to this email or call us at +91 70921 77092. 🌿`,
+      : `We noticed you're still thinking about your order — can we help? Our team is happy to answer any questions. Just reply to this email or call us at +91 76187 73778. 🌿`,
     3: `This is our last reminder — your cart is about to expire. We'd hate for you to miss out on our pure, cold-pressed oils delivered fresh to your door.`,
   };
 
@@ -513,7 +513,7 @@ function buildCartEmailHtml(cart, touch, waMsg, discountPct = 0) {
     <div style="text-align:center;margin:24px 0">
       <a href="https://sathvam.in" style="background:linear-gradient(135deg,#2d1a0e,#1a5c2a);color:#fff;text-decoration:none;padding:14px 36px;border-radius:10px;font-size:16px;font-weight:700;display:inline-block">Complete My Order →</a>
     </div>
-    <p style="color:#9ca3af;font-size:12px;text-align:center;margin:0">Questions? Call <strong>+91 70921 77092</strong> · Free shipping above ₹499<br>Sathvam Natural Products, Karur, Tamil Nadu</p>
+    <p style="color:#9ca3af;font-size:12px;text-align:center;margin:0">Questions? Call <strong>+91 76187 73778</strong> · Free shipping above ₹499<br>Sathvam Natural Products, Karur, Tamil Nadu</p>
   </div>
 </div>`;
 }
@@ -871,7 +871,7 @@ async function runCreditFollowUps() {
       const msgs = {
         1: `Hi ${first}! 🙏 This is a friendly reminder from Sathvam. Your order ${orderNo} has an outstanding balance of ₹${Math.round(balance).toLocaleString('en-IN')}. Please arrange payment at your earliest convenience. Thank you!`,
         2: `Hi ${first}, following up on your Sathvam order ${orderNo} — balance of ₹${Math.round(balance).toLocaleString('en-IN')} is pending for ${ageDays} days. If it's convenient, even a partial payment helps. Please let us know if there's an issue. 🌿`,
-        3: `Hi ${first}, final reminder for Sathvam order ${orderNo} — ₹${Math.round(balance).toLocaleString('en-IN')} outstanding for ${ageDays} days. Please make payment urgently. Contact us if you need to discuss. +91 70921 77092`,
+        3: `Hi ${first}, final reminder for Sathvam order ${orderNo} — ₹${Math.round(balance).toLocaleString('en-IN')} outstanding for ${ageDays} days. Please make payment urgently. Contact us if you need to discuss. +91 76187 73778`,
       };
 
       const waSent = await sendWhatsAppMsg(phone, msgs[touch]);

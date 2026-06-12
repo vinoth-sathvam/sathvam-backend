@@ -63,7 +63,7 @@ async function run() {
       `Hi ${name.split(' ')[0]}, your Sathvam order *#${o.order_no}* worth *₹${total}* is awaiting payment.\n\n` +
       `Please complete your payment to avoid order cancellation.\n\n` +
       `💳 Pay now: https://sathvam.in/orders\n\n` +
-      `Need help? Reply here or call *+91 70921 77092*\n\n` +
+      `Need help? Reply here or call *+91 76187 73778*\n\n` +
       `_— Team Sathvam 🌿_`;
 
     try {

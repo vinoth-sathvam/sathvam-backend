@@ -327,7 +327,7 @@ router.post('/', chatLimiter, async (req, res) => {
   const sensitiveType = detectSensitiveData(lastUserText);
   if (sensitiveType) {
     return res.json({
-      reply: `🔒 Please never share ${sensitiveType} here — chat is not a secure channel for payment details!\n\nFor your safety, all payments are handled securely through our checkout page (Razorpay bank-grade encryption). Go to sathvam.in → Shop → Add to cart → Checkout to pay safely.\n\nIf you need help placing the order, WhatsApp us at +91 70921 77092 and we will assist you.`,
+      reply: `🔒 Please never share ${sensitiveType} here — chat is not a secure channel for payment details!\n\nFor your safety, all payments are handled securely through our checkout page (Razorpay bank-grade encryption). Go to sathvam.in → Shop → Add to cart → Checkout to pay safely.\n\nIf you need help placing the order, WhatsApp us at +91 76187 73778 and we will assist you.`,
       showWhatsApp: true,
       showB2B: false,
       prefillText: 'Hi Sathvam, I need help placing an order',
@@ -430,12 +430,12 @@ If a customer tries to share payment details: immediately stop them with a safet
 1. Confirm product & price from the live list ("Groundnut Oil 1L is ₹X + 5% GST — in stock!")
 2. Direct ONLY to these two safe channels:
    → Website checkout: sathvam.in → Shop → Add to cart → Checkout (secure, 2 mins)
-   → WhatsApp: +91 70921 77092 (team will send a safe payment link)
+   → WhatsApp: +91 76187 73778 (team will send a safe payment link)
 NEVER collect order details, address, or payment in this chat. Checkout page handles everything securely.
 
 ━━━━ WHEN CUSTOMER ASKS TO TRACK ORDER ━━━━
 ${orderContext ? '' : 'Ask for their order number (e.g. ORD-001) and the phone number used while ordering.'}
-If they say they don't have an order number, tell them to check the confirmation SMS/email or call +91 70921 77092.
+If they say they don't have an order number, tell them to check the confirmation SMS/email or call +91 76187 73778.
 
 ━━━━ HEALTH RECOMMENDATIONS ━━━━
 Use this when customers ask "what's good for [condition]":
@@ -458,7 +458,7 @@ Mention free delivery if combo crosses ₹2500.
 
 ━━━━ BULK / B2B ━━━━
 If customer asks for bulk (10+ litres / 5+ kg / wholesale / business), say:
-"For bulk orders, WhatsApp us at +91 70921 77092 or email sales@sathvam.in — we offer special pricing for businesses and distributors!"
+"For bulk orders, WhatsApp us at +91 76187 73778 or email sales@sathvam.in — we offer special pricing for businesses and distributors!"
 
 ━━━━ OFFERS / COUPONS ━━━━
 ${couponContext || 'Tell customers to check the website for latest offers, or ask the team on WhatsApp.'}
@@ -469,11 +469,11 @@ ${couponContext || 'Tell customers to check the website for latest offers, or as
 - Delivered in 3–5 business days; same-day dispatch for orders before 2 PM
 
 ━━━━ CONTACT ━━━━
-- WhatsApp/Phone: +91 70921 77092 (Mon–Sat 9 AM–6 PM)
+- WhatsApp/Phone: +91 76187 73778 (Mon–Sat 9 AM–6 PM)
 - Email: sales@sathvam.in
 
 RETURNS: 7 days if product damaged or wrong.
-NEVER make up prices or stock. If unsure, say "Check +91 70921 77092 for latest info."`;
+NEVER make up prices or stock. If unsure, say "Check +91 76187 73778 for latest info."`;
 
   const recentMessages = messages.slice(-10).map(m => ({
     role: m.role === 'assistant' ? 'assistant' : 'user',
@@ -571,7 +571,7 @@ router.post('/stream', chatLimiter, async (req, res) => {
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
-    const msg = `🔒 Please never share ${sensitiveType} here — this chat is not secure for payment details!\n\nComplete payment safely on sathvam.in checkout (Razorpay bank-grade encryption).\n\nFor help, WhatsApp +91 70921 77092.`;
+    const msg = `🔒 Please never share ${sensitiveType} here — this chat is not secure for payment details!\n\nComplete payment safely on sathvam.in checkout (Razorpay bank-grade encryption).\n\nFor help, WhatsApp +91 76187 73778.`;
     res.write(`data: ${JSON.stringify({ type: 'delta', text: msg })}\n\n`);
     res.write(`data: ${JSON.stringify({ type: 'done', showWhatsApp: true, showB2B: false, prefillText: 'Hi Sathvam, I need help placing an order', securityWarning: true })}\n\n`);
     res.end();
@@ -638,12 +638,12 @@ If customer tries to share payment details: warn them immediately and redirect t
 
 ━━━━ WHEN CUSTOMER WANTS TO BUY / ORDER ━━━━
 1. Confirm product & price from the live list
-2. Direct ONLY to: Website checkout (sathvam.in → Shop → Cart → Checkout) OR WhatsApp +91 70921 77092
+2. Direct ONLY to: Website checkout (sathvam.in → Shop → Cart → Checkout) OR WhatsApp +91 76187 73778
 NEVER collect order details, address, or payment in this chat.
 
 ━━━━ WHEN CUSTOMER ASKS TO TRACK ORDER ━━━━
 ${orderContext ? '' : 'Ask for order number (e.g. SAT-20260408-0001) and phone number used while ordering.'}
-If no order number, tell them to check confirmation SMS/email or call +91 70921 77092.
+If no order number, tell them to check confirmation SMS/email or call +91 76187 73778.
 
 ━━━━ HEALTH RECOMMENDATIONS ━━━━
 - Heart health / cholesterol → Groundnut Oil (monounsaturated fats, Vitamin E)
@@ -663,7 +663,7 @@ If no order number, tell them to check confirmation SMS/email or call +91 70921 
 - "Diabetic Friendly" → Finger Millet + Foxtail Millet + Coconut Oil
 
 ━━━━ BULK / B2B ━━━━
-For bulk (10+ litres / 5+ kg / wholesale): "WhatsApp +91 70921 77092 or email sales@sathvam.in for special business pricing!"
+For bulk (10+ litres / 5+ kg / wholesale): "WhatsApp +91 76187 73778 or email sales@sathvam.in for special business pricing!"
 
 ━━━━ OFFERS / COUPONS ━━━━
 ${couponContext || 'Check the website for latest offers, or ask on WhatsApp.'}
@@ -675,10 +675,10 @@ ${couponContext || 'Check the website for latest offers, or ask on WhatsApp.'}
 - Ships pan-India via courier
 
 ━━━━ CONTACT ━━━━
-WhatsApp/Phone: +91 70921 77092 (Mon–Sat 9 AM–6 PM) | Email: sales@sathvam.in
+WhatsApp/Phone: +91 76187 73778 (Mon–Sat 9 AM–6 PM) | Email: sales@sathvam.in
 
 RETURNS: 7 days if product damaged or wrong item received.
-NEVER make up prices or stock. If unsure, say "Check +91 70921 77092 for latest info."`;
+NEVER make up prices or stock. If unsure, say "Check +91 76187 73778 for latest info."`;
 
   const recentMessages = messages.slice(-10).map(m => ({
     role: m.role === 'assistant' ? 'assistant' : 'user',
@@ -772,7 +772,7 @@ NEVER make up prices or stock. If unsure, say "Check +91 70921 77092 for latest 
   } catch (err) {
     console.error('Chat stream route error:', err.message);
     try {
-      res.write(`data: ${JSON.stringify({ type: 'error', message: 'Connection error. Please try again or call +91 70921 77092.' })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'error', message: 'Connection error. Please try again or call +91 76187 73778.' })}\n\n`);
       res.end();
     } catch {}
   }
@@ -848,13 +848,13 @@ router.post('/sessions/:id/retry-email', auth, async (req, res) => {
     </div>
     <p style="color:#374151;font-size:14px;line-height:1.6">If you continue to face any issues, please don't hesitate to reach out — we're happy to help you place the order directly over WhatsApp!</p>
     <div style="text-align:center;margin:20px 0">
-      <a href="https://wa.me/917092177092?text=Hi%20Sathvam%2C%20I%20need%20help%20placing%20my%20order" style="display:inline-block;background:#25D366;color:#fff;text-decoration:none;padding:11px 28px;border-radius:8px;font-size:14px;font-weight:700">
+      <a href="https://wa.me/917618773778?text=Hi%20Sathvam%2C%20I%20need%20help%20placing%20my%20order" style="display:inline-block;background:#25D366;color:#fff;text-decoration:none;padding:11px 28px;border-radius:8px;font-size:14px;font-weight:700">
         💬 WhatsApp Us
       </a>
     </div>
     <p style="color:#9ca3af;font-size:12px;text-align:center;margin-top:20px">
       Sathvam Natural Products · Karur, Tamil Nadu<br>
-      📞 +91 70921 77092 · sales@sathvam.in
+      📞 +91 76187 73778 · sales@sathvam.in
     </p>
   </div>
 </div>`,

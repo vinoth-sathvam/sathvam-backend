@@ -287,7 +287,7 @@ body { width:760px; font-family:'Segoe UI',Arial,sans-serif; background:#1a1a2e;
   </div>
   <div class="footer">
     <div class="footer-tag">Pure · Natural · Traditional</div>
-    <div class="footer-web">🌐 sathvam.in · 📞 +91 70921 77092</div>
+    <div class="footer-web">🌐 sathvam.in · 📞 +91 76187 73778</div>
   </div>
 </div>
 </body></html>`;
@@ -334,7 +334,7 @@ body { width:760px; font-family:'Segoe UI',Arial,sans-serif; background:#0a1628;
   </div>
   <div class="footer">
     <div class="footer-tag">Your health is our purpose 🙏</div>
-    <div class="footer-web">🌐 sathvam.in · 📞 +91 70921 77092</div>
+    <div class="footer-web">🌐 sathvam.in · 📞 +91 76187 73778</div>
   </div>
 </div>
 </body></html>`;
@@ -388,7 +388,7 @@ body { width:760px; font-family:'Segoe UI',Arial,sans-serif; background:#1a0a00;
   </div>
   <div class="footer">
     <div class="footer-tag">🌿 Cook with pure cold-pressed oils · sathvam.in</div>
-    <div class="footer-web">📞 +91 70921 77092</div>
+    <div class="footer-web">📞 +91 76187 73778</div>
   </div>
 </div>
 </body></html>`;
@@ -498,7 +498,7 @@ function buildWelcomeCardHtml() {
 
   <div class="footer">
     <div class="footer-left">🌐 sathvam.in &nbsp;|&nbsp; Pure • Natural • Cold-Pressed</div>
-    <div class="footer-right">📞 +91 70921 77092</div>
+    <div class="footer-right">📞 +91 76187 73778</div>
   </div>
 
 </div>
@@ -602,7 +602,7 @@ async function broadcastToAllCustomers(message, imageUrl = null, broadcastMeta =
 function buildMorningMessage() {
   const kural = dailyItem(THIRUKKURALS);
   return {
-    preview: `🌅 *காலை வணக்கம்! Good Morning!* ☀️\n\n📖 *திருக்குறள் #${kural.num}*\n\n*தமிழ்:*\n_${kural.tamil}_\n\n*English:*\n"${kural.english}"\n\n🌿 *Sathvam Natural Products*\nPure • Natural • Traditional\n_sathvam.in · +91 70921 77092_`,
+    preview: `🌅 *காலை வணக்கம்! Good Morning!* ☀️\n\n📖 *திருக்குறள் #${kural.num}*\n\n*தமிழ்:*\n_${kural.tamil}_\n\n*English:*\n"${kural.english}"\n\n🌿 *Sathvam Natural Products*\nPure • Natural • Traditional\n_sathvam.in · +91 76187 73778_`,
     meta: { num: kural.num, tamil: kural.tamil, english: kural.english },
     cardHtml: buildKuralCardHtml(kural),
     cardPrefix: `kural-${kural.num}`,
@@ -622,7 +622,7 @@ async function buildAfternoonMessage() {
       `🛢️ _Oil used: ${r.oil}_\n\n` +
       `📋 *Ingredients | தேவையானவை:*\n${r.ingredients_en}\n\n` +
       `👨‍🍳 *Method | செய்முறை:*\n${r.method_en}\n\n` +
-      `🌿 Get Sathvam cold-pressed oils at *sathvam.in* · 📞 +91 70921 77092`;
+      `🌿 Get Sathvam cold-pressed oils at *sathvam.in* · 📞 +91 76187 73778`;
     return { preview: msg, meta: { type: 'recipe', name: r.name_en }, cardHtml: buildRecipeCardHtml(r), cardPrefix: 'recipe' };
   } else {
     const { data: posts } = await supabase
@@ -640,7 +640,7 @@ async function buildAfternoonMessage() {
         `*${post.title || ''}*\n${post.title_ta ? `_${post.title_ta}_` : ''}\n\n` +
         `${excerpt}${excerpt.length >= 200 ? '…' : ''}\n\n` +
         `🔗 Read more: *sathvam.in/blog/${post.slug || ''}*\n\n` +
-        `🌿 _Sathvam Natural Products · sathvam.in · +91 70921 77092_`;
+        `🌿 _Sathvam Natural Products · sathvam.in · +91 76187 73778_`;
       return { preview: msg, meta: { type: 'blog', title: post.title } };
     } else {
       const r = dailyItem(RECIPES, 7);
@@ -649,7 +649,7 @@ async function buildAfternoonMessage() {
         `*${r.name_en}*\n*${r.name_ta}*\n\n` +
         `🛢️ _Oil used: ${r.oil}_\n\n` +
         `👨‍🍳 *Method:*\n${r.method_en}\n\n` +
-        `🌿 Get Sathvam cold-pressed oils at *sathvam.in* · 📞 +91 70921 77092`;
+        `🌿 Get Sathvam cold-pressed oils at *sathvam.in* · 📞 +91 76187 73778`;
       return { preview: msg, meta: { type: 'recipe', name: r.name_en }, cardHtml: buildRecipeCardHtml(r), cardPrefix: 'recipe' };
     }
   }
@@ -663,7 +663,7 @@ function buildNightMessage() {
     `💡 *${tip.title}*\n\n` +
     `🇬🇧 ${tip.english}\n\n` +
     `🇮🇳 ${tip.tamil}\n\n` +
-    `💤 நல்ல இரவு! Sleep well. 🌙\n🌿 _Sathvam Natural Products · sathvam.in · +91 70921 77092_`;
+    `💤 நல்ல இரவு! Sleep well. 🌙\n🌿 _Sathvam Natural Products · sathvam.in · +91 76187 73778_`;
   return { preview: msg, meta: { title: tip.title }, cardHtml: buildHealthCardHtml(tip), cardPrefix: 'health' };
 }
 
@@ -981,6 +981,6 @@ We have completely *redesigned our website* with exciting new features!
 _Your Way to a Healthier Life — *Sathvam*_
 
 🌐 *sathvam.in*
-📞 +91 70921 77092`;
+📞 +91 76187 73778`;
 
 module.exports = router;

@@ -998,7 +998,7 @@ router.post('/cart-reminder', async (req, res) => {
     <div style="text-align:center;margin:24px 0">
       <a href="https://sathvam.in" style="background:linear-gradient(135deg,#2d1a0e,#5c3317);color:#fff;text-decoration:none;padding:14px 36px;border-radius:10px;font-size:16px;font-weight:700;display:inline-block">Complete My Order →</a>
     </div>
-    <p style="color:#9ca3af;font-size:12px;text-align:center">Questions? Call us at +91 70921 77092.<br>Sathvam Natural Products — Pure. Natural. Cold-pressed.</p>
+    <p style="color:#9ca3af;font-size:12px;text-align:center">Questions? Call us at +91 76187 73778.<br>Sathvam Natural Products — Pure. Natural. Cold-pressed.</p>
   </div>
 </div>`;
 

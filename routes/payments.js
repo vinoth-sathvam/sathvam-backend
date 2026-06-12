@@ -143,7 +143,7 @@ async function sendCustomerOrderWhatsApp(order) {
     `🚚 உங்கள் ஆர்டர் அனுப்பப்படும்போது தகவல் தெரிவிக்கப்படும்.\n` +
     `_We'll notify you once your order is dispatched._\n\n` +
     `❓ கேள்விகளா? | Questions?\n` +
-    `📞 *+91 70921 77092*\n` +
+    `📞 *+91 76187 73778*\n` +
     `🌐 sathvam.in`;
 
   try {

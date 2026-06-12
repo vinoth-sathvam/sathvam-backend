@@ -479,7 +479,7 @@ function startScheduler() {
             `*${couponCode}* — 10% off your next order!\n` +
             `_(Valid for 7 days — expires ${expiresAt})_\n\n` +
             `🛒 Shop now: *sathvam.in*\n` +
-            `❓ Help: +91 70921 77092`;
+            `❓ Help: +91 76187 73778`;
 
           if (phone) {
             await sendBirthdayWA(phone, waMsg);

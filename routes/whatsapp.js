@@ -266,7 +266,7 @@ async function handleFlowSubmission(fromPhone, nfmReply) {
 
     if (!product1 || !qty1 || !cust_name || !address) {
       console.error('WA Flow: missing required fields', JSON.stringify(payload));
-      await sendFlowViaBotSailor(fromPhone, '❌ Order submission incomplete. Please try again or call +91 70921 77092.');
+      await sendFlowViaBotSailor(fromPhone, '❌ Order submission incomplete. Please try again or call +91 76187 73778.');
       return;
     }
 
@@ -281,7 +281,7 @@ async function handleFlowSubmission(fromPhone, nfmReply) {
 
     if (prodErr || !products?.length) {
       console.error('WA Flow: product lookup failed', prodErr?.message);
-      await sendFlowViaBotSailor(fromPhone, '❌ Product lookup failed. Please call +91 70921 77092.');
+      await sendFlowViaBotSailor(fromPhone, '❌ Product lookup failed. Please call +91 76187 73778.');
       return;
     }
 
@@ -354,7 +354,7 @@ async function handleFlowSubmission(fromPhone, nfmReply) {
 
     if (insertErr) {
       console.error('WA Flow: order insert failed', insertErr.message);
-      await sendFlowViaBotSailor(fromPhone, '❌ Could not save your order. Please call +91 70921 77092.');
+      await sendFlowViaBotSailor(fromPhone, '❌ Could not save your order. Please call +91 76187 73778.');
       return;
     }
 
@@ -407,7 +407,7 @@ async function handleFlowSubmission(fromPhone, nfmReply) {
       `📍 *Deliver to:*\n${[customer.address, customer.city, customer.state, customer.pincode].filter(Boolean).join(', ')}\n\n` +
       (payUrl
         ? `💳 *Pay securely here:*\n${payUrl}\n\n_Your order will be processed once payment is received._`
-        : `💳 Our team will send you a payment link shortly.\n📞 For queries: +91 70921 77092`) +
+        : `💳 Our team will send you a payment link shortly.\n📞 For queries: +91 76187 73778`) +
       `\n\n_Thank you for choosing Sathvam! 🙏_`;
 
     await sendFlowViaBotSailor(fromPhone, custMsg);
@@ -436,7 +436,7 @@ async function handleFlowSubmission(fromPhone, nfmReply) {
   } catch (err) {
     console.error('WA Flow submission error:', err.message);
     try {
-      await sendFlowViaBotSailor(fromPhone, '❌ Something went wrong. Please call +91 70921 77092 to place your order.');
+      await sendFlowViaBotSailor(fromPhone, '❌ Something went wrong. Please call +91 76187 73778 to place your order.');
     } catch (e) {}
   }
 }
@@ -707,7 +707,7 @@ router.post('/notify/order', auth, async (req, res) => {
     if (!phone || !orderNo) return res.status(400).json({ error: 'phone and orderNo required' });
 
     const to  = normalisePhone(phone);
-    const msg = `🛍️ *Order Update — ${orderNo}*\n\nYour order status has been updated to: *${event}*.\n\nFor details visit: https://sathvam.in\nQueries: +91 70921 77092`;
+    const msg = `🛍️ *Order Update — ${orderNo}*\n\nYour order status has been updated to: *${event}*.\n\nFor details visit: https://sathvam.in\nQueries: +91 76187 73778`;
 
     const ok = await gaSendText(to, msg);
     if (!ok) return res.status(500).json({ error: 'Failed to send via Green API' });

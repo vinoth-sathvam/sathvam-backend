@@ -56,7 +56,7 @@ async function sendMagicLink(email, companyName, token) {
           </div>
         </div>
         <div style="background:#f9fafb;padding:16px 32px;border-top:1px solid #e5e7eb;font-size:11px;color:#9ca3af">
-          Sathvam Natural Products · export@sathvam.in · +91 70921 77092
+          Sathvam Natural Products · export@sathvam.in · +91 76187 73778
         </div>
       </div>
     `,
