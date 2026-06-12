@@ -14,20 +14,14 @@
  */
 
 const express    = require('express');
-const { execFile } = require('child_process');
 const fs         = require('fs');
-const path       = require('path');
 const { auth }   = require('../middleware/auth');
 const { toChatId } = require('../lib/greenapi');
 
 const router     = express.Router();
 
-const SCRIPT_DIR = '/home/ubuntu/cart-reminder';
-const SCRIPT     = path.join(SCRIPT_DIR, 'generate_reminder.py');
-const OUTPUT_DIR = path.join(SCRIPT_DIR, 'output');
-const PYTHON     = 'python3';
-
-const GREENAPI_BASE = 'https://api.green-api.com';
+const GREENAPI_BASE  = 'https://api.green-api.com';
+const PNG_GEN_URL    = 'http://host.docker.internal:8765/generate';
 
 // ── Order status metadata (mirrors ORDER_STATUSES in Python) ──────────────────
 const STATUS_META = {
@@ -68,21 +62,17 @@ function safeName(name) {
   return (name || 'Customer').replace(/[^a-zA-Z0-9_-]/g, '_');
 }
 
-// ── Helper: run the Python generator ─────────────────────────────────────────
-function runGenerator(inputJsonPath, type) {
-  return new Promise((resolve, reject) => {
-    const args = ['--input', inputJsonPath];
-    if (type) args.push('--type', type);
-    execFile(
-      PYTHON,
-      [SCRIPT, ...args],
-      { timeout: 45_000, cwd: SCRIPT_DIR },
-      (err, stdout, stderr) => {
-        if (err) return reject(new Error(stderr || err.message));
-        resolve(stdout);
-      }
-    );
+// ── Helper: call host-side PNG generator microservice ──────────────────────────
+async function runGenerator(data, type) {
+  const res  = await fetch(PNG_GEN_URL, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ type: type || 'cart', data }),
+    signal:  AbortSignal.timeout(60_000),
   });
+  const json = await res.json();
+  if (!json.ok) throw new Error(json.error || 'PNG generation failed');
+  return json.path;
 }
 
 // ── POST /api/cart-reminder/send ──────────────────────────────────────────────
@@ -94,19 +84,11 @@ router.post('/send', auth, async (req, res) => {
   if (!Array.isArray(items) || !items.length)
                                         return res.status(400).json({ error: 'items must be a non-empty array' });
 
-  const tmpJson  = path.join('/tmp', `cart_rm_${Date.now()}.json`);
-  const pngPath  = path.join(OUTPUT_DIR, `${safeName(name)}_cart_reminder.png`);
-
   try {
-    // 1. Write temp input JSON
-    fs.writeFileSync(tmpJson, JSON.stringify([{ name, items, cart_value: cart_value || 0 }]));
+    // 1. Generate PNG via host microservice
+    const pngPath = await runGenerator({ name, items, cart_value: cart_value || 0 }, 'cart');
 
-    // 2. Generate PNG
-    await runGenerator(tmpJson);
-
-    if (!fs.existsSync(pngPath)) throw new Error('PNG was not generated');
-
-    // 3. Send via Green API
+    // 2. Send via Green API
     const caption = `🌿 *SATHVAM*\n_Pure. Cold-Pressed. Honest._\n\nDear *${name}*, your cart is saved and waiting for you 🛒\n\n👉 *Complete your order:*\nhttps://www.sathvam.in/cart\n\nReply here anytime — we're happy to help! 🙏`;
     const msgId   = await sendPngViaGreenApi(phone, pngPath, caption);
 
@@ -114,8 +96,6 @@ router.post('/send', auth, async (req, res) => {
   } catch (err) {
     console.error('[cart-reminder]', err.message);
     res.status(500).json({ error: err.message });
-  } finally {
-    if (fs.existsSync(tmpJson)) fs.unlinkSync(tmpJson);
   }
 });
 
@@ -131,44 +111,29 @@ router.post('/send-order', auth, async (req, res) => {
   if (!Array.isArray(items) || !items.length)
                                             return res.status(400).json({ error: 'items must be a non-empty array' });
 
-  const tmpJson    = path.join('/tmp', `order_rm_${Date.now()}.json`);
-  const safeN      = safeName(name);
-  const safeOrderNo = safeName(order_no);
-  const pngPath    = path.join(OUTPUT_DIR, `${safeN}_${safeOrderNo}_order.png`);
-
   try {
-    // 1. Write temp input JSON
+    // 1. Generate PNG via host microservice
     const orderData = {
-      name,
-      order_no,
-      status,
-      items,
-      cart_value: cart_value || 0,
+      name, order_no, status, items,
+      cart_value:     cart_value     || 0,
       tracking_no:    tracking_no    || '',
       courier:        courier        || '',
       cancel_reason:  cancel_reason  || '',
       payment_method: payment_method || '',
     };
-    fs.writeFileSync(tmpJson, JSON.stringify([orderData]));
+    const pngPath = await runGenerator(orderData, 'order');
 
-    // 2. Generate PNG
-    await runGenerator(tmpJson, 'order');
-
-    if (!fs.existsSync(pngPath)) throw new Error('Order PNG was not generated');
-
-    // 3. Build WhatsApp caption
+    // 2. Build WhatsApp caption
     const meta = STATUS_META[status] || STATUS_META['confirmed'];
     const caption = `🌿 *SATHVAM* | Order #${order_no}\n${meta.icon} *${meta.label}*\n\n${meta.msg}\n\n👉 ${meta.cta}\n\nReply anytime — Team Sathvam 🙏`;
 
-    // 4. Send via Green API
+    // 3. Send via Green API
     const msgId = await sendPngViaGreenApi(phone, pngPath, caption);
 
     res.json({ ok: true, idMessage: msgId });
   } catch (err) {
     console.error('[order-reminder]', err.message);
     res.status(500).json({ error: err.message });
-  } finally {
-    if (fs.existsSync(tmpJson)) fs.unlinkSync(tmpJson);
   }
 });
 
