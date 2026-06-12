@@ -4,6 +4,10 @@
  * POST /api/cart-reminder/send
  *   Body: { phone, name, items: [{product, qty}], cart_value }
  *
+ * POST /api/cart-reminder/send-order
+ *   Body: { phone, name, order_no, status, items: [{product, qty}], cart_value,
+ *           tracking_no?, courier?, cancel_reason?, payment_method? }
+ *
  * Generates a branded PNG via the Python/Playwright script at
  * /home/ubuntu/cart-reminder/generate_reminder.py, then uploads
  * it to Green API via sendFileByUpload (direct binary upload, no public URL needed).
@@ -24,6 +28,16 @@ const OUTPUT_DIR = path.join(SCRIPT_DIR, 'output');
 const PYTHON     = 'python3';
 
 const GREENAPI_BASE = 'https://api.green-api.com';
+
+// ── Order status metadata (mirrors ORDER_STATUSES in Python) ──────────────────
+const STATUS_META = {
+  confirmed: { label: 'Order Confirmed',   icon: '✅', msg: "Your order has been confirmed and we're preparing it now.", cta: 'https://www.sathvam.in/orders' },
+  packed:    { label: 'Order Packed',       icon: '📦', msg: 'Your order is carefully packed and ready to ship.',          cta: 'https://www.sathvam.in/orders' },
+  shipped:   { label: 'On the Way!',        icon: '🚚', msg: 'Your order is on its way to you.',                           cta: 'https://www.sathvam.in/orders' },
+  delivered: { label: 'Order Delivered',    icon: '🎉', msg: 'Your order has been delivered. Enjoy your Sathvam products!', cta: 'https://www.sathvam.in/orders' },
+  cancelled: { label: 'Order Cancelled',    icon: '❌', msg: 'Your order has been cancelled.',                             cta: 'https://www.sathvam.in/orders' },
+  paid:      { label: 'Payment Confirmed',  icon: '💳', msg: 'Your payment has been received successfully.',              cta: 'https://www.sathvam.in/orders' },
+};
 
 // ── Helper: upload PNG file to Green API and send to WhatsApp ─────────────────
 async function sendPngViaGreenApi(phone, pngPath, caption) {
@@ -55,11 +69,13 @@ function safeName(name) {
 }
 
 // ── Helper: run the Python generator ─────────────────────────────────────────
-function runGenerator(inputJsonPath) {
+function runGenerator(inputJsonPath, type) {
   return new Promise((resolve, reject) => {
+    const args = ['--input', inputJsonPath];
+    if (type) args.push('--type', type);
     execFile(
       PYTHON,
-      [SCRIPT, '--input', inputJsonPath],
+      [SCRIPT, ...args],
       { timeout: 45_000, cwd: SCRIPT_DIR },
       (err, stdout, stderr) => {
         if (err) return reject(new Error(stderr || err.message));
@@ -97,6 +113,59 @@ router.post('/send', auth, async (req, res) => {
     res.json({ ok: true, idMessage: msgId });
   } catch (err) {
     console.error('[cart-reminder]', err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    if (fs.existsSync(tmpJson)) fs.unlinkSync(tmpJson);
+  }
+});
+
+// ── POST /api/cart-reminder/send-order ────────────────────────────────────────
+router.post('/send-order', auth, async (req, res) => {
+  const { phone, name, order_no, status, items, cart_value,
+          tracking_no, courier, cancel_reason, payment_method } = req.body;
+
+  if (!phone)                               return res.status(400).json({ error: 'phone required' });
+  if (!name)                                return res.status(400).json({ error: 'name required' });
+  if (!order_no)                            return res.status(400).json({ error: 'order_no required' });
+  if (!status)                              return res.status(400).json({ error: 'status required' });
+  if (!Array.isArray(items) || !items.length)
+                                            return res.status(400).json({ error: 'items must be a non-empty array' });
+
+  const tmpJson    = path.join('/tmp', `order_rm_${Date.now()}.json`);
+  const safeN      = safeName(name);
+  const safeOrderNo = safeName(order_no);
+  const pngPath    = path.join(OUTPUT_DIR, `${safeN}_${safeOrderNo}_order.png`);
+
+  try {
+    // 1. Write temp input JSON
+    const orderData = {
+      name,
+      order_no,
+      status,
+      items,
+      cart_value: cart_value || 0,
+      tracking_no:    tracking_no    || '',
+      courier:        courier        || '',
+      cancel_reason:  cancel_reason  || '',
+      payment_method: payment_method || '',
+    };
+    fs.writeFileSync(tmpJson, JSON.stringify([orderData]));
+
+    // 2. Generate PNG
+    await runGenerator(tmpJson, 'order');
+
+    if (!fs.existsSync(pngPath)) throw new Error('Order PNG was not generated');
+
+    // 3. Build WhatsApp caption
+    const meta = STATUS_META[status] || STATUS_META['confirmed'];
+    const caption = `🌿 *SATHVAM* | Order #${order_no}\n${meta.icon} *${meta.label}*\n\n${meta.msg}\n\n👉 ${meta.cta}\n\nReply anytime — Team Sathvam 🙏`;
+
+    // 4. Send via Green API
+    const msgId = await sendPngViaGreenApi(phone, pngPath, caption);
+
+    res.json({ ok: true, idMessage: msgId });
+  } catch (err) {
+    console.error('[order-reminder]', err.message);
     res.status(500).json({ error: err.message });
   } finally {
     if (fs.existsSync(tmpJson)) fs.unlinkSync(tmpJson);
