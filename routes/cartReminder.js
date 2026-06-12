@@ -13,7 +13,7 @@ const express    = require('express');
 const { execFile } = require('child_process');
 const fs         = require('fs');
 const path       = require('path');
-const auth       = require('../middleware/auth');
+const { auth }   = require('../middleware/auth');
 const { toChatId } = require('../lib/greenapi');
 
 const router     = express.Router();
