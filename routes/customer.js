@@ -9,6 +9,31 @@ const { encrypt, decrypt, hmac, encryptCustomer, decryptCustomer } = require('..
 const { sendText: gaSendText } = require('../lib/greenapi');
 const router     = express.Router();
 
+// ── WhatsApp welcome message (English + Tamil) ────────────────────────────────
+function buildWelcomeMessage(firstName) {
+  return (
+    `\`╔══════════════════════════╗\`\n` +
+    `\`║     S A T H V A M        ║\`\n` +
+    `\`║  Way to a Healthier Life ║\`\n` +
+    `\`╚══════════════════════════╝\`\n\n` +
+
+    `🌿 *Welcome, ${firstName}!* 🎉\n\n` +
+    `_Pure. Natural. From Our Factory to Your Home._\n\n` +
+    `Founded in *Karur, Tamil Nadu* — we started Sathvam because we were tired of refined, chemical-laden oils that look pretty but taste of nothing. We went back to the wooden press, to stone-ground spices, to sun-dried millets. That's Sathvam. 🌿\n\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━━\n` +
+
+    `🌿 *${firstName}-க்கு வருக!* 🎉\n\n` +
+    `_பாரம்பரிய இயற்கை வழியை மீட்டெடுக்கிறோம்_\n\n` +
+    `கரூர், தமிழ்நாட்டில் தொடங்கப்பட்ட *சத்துவம்* — பதப்படுத்தப்பட்ட, ரசாயனம் நிறைந்த எண்ணெய்களிலிருந்து விலகி, *மரவட்டில் ஆட்டிய தூய எண்ணெய்*, *கல்லில் அரைத்த மசாலா*, *வெயிலில் உலர்த்திய தானியங்களுக்குத்* திரும்பினோம்.\n\n` +
+    `குறுக்கு வழிகள் இல்லை. ரசாயனங்கள் இல்லை. சமரசங்கள் இல்லை. 🌿\n\n` +
+    `_அதுவே சத்துவம்._\n` +
+    `━━━━━━━━━━━━━━━━━━━━━━━\n\n` +
+
+    `🛒 https://sathvam.in\n` +
+    `💬 Just reply here anytime — we're always happy to help! 🙏`
+  );
+}
+
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
   port: parseInt(process.env.SMTP_PORT || '587'),
@@ -80,8 +105,14 @@ router.post('/signup', async (req, res) => {
     setCustCookie(res, token);
     res.json({ customer: plain, token });
 
-    // Fire-and-forget admin notification
+    // Fire-and-forget notifications
     setImmediate(async () => {
+      // WhatsApp welcome to customer (if phone provided)
+      if (plain.phone) {
+        const firstName = plain.name.split(' ')[0];
+        gaSendText(plain.phone, buildWelcomeMessage(firstName)).catch(() => {});
+      }
+
       // WhatsApp alert to admins
       notifyAdmins(
         `🆕 *New Customer Signup*\n\n` +
@@ -229,8 +260,15 @@ async function oauthFindOrCreate(email, name, avatarUrl) {
     .select('id,name,email,phone,address,city,state,pincode,totp_enabled,totp_secret,email_hash').single();
   if (error) throw new Error(error.message);
 
-  // Notify admin of new OAuth signup (fire-and-forget)
+  // Notify admin + welcome customer for new OAuth signup (fire-and-forget)
   setImmediate(async () => {
+    // WhatsApp welcome to customer — OAuth signups usually have no phone, skip silently
+    const decrypted = decryptCustomer(created);
+    if (decrypted.phone) {
+      const firstName = name.split(' ')[0];
+      gaSendText(decrypted.phone, buildWelcomeMessage(firstName)).catch(() => {});
+    }
+
     try {
       const adminEmail = process.env.SMTP_USER;
       if (!adminEmail) return;

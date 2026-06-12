@@ -28,7 +28,7 @@ const express   = require('express');
 const Anthropic  = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const { sendText, sendFile, toChatId } = require('../lib/greenapi');
-const { handleOrderMessage } = require('./waOrdering');
+const { handleBotMessage } = require('./waOrdering');
 
 const router    = express.Router();
 const supabase  = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -82,49 +82,6 @@ async function getProductContext() {
     console.error('GreenAPI getProductContext error:', e.message);
     return '(product data unavailable)';
   }
-}
-
-// ── Helper: get recent orders for a phone number ──────────────────────────────
-async function getOrdersByPhone(phone) {
-  const digits = (phone || '').replace(/\D/g, '').slice(-10);
-  if (digits.length < 10) return [];
-  try {
-    const { data } = await supabase
-      .from('webstore_orders')
-      .select('order_no,status,total,created_at,customer,tracking_no,courier')
-      .ilike('customer->>phone', `%${digits}`)
-      .order('created_at', { ascending: false })
-      .limit(5);
-    return data || [];
-  } catch (e) { return []; }
-}
-
-// ── Helper: lookup one order by number ───────────────────────────────────────
-async function lookupOrderNo(rawNo, phone) {
-  try {
-    const { data } = await supabase
-      .from('webstore_orders')
-      .select('order_no,status,total,created_at,customer,tracking_no,courier')
-      .ilike('order_no', rawNo.trim())
-      .maybeSingle();
-    if (!data) return null;
-    const orderDigits = (data.customer?.phone || '').replace(/\D/g, '').slice(-10);
-    const inputDigits = (phone || '').replace(/\D/g, '').slice(-10);
-    if (orderDigits && inputDigits && orderDigits !== inputDigits) return null;
-    return data;
-  } catch { return null; }
-}
-
-const STATUS_LABEL = {
-  new: 'Received ✅', confirmed: 'Confirmed ✅', packed: 'Packed 📦',
-  shipped: 'Shipped 🚚', delivered: 'Delivered ✅', cancelled: 'Cancelled ❌',
-};
-
-function formatOrder(o) {
-  const status = STATUS_LABEL[o.status] || o.status;
-  const date   = o.created_at ? new Date(o.created_at).toLocaleDateString('en-IN') : '';
-  const track  = o.tracking_no ? `\n🔍 Tracking: ${o.courier || ''} ${o.tracking_no}` : '';
-  return `📦 *${o.order_no}*\nStatus: ${status}\nDate: ${date}\nTotal: ₹${o.total}${track}`;
 }
 
 // ── Chat history ───────────────────────────────────────────────────────────────
@@ -193,35 +150,8 @@ async function keywordReply(text, phone) {
     }
   }
 
-  if (/^(hi|hello|hey|start|menu|help|வணக்கம்|ஹலோ)$/i.test(t)) {
-    return `👋 *Welcome to Sathvam!*\n\nNatural cold-pressed oils, directly from our mill 🌿\n\nReply with:\n📦 *ORDERS* — your recent orders\n🔍 *TRACK <order no>* — e.g. TRACK SAT-20260410-0042\n🛍 *PRODUCTS* — what we sell\n💬 *anything else* — ask me anything!`;
-  }
-
-  if (/^(products?|shop|buy|oils?|list|catalogue|catalog|விலை|தயாரிப்பு)$/i.test(t)) {
-    const ctx = await getProductContext();
-    return `🌿 *Our Products*\n\n${ctx}\n\n🛒 Order at: https://sathvam.in`;
-  }
-
-  if (/^(orders?|my orders?|order history|என்.*ஆர்டர்)$/i.test(t)) {
-    const orders = await getOrdersByPhone(phone);
-    if (!orders.length) return `No orders found for this number.\n\nShop at 👉 https://sathvam.in`;
-    return `📦 *Your Recent Orders*\n\n${orders.map(formatOrder).join('\n\n')}`;
-  }
-
-  const trackMatch = t.match(/^track\s+([A-Z0-9\-]+)$/i);
-  if (trackMatch) {
-    const order = await lookupOrderNo(trackMatch[1], phone);
-    if (!order) return `❌ Order *${trackMatch[1]}* not found or doesn't match this number.\n\nReply *ORDERS* to see your orders.`;
-    return formatOrder(order);
-  }
-
-  const orderNoMatch = t.match(/\b(SAT-\d{8}-\d{4})\b/i);
-  if (orderNoMatch) {
-    const order = await lookupOrderNo(orderNoMatch[1], phone);
-    if (order) return formatOrder(order);
-  }
-
-  return null; // fall through to AI
+  // All other message types fall through to AI
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -357,6 +287,7 @@ router.post('/webhook', async (req, res) => {
 
   try {
     const body = req.body;
+    console.log('[wa-raw] typeWebhook=' + body?.typeWebhook + ' msgType=' + body?.messageData?.typeMessage + ' chatId=' + body?.senderData?.chatId);
 
     // Handle outbound message status updates
     if (body.typeWebhook === 'outgoingMessageStatus') {
@@ -371,16 +302,25 @@ router.post('/webhook', async (req, res) => {
     }
 
     // Only process incoming text messages
+    console.log('[wa-debug] webhook type:', body.typeWebhook, 'msgType:', body.messageData?.typeMessage);
     if (body.typeWebhook !== 'incomingMessageReceived') return;
 
     const typeMessage = body.messageData?.typeMessage;
-    if (typeMessage && typeMessage !== 'textMessage') return;
+    const ACCEPTED_TYPES = ['textMessage', 'extendedTextMessage', 'buttonsResponseMessage', 'listResponseMessage', 'templateButtonReplyMessage'];
+    if (typeMessage && !ACCEPTED_TYPES.includes(typeMessage)) return;
 
     const rawChatId = body.senderData?.chatId || body.senderData?.sender || '';
     const phone = rawChatId.replace('@c.us', '').replace(/\D/g, '');
     if (!phone) return;
 
-    const last_message = body.messageData?.textMessageData?.textMessage || '';
+    // Extract text from all supported message types
+    const last_message =
+      body.messageData?.textMessageData?.textMessage ||
+      body.messageData?.extendedTextMessageData?.text ||
+      body.messageData?.buttonsResponseMessage?.selectedButtonId ||
+      body.messageData?.listResponseMessage?.listResponseRow?.rowId ||
+      body.messageData?.templateButtonReplyMessage?.selectedId || '';
+    console.log('[wa-debug] phone:', phone, 'type:', typeMessage, 'msg:', JSON.stringify(last_message));
     if (!last_message.trim()) return;
 
     const subscriber_name = body.senderData?.senderName || body.senderData?.chatName || null;
@@ -427,20 +367,23 @@ router.post('/webhook', async (req, res) => {
       timestamp:     new Date().toISOString(),
     });
 
-    // 1. WhatsApp ordering state machine (takes priority over keyword replies and AI)
+    // 1. WhatsApp bot state machine (takes priority over keyword replies and AI)
     try {
-      const orderResult = await handleOrderMessage(phone, last_message, subscriber_name);
-      if (orderResult.reply !== null) {
-        await sendText(phone, orderResult.reply);
-        await storeMessage({
-          phone, direction: 'outbound', type: 'text',
-          content: orderResult.reply, status: 'sent', sent_by: 'bot',
-          timestamp: new Date().toISOString(),
-        });
+      const botResult = await handleBotMessage(phone, last_message, subscriber_name);
+      // handled=true means bot sent interactively (buttons/list) — don't fall through to AI
+      if (botResult.handled || botResult.reply !== null) {
+        if (botResult.reply !== null) {
+          await sendText(phone, botResult.reply);
+          await storeMessage({
+            phone, direction: 'outbound', type: 'text',
+            content: botResult.reply, status: 'sent', sent_by: 'bot',
+            timestamp: new Date().toISOString(),
+          });
+        }
         return;
       }
-    } catch (orderErr) {
-      console.error('[wa-order] handleOrderMessage error:', orderErr.message);
+    } catch (botErr) {
+      console.error('[wa-bot] handleBotMessage error:', botErr.message);
       // Non-fatal — fall through to keyword/AI
     }
 
