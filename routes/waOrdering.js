@@ -19,6 +19,7 @@
 'use strict';
 
 const fs            = require('fs');
+const crypto        = require('crypto');
 const { createClient } = require('@supabase/supabase-js');
 const { sendText, toChatId } = require('../lib/greenapi');
 
@@ -28,7 +29,10 @@ const supabase = createClient(
 );
 
 const GREENAPI_BASE = 'https://api.green-api.com';
-const PNG_GEN_URL   = 'http://host.docker.internal:8765/generate';
+// Inside Docker: host.docker.internal resolves to the host. On host directly: use localhost.
+const PNG_GEN_URL   = process.env.DOCKER_ENV === 'true'
+  ? 'http://host.docker.internal:8765/generate'
+  : 'http://localhost:8765/generate';
 
 // ── Session helpers ───────────────────────────────────────────────────────────
 
@@ -578,12 +582,13 @@ async function handlePaymentLinkPaid(paymentLinkId, razorpayPaymentId) {
   const { data: newOrder, error: insertErr } = await supabase
     .from('webstore_orders')
     .insert({
+      id:             crypto.randomUUID(),
       order_no:       orderNo,
       date:           dateStr,
       customer,
       items,
       subtotal,
-      gst_amount:     gstAmount,
+      gst:            gstAmount,
       shipping,
       total,
       payment_id:     razorpayPaymentId,

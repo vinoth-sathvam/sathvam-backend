@@ -21,7 +21,9 @@ const { toChatId } = require('../lib/greenapi');
 const router     = express.Router();
 
 const GREENAPI_BASE  = 'https://api.green-api.com';
-const PNG_GEN_URL    = 'http://host.docker.internal:8765/generate';
+const PNG_GEN_URL    = process.env.DOCKER_ENV === 'true'
+  ? 'http://host.docker.internal:8765/generate'
+  : 'http://localhost:8765/generate';
 
 // ── Order status metadata (mirrors ORDER_STATUSES in Python) ──────────────────
 const STATUS_META = {
