@@ -590,6 +590,19 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
       // Order is already saved via /verify — this is just a backup log
     }
 
+    if (event.event === 'payment_link.paid' || event.event === 'payment_link.completed') {
+      const paymentLinkId = event.payload?.payment_link?.entity?.id;
+      const paymentId     = event.payload?.payment?.entity?.id;
+      if (paymentLinkId && paymentId) {
+        try {
+          const { handlePaymentLinkPaid } = require('./waOrdering');
+          await handlePaymentLinkPaid(paymentLinkId, paymentId);
+        } catch (e) {
+          console.error('[wa-order-webhook]', e.message);
+        }
+      }
+    }
+
     if (event.event === 'refund.processed') {
       const refund = event.payload.refund.entity;
       console.log(`Razorpay refund processed: ${refund.id} ₹${refund.amount / 100}`);

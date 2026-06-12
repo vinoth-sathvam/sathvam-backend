@@ -28,6 +28,7 @@ const express   = require('express');
 const Anthropic  = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const { sendText, sendFile, toChatId } = require('../lib/greenapi');
+const { handleOrderMessage } = require('./waOrdering');
 
 const router    = express.Router();
 const supabase  = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -426,7 +427,24 @@ router.post('/webhook', async (req, res) => {
       timestamp:     new Date().toISOString(),
     });
 
-    // 1. Keyword shortcuts
+    // 1. WhatsApp ordering state machine (takes priority over keyword replies and AI)
+    try {
+      const orderResult = await handleOrderMessage(phone, last_message, subscriber_name);
+      if (orderResult.reply !== null) {
+        await sendText(phone, orderResult.reply);
+        await storeMessage({
+          phone, direction: 'outbound', type: 'text',
+          content: orderResult.reply, status: 'sent', sent_by: 'bot',
+          timestamp: new Date().toISOString(),
+        });
+        return;
+      }
+    } catch (orderErr) {
+      console.error('[wa-order] handleOrderMessage error:', orderErr.message);
+      // Non-fatal — fall through to keyword/AI
+    }
+
+    // 2. Keyword shortcuts
     const kwReply = await keywordReply(last_message, phone);
     if (kwReply) {
       await sendText(phone, kwReply);
