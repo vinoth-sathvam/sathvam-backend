@@ -174,6 +174,7 @@ app.use('/api/blog',              require('./routes/blog'));
 app.use('/api/notifications',     require('./routes/notifications'));
 app.use('/api/whatsapp',          require('./routes/whatsapp'));      // WhatsApp Business API (Meta direct)
 app.use('/api/botsailor',         require('./routes/botsailor'));     // BotSailor WhatsApp middleware
+app.use('/api/cart-reminder',     require('./routes/cartReminder'));   // Cart reminder PNG generator + WA sender
 app.use('/api/aisensy',           require('./routes/aisensy'));       // AiSensy WhatsApp integration (testing)
 app.use('/api/thirukural',        require('./routes/thirukural').router); // Daily Thirukkural broadcast
 app.use('/api/broadcasts',        require('./routes/broadcasts'));          // All daily WA broadcasts
