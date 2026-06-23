@@ -124,8 +124,7 @@ router.post('/send-preview', auth, async (req, res) => {
       `\n\n---\nReply *APPROVE* to broadcast this to all customers.\nReply *SKIP* to cancel today's broadcast.`;
 
     const r = await sendWA(adminNo, preview);
-    if (r.status !== '1' && r.status !== 1)
-      return res.status(400).json({ error: r.message || 'Failed to send to admin WA' });
+    if (!r) return res.status(400).json({ error: 'Failed to send to admin WA — check Green API credentials' });
 
     // Store pending state
     await supabase.from('settings').upsert({
