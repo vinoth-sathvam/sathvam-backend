@@ -1472,13 +1472,18 @@ settings.get('/env-config', auth, requireRole('admin'), (req, res) => {
 settings.post('/env-config', auth, requireRole('admin'), async (req, res) => {
   const updates = req.body;
   const saved = [];
-  for (const [key, value] of Object.entries(updates)) {
-    if (!EDITABLE_KEYS.includes(key)) continue;
-    if (value === '' || value === '••••••••') continue; // skip blanks and masked placeholders
-    updateEnvVar(key, value);
-    saved.push(key);
+  try {
+    for (const [key, value] of Object.entries(updates)) {
+      if (!EDITABLE_KEYS.includes(key)) continue;
+      if (value === '' || value === '••••••••') continue; // skip blanks and masked placeholders
+      updateEnvVar(key, value);
+      saved.push(key);
+    }
+    res.json({ success: true, saved });
+  } catch (e) {
+    console.error('[env-config] save error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
   }
-  res.json({ success: true, saved });
 });
 
 settings.post('/smtp-config/test', auth, requireRole('admin'), async (req, res) => {
