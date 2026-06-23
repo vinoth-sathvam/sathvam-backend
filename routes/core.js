@@ -22,13 +22,19 @@ async function ensurePOBillsBucket() {
 const ENV_PATH = path.join(__dirname, '../.env');
 
 function updateEnvVar(key, value) {
-  let content = fs.readFileSync(ENV_PATH, 'utf8');
+  let content = '';
+  try {
+    content = fs.readFileSync(ENV_PATH, 'utf8');
+  } catch (e) {
+    // .env doesn't exist yet in container — start with empty file
+    content = '';
+  }
   const regex = new RegExp(`^${key}=.*`, 'm');
   const line = `${key}=${value}`;
   if (regex.test(content)) {
     content = content.replace(regex, line);
   } else {
-    content += `\n${line}`;
+    content += (content && !content.endsWith('\n') ? '\n' : '') + line + '\n';
   }
   fs.writeFileSync(ENV_PATH, content, 'utf8');
   process.env[key] = value;
