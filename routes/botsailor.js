@@ -242,6 +242,79 @@ router.post('/trigger-bot', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// GET /api/botsailor/instance-status  — Check Green API instance connection state
+// Returns: { stateInstance, phoneNumber, displayName, ok }
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/instance-status', async (req, res) => {
+  const instanceId = process.env.GREENAPI_INSTANCE_ID;
+  const token      = process.env.GREENAPI_API_TOKEN;
+  if (!instanceId || !token) {
+    return res.status(400).json({ ok: false, error: 'GREENAPI_INSTANCE_ID or GREENAPI_API_TOKEN not set in .env' });
+  }
+  try {
+    const BASE = 'https://api.green-api.com';
+    const [stateRes, accountRes] = await Promise.all([
+      fetch(`${BASE}/waInstance${instanceId}/getStateInstance/${token}`),
+      fetch(`${BASE}/waInstance${instanceId}/getSettings/${token}`),
+    ]);
+    const stateData   = await stateRes.json();
+    const accountData = await accountRes.json().catch(() => ({}));
+    const state       = stateData.stateInstance || 'unknown';
+    res.json({
+      ok:            state === 'authorized',
+      stateInstance: state,
+      webhookUrl:    accountData.webhookUrl || '',
+      webhookMode:   accountData.webhookUrlToken || '',
+      instanceId,
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/botsailor/set-webhook  — Update webhook URL in Green API settings
+// Body: { webhookUrl }
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/set-webhook', async (req, res) => {
+  const instanceId = process.env.GREENAPI_INSTANCE_ID;
+  const token      = process.env.GREENAPI_API_TOKEN;
+  if (!instanceId || !token) return res.status(400).json({ ok: false, error: 'Green API credentials not set' });
+
+  const webhookUrl = req.body.webhookUrl || 'https://api.sathvam.in/api/botsailor/webhook';
+  try {
+    const BASE = 'https://api.green-api.com';
+    const r = await fetch(`${BASE}/waInstance${instanceId}/setSettings/${token}`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        webhookUrl,
+        incomingWebhook: 'yes',
+        outgoingWebhook: 'yes',
+        outgoingMessageWebhook: 'yes',
+        stateWebhook: 'yes',
+      }),
+    });
+    const data = await r.json();
+    res.json({ ok: data.saveSettings === true, data });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/botsailor/send-test-message  — Send a test WA message to admin phone
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/send-test-message', async (req, res) => {
+  const adminPhone = process.env.WA_ADMIN_PHONE1;
+  if (!adminPhone) return res.status(400).json({ ok: false, error: 'WA_ADMIN_PHONE1 not set in .env' });
+  const msg = `✅ *Sathvam Green API Test*\n\nThis is a test message from your admin panel.\nTimestamp: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`;
+  const ok = await sendText(adminPhone, msg);
+  if (!ok) return res.status(500).json({ ok: false, error: 'Send failed — check Green API credentials and WhatsApp connection' });
+  res.json({ ok: true, sentTo: adminPhone });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // POST /api/botsailor/broadcast-social  — Broadcast image + caption to all customers
 // Body: { caption, image_url }
 // ─────────────────────────────────────────────────────────────────────────────
