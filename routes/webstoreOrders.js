@@ -1003,6 +1003,27 @@ async function updateOrder(req, res) {
             }
           }
         } catch (e) { console.error('[AUTO] Loyalty error:', e.message); }
+
+        // Schedule review request WA 24 hours after delivery
+        const custPhone = (decrypted.customer?.phone || '').replace(/\D/g, '');
+        const custName = (decrypted.customer?.name || '').split(' ')[0] || 'Customer';
+        if (custPhone) {
+          setTimeout(async () => {
+            try {
+              const msg = `⭐ *நன்றி ${custName}!*\n_Thank you for your Sathvam order!_\n\n` +
+                `உங்கள் ஆர்டர் ${orderNo} டெலிவரி ஆனதற்கு நன்றி 🙏\n` +
+                `_Your order ${orderNo} has been delivered!_\n\n` +
+                `உங்கள் அனுபவம் எப்படி இருந்தது?\n_How was your experience?_\n\n` +
+                `⭐ Please leave a Google review:\nhttps://g.page/r/sathvam-karur/review\n\n` +
+                `📸 Share your unboxing on Instagram: @sathvam.in\n` +
+                `🎁 Get featured + win a free product!\n\n` +
+                `❓ Any issues? Reply here or call +91 76187 73778`;
+              const phone = custPhone.length === 10 ? `91${custPhone}` : custPhone;
+              await gaSendText(phone, msg);
+              console.log(`[REVIEW] Review request sent to ${phone.slice(0,4)}****`);
+            } catch(e) { console.error('[REVIEW] Failed:', e.message); }
+          }, 24 * 60 * 60 * 1000); // 24 hours
+        }
       }
     });
   }

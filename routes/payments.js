@@ -603,6 +603,24 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
       }
     }
 
+    if (event.event === 'payment.failed') {
+      const payment = event.payload.payment.entity;
+      const adminNumbers = [process.env.WA_ADMIN_PHONE1, process.env.WA_NOTIFY_TO]
+        .filter(Boolean).map(n => n.replace(/\D/g, ''));
+      const amt = (payment.amount || 0) / 100;
+      const msg = `❌ *Payment Failed Alert*\n\n` +
+        `💳 Amount: ₹${amt.toLocaleString('en-IN')}\n` +
+        `📞 Contact: ${payment.contact || '—'}\n` +
+        `📧 Email: ${payment.email || '—'}\n` +
+        `❌ Reason: ${payment.error_description || payment.error_code || 'Unknown'}\n` +
+        `🔑 Payment ID: ${payment.id}\n\n` +
+        `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`;
+      for (const phone of adminNumbers) {
+        try { await gaSendText(phone, msg); } catch(e) {}
+      }
+      console.log(`Payment failed: ${payment.id} ₹${amt} — ${payment.error_description}`);
+    }
+
     if (event.event === 'refund.processed') {
       const refund = event.payload.refund.entity;
       console.log(`Razorpay refund processed: ${refund.id} ₹${refund.amount / 100}`);
@@ -625,6 +643,77 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
   } catch (err) {
     console.error('Webhook error:', err.message);
     res.status(500).json({ error: 'Webhook processing error' });
+  }
+});
+
+// POST /api/payments/place-cod
+// Place a Cash on Delivery order (no Razorpay)
+router.post('/place-cod', async (req, res) => {
+  try {
+    const { order } = req.body;
+    if (!order) return res.status(400).json({ error: 'order required' });
+
+    const rawCustomer = order.customer || {};
+    const encCustomer = encryptCustomer(rawCustomer);
+    const custEmailHash = hmac(rawCustomer.email || '');
+    const dbId = crypto.randomUUID();
+    const generatedOrderNo = await generateOrderNo();
+
+    const { error: wsErr } = await supabase.from('webstore_orders').upsert({
+      id:                  dbId,
+      order_no:            generatedOrderNo,
+      date:                order.date || new Date().toISOString().slice(0, 10),
+      customer:            encCustomer,
+      customer_email_hash: custEmailHash,
+      items:               order.items || [],
+      subtotal:            parseFloat(order.subtotal) || 0,
+      gst:                 parseFloat(order.gst) || 0,
+      shipping:            parseFloat(order.shipping) || 0,
+      total:               parseFloat(order.total) || 0,
+      status:              'confirmed',
+      payment_status:      'pending',
+      payment_mode:        'cod',
+      channel:             'website',
+      notes:               'COD Order — payment on delivery',
+    }, { onConflict: 'id' });
+
+    if (wsErr) return res.status(500).json({ error: 'Order save failed: ' + wsErr.message });
+
+    // Non-blocking notifications
+    setImmediate(async () => {
+      await sendWhatsAppAlert({ ...order, paymentId: 'COD', orderNo: generatedOrderNo });
+      await sendOrderEmail({ ...order, orderNo: generatedOrderNo }, 'COD');
+
+      // COD confirmation to customer
+      const cust = order.customer || {};
+      const phone = (cust.phone || '').replace(/\D/g, '');
+      const firstName = (cust.name || '').split(' ')[0] || 'Customer';
+      if (phone) {
+        const custPhone = phone.length === 10 ? `91${phone}` : phone;
+        const items = (order.items || []).map(i => `  • ${i.name} × ${i.qty}`).join('\n');
+        const codMsg =
+          `🌿 *சத்துவம் இயற்கை உணவுகள்*\n` +
+          `━━━━━━━━━━━━━━━━━━━━━\n\n` +
+          `✅ *COD ஆர்டர் பதிவு செய்யப்பட்டது!*\n` +
+          `_Cash on Delivery Order Placed!_\n\n` +
+          `வணக்கம் ${firstName}! 🙏\n\n` +
+          `📋 *ஆர்டர் எண்:* ${generatedOrderNo}\n` +
+          `💵 *கட்டணம்:* ₹${parseFloat(order.total || 0).toLocaleString('en-IN')} (டெலிவரியில் செலுத்தவும்)\n` +
+          `_Pay ₹${parseFloat(order.total || 0).toLocaleString('en-IN')} at delivery_\n\n` +
+          `*📦 Items:*\n${items}\n\n` +
+          `📍 *முகவரி:*\n${[cust.address, cust.city, cust.state, cust.pincode].filter(Boolean).join(', ')}\n\n` +
+          `━━━━━━━━━━━━━━━━━━━━━\n` +
+          `🚚 நாங்கள் விரைவில் அனுப்புவோம்!\n` +
+          `_We'll dispatch your order soon!_\n\n` +
+          `❓ கேள்விகளா? +91 76187 73778`;
+        try { await gaSendText(custPhone, codMsg); } catch(e) {}
+      }
+    });
+
+    res.json({ success: true, orderNo: generatedOrderNo, orderId: dbId });
+  } catch (err) {
+    console.error('COD order error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 

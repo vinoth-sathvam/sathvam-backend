@@ -29,6 +29,7 @@ const Anthropic  = require('@anthropic-ai/sdk');
 const { createClient } = require('@supabase/supabase-js');
 const { sendText, sendFile, toChatId } = require('../lib/greenapi');
 const { handleBotMessage } = require('./waOrdering');
+const { decrypt } = require('../config/crypto');
 
 const router    = express.Router();
 const supabase  = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -124,10 +125,32 @@ async function getOrCreateWACoupon(phone) {
   return { code, isNew: true };
 }
 
+// ── Referral coupon generator ───────────────────────────────────────────────────
+async function getOrCreateReferralCoupon(phone) {
+  const tag = `wa_referral:${phone}`;
+  const { data: existing } = await supabase
+    .from('coupons')
+    .select('code')
+    .eq('description', tag)
+    .eq('active', true)
+    .maybeSingle();
+  if (existing) return { code: existing.code, isNew: false };
+
+  const rand = Math.random().toString(36).slice(2, 7).toUpperCase();
+  const code = `REF${rand}`;
+  const expires = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
+  await supabase.from('coupons').insert({
+    code, type: 'percent', value: 5, min_order: 0, max_uses: 10,
+    uses_count: 0, expires_at: expires, description: tag, active: true,
+  });
+  return { code, isNew: true };
+}
+
 // ── Keyword router ─────────────────────────────────────────────────────────────
 async function keywordReply(text, phone) {
   const t = text.trim();
 
+  // HI SATHVAM — welcome coupon
   if (/^hi\s+sathvam$/i.test(t)) {
     try {
       const { code, isNew } = await getOrCreateWACoupon(phone);
@@ -137,17 +160,154 @@ async function keywordReply(text, phone) {
           `🏷️ Code: *${code}*\n\n` +
           `✅ Valid for 30 days · One-time use\n` +
           `💰 Apply at checkout on *sathvam.in*\n\n` +
-          `🛒 Shop now: https://sathvam.in`;
+          `🛒 Shop now: https://sathvam.in\n\n` +
+          `Reply *MENU* to see all commands.`;
       } else {
         return `😊 *Your 5% OFF coupon is already ready!*\n\n` +
           `🏷️ Code: *${code}*\n\n` +
           `Apply at checkout on *sathvam.in* 🛒\n` +
-          `https://sathvam.in`;
+          `https://sathvam.in\n\n` +
+          `Reply *MENU* to see all commands.`;
       }
     } catch (e) {
       console.error('WA coupon error:', e.message);
       return `🎉 Thanks for reaching out! Shop at https://sathvam.in 🌿\nReply *PRODUCTS* to see our range.`;
     }
+  }
+
+  // POINTS — loyalty balance
+  if (/^points$/i.test(t)) {
+    try {
+      const { data: customers } = await supabase.from('customers').select('id,phone');
+      let custId = null;
+      for (const c of customers || []) {
+        try {
+          const decPhone = (decrypt(c.phone) || '').replace(/\D/g, '');
+          const inPhone  = phone.replace(/\D/g, '');
+          if (decPhone && (decPhone === inPhone || decPhone.endsWith(inPhone) || inPhone.endsWith(decPhone))) {
+            custId = c.id;
+            break;
+          }
+        } catch {}
+      }
+      if (!custId) {
+        return `ℹ️ *Loyalty Points*\n\nWe couldn't find an account linked to your number.\n\nShop at sathvam.in to start earning points! (1 pt per ₹100)`;
+      }
+      const key = `cust_loyalty_${custId}`;
+      const { data: setting } = await supabase.from('settings').select('value').eq('key', key).single();
+      const pts = setting?.value?.points || 0;
+      return `⭐ *Your Loyalty Points Balance*\n\n` +
+        `🏆 Points: *${pts}*\n` +
+        `💰 Value: ₹${pts} (1 pt = ₹1 off)\n\n` +
+        `Earn more: 1 pt for every ₹100 spent!\n` +
+        `🛒 Shop: https://sathvam.in`;
+    } catch (e) {
+      console.error('WA points error:', e.message);
+      return `ℹ️ Could not fetch your points right now. Please try again later.`;
+    }
+  }
+
+  // ORDER <no> or TRACK <no> — order status
+  const orderMatch = t.match(/^(?:order|track)\s+(\S+)$/i);
+  if (orderMatch) {
+    const orderNo = orderMatch[1].toUpperCase();
+    try {
+      const { data: order } = await supabase
+        .from('webstore_orders')
+        .select('order_no,status,date,total')
+        .ilike('order_no', orderNo)
+        .maybeSingle();
+      if (!order) {
+        return `❓ Order *${orderNo}* not found.\n\nPlease check the order number and try again.\nFor help call +91 76187 73778`;
+      }
+      const statusEmoji = {
+        confirmed: '✅', processing: '⚙️', packed: '📦',
+        dispatched: '🚚', shipped: '🚚', delivered: '🎉',
+        cancelled: '❌', refunded: '💸',
+      };
+      const emoji = statusEmoji[order.status] || '📋';
+      return `${emoji} *Order Status — ${order.order_no}*\n\n` +
+        `📋 Status: *${order.status.toUpperCase()}*\n` +
+        `📅 Date: ${order.date}\n` +
+        `💰 Total: ₹${parseFloat(order.total || 0).toLocaleString('en-IN')}\n\n` +
+        `❓ Questions? Call +91 76187 73778`;
+    } catch (e) {
+      console.error('WA order status error:', e.message);
+      return `❓ Could not fetch order status. Please try again or call +91 76187 73778`;
+    }
+  }
+
+  // STOP — opt out
+  if (/^stop$/i.test(t)) {
+    try {
+      await supabase.from('settings').upsert({
+        key:   `wa_optout_${phone}`,
+        value: { opted_out: true, date: new Date().toISOString(), phone },
+      });
+    } catch (e) { console.error('WA opt-out error:', e.message); }
+    return `✅ You have been unsubscribed from Sathvam WhatsApp messages.\n\n` +
+      `To re-subscribe, reply *START* or visit sathvam.in\n` +
+      `For urgent help: +91 76187 73778`;
+  }
+
+  // INVOICE <no> — invoice info
+  const invoiceMatch = t.match(/^invoice\s+(\S+)$/i);
+  if (invoiceMatch) {
+    return `🧾 *Invoice — ${invoiceMatch[1].toUpperCase()}*\n\n` +
+      `To download your invoice, please visit:\n` +
+      `🌐 https://sathvam.in/orders\n\n` +
+      `Or contact us:\n` +
+      `📞 +91 76187 73778\n` +
+      `We'll send it to your email within 24 hours.`;
+  }
+
+  // REFER — referral coupon
+  if (/^refer$/i.test(t)) {
+    try {
+      const { code, isNew } = await getOrCreateReferralCoupon(phone);
+      return `🎁 *Your Referral Code*\n\n` +
+        `Share this code with friends:\n` +
+        `🏷️ *${code}* — 5% OFF for them!\n\n` +
+        `How it works:\n` +
+        `• Share code with a friend\n` +
+        `• They use it at sathvam.in checkout\n` +
+        `• They get 5% off their order\n\n` +
+        `🛒 https://sathvam.in`;
+    } catch (e) {
+      console.error('WA referral error:', e.message);
+      return `❓ Could not generate referral code. Please try again later.`;
+    }
+  }
+
+  // PRODUCTS — product list prompt
+  if (/^products$/i.test(t)) {
+    return `🌿 *Sathvam Natural Products*\n\n` +
+      `We offer:\n` +
+      `• 🫒 Cold-Pressed Groundnut Oil\n` +
+      `• 🌿 Cold-Pressed Sesame (Til) Oil\n` +
+      `• 🧡 Turmeric Powder\n` +
+      `• 🌾 Ragi (Finger Millet) Products\n` +
+      `• 🥜 Natural Groundnuts\n` +
+      `• And more!\n\n` +
+      `Reply with a product name for details or visit:\n` +
+      `🛒 https://sathvam.in\n\n` +
+      `📞 +91 76187 73778`;
+  }
+
+  // HELP or MENU — command list
+  if (/^(?:help|menu)$/i.test(t)) {
+    return `📋 *Sathvam WhatsApp Menu*\n\n` +
+      `Reply with any of these commands:\n\n` +
+      `👋 *HI SATHVAM* — Get a welcome coupon\n` +
+      `⭐ *POINTS* — Check loyalty points balance\n` +
+      `🚚 *TRACK <order no>* — Track your order\n` +
+      `📋 *ORDER <order no>* — Order status\n` +
+      `🧾 *INVOICE <order no>* — Get invoice\n` +
+      `🎁 *REFER* — Get your referral code\n` +
+      `🌿 *PRODUCTS* — See our product range\n` +
+      `🚫 *STOP* — Unsubscribe from messages\n\n` +
+      `🛒 Shop: https://sathvam.in\n` +
+      `📞 Help: +91 76187 73778`;
   }
 
   // All other message types fall through to AI

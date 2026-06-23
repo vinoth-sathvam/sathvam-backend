@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const supabase = require('../config/supabase');
+const { sendText: gaSendText } = require('../lib/greenapi');
 const router = express.Router();
 
 if (!process.env.MAGIC_LINK_SECRET) { console.error('FATAL: MAGIC_LINK_SECRET not set'); process.exit(1); }
@@ -93,6 +94,22 @@ router.post('/signup', async (req, res) => {
 
     const token = jwt.sign({ email: email.toLowerCase(), type: 'b2b_magic' }, MAGIC_SECRET, { expiresIn: '30m' });
     await sendMagicLink(email, companyName, token);
+
+    // Alert admin of new B2B signup
+    setImmediate(async () => {
+      const adminPhones = [process.env.WA_ADMIN_PHONE1, process.env.WA_NOTIFY_TO]
+        .filter(Boolean).map(n => n.replace(/\D/g, ''));
+      const msg = `🏢 *New B2B Signup Alert!*\n\n` +
+        `Company: *${companyName}*\n` +
+        `Contact: ${contactName || '—'}\n` +
+        `Email: ${email}\n` +
+        `Phone: ${phone || '—'}\n` +
+        `Country: ${country || 'India'}\n\n` +
+        `⚡ *Action required:* Approve/reject at admin.sathvam.in → B2B`;
+      for (const p of adminPhones) {
+        try { await gaSendText(p, msg); } catch(e) {}
+      }
+    });
 
     res.status(201).json({ message: 'Account created! Check your email for the access link.' });
   } catch (err) {

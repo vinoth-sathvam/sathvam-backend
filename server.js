@@ -181,6 +181,7 @@ app.use('/api/broadcasts',        require('./routes/broadcasts'));          // A
 app.use('/api/competitor-prices', require('./routes/competitorPrices'));
 app.use('/api/security',         require('./routes/security'));
 app.use('/api/restock-reminders', require('./routes/restockReminder'));
+app.use('/api/checkout-recovery', require('./routes/checkoutRecovery')); // Abandoned checkout WA recovery
 app.use('/api/ca-agent',          require('./routes/caAgent'));
 app.use('/api/google-ads',        require('./routes/googleAds'));
 app.use('/api/deploy-notify',     require('./routes/deployNotify'));

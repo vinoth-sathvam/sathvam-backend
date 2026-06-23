@@ -13,16 +13,7 @@ const mailer = nodemailer.createTransport({
 // ── Shared helpers ─────────────────────────────────────────────────────────────
 
 async function sendWhatsApp(phone, message) {
-  const phoneId = process.env.WA_PHONE_NUMBER_ID;
-  const token   = process.env.WA_ACCESS_TOKEN;
-  if (!phoneId || !token) return;
-  try {
-    await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
-      method:  'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ messaging_product:'whatsapp', to: phone, type:'text', text:{ body: message } }),
-    });
-  } catch (e) { console.error('WhatsApp send failed:', e.message); }
+  try { await gaSendText(phone, message); } catch (e) { console.error('WhatsApp send failed:', e.message); }
 }
 
 // Get all active managers + admins with email/phone
@@ -319,7 +310,7 @@ function startScheduler() {
     } catch (e) { console.error('Afternoon check failed:', e.message); }
   });
 
-  // ── Evening summary: 7:00 PM IST (1:30 PM UTC) — status + nudge ──────────
+  // ── Evening summary: 7:00 PM IST (1:30 PM UTC) — status + nudge + sales WA ─
   cron.schedule('30 13 * * *', async () => {
     try {
       const tasks  = await checkDailyTasks();
@@ -335,6 +326,40 @@ function startScheduler() {
         console.log('Evening check: all daily tasks completed — no reminder needed');
       }
     } catch (e) { console.error('Evening check failed:', e.message); }
+
+    // Send daily sales summary WA to admin phones
+    try {
+      const today = new Date().toISOString().slice(0, 10);
+      const [wsoRes, salesRes] = await Promise.all([
+        supabase.from('webstore_orders').select('total,status').eq('date', today),
+        supabase.from('sales').select('final_amount,status').eq('date', today),
+      ]);
+
+      const wsoOrders  = wsoRes.data  || [];
+      const saleOrders = salesRes.data || [];
+
+      const totalOrders   = wsoOrders.length + saleOrders.length;
+      const totalRevenue  = wsoOrders.reduce((s, r) => s + parseFloat(r.total || 0), 0)
+                          + saleOrders.reduce((s, r) => s + parseFloat(r.final_amount || 0), 0);
+      const pendingCount  = wsoOrders.filter(o => ['confirmed','processing','packed'].includes(o.status)).length;
+      const deliveredCount= wsoOrders.filter(o => o.status === 'delivered').length;
+
+      const dateLabel = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata', day: 'numeric', month: 'short', year: 'numeric' });
+      const summaryMsg =
+        `📊 *Sathvam Daily Summary — ${dateLabel}*\n\n` +
+        `🛒 Orders Today: ${totalOrders}\n` +
+        `💰 Revenue: ₹${Math.round(totalRevenue).toLocaleString('en-IN')}\n` +
+        `📦 Pending Orders: ${pendingCount}\n` +
+        `✅ Delivered: ${deliveredCount}\n\n` +
+        `_View full report: admin.sathvam.in_`;
+
+      const adminPhones = [process.env.WA_ADMIN_PHONE1, process.env.WA_ADMIN_PHONE2, process.env.WA_NOTIFY_TO]
+        .filter(Boolean).map(p => p.replace(/\D/g, ''));
+      for (const p of adminPhones) {
+        try { await gaSendText(p, summaryMsg); } catch (e) {}
+      }
+      console.log(`[SALES-SUMMARY] Daily WA summary sent — ${totalOrders} orders, ₹${Math.round(totalRevenue)}`);
+    } catch (e) { console.error('[SALES-SUMMARY] Failed:', e.message); }
   });
 
   // ── AI Monitor Agent: 9:00 AM IST (3:30 AM UTC) daily ────────────────────
@@ -515,7 +540,213 @@ function startScheduler() {
     } catch(e) { console.error('[BIRTHDAY] Cron failed:', e.message); }
   });
 
-  console.log('Scheduler started — weekly report Mon 8 AM, daily reminders 9 AM / 1:30 PM / 7 PM IST, monitor agent 9 AM IST, low-stock 8 AM IST, birthday coupons 9 AM IST');
+  // ── Weekly Health Tip: Every Sunday 7:00 AM IST (1:30 AM UTC) ─────────────
+  const HEALTH_TIPS = [
+    '🫒 *Groundnut Oil Health Tip*\nCold-pressed groundnut oil retains Vitamin E and healthy fats. Use for high-heat cooking. Rich in resveratrol — heart-healthy! 🫀',
+    '🌿 *Sesame Oil Tip*\nTil (sesame) oil has lignans that support liver health and bone density. Ideal for tadka & traditional cooking.',
+    '🧡 *Turmeric Tip*\nHaldi contains curcumin — a powerful anti-inflammatory. Add a pinch of black pepper to boost absorption by 2000%! 🌶️',
+    '🌰 *Cold-Pressed Oil Tip*\nCold pressing retains all natural antioxidants. Heated/refined oils lose up to 70% of nutrients during processing.',
+    '💪 *Sesame Oil Massage*\nWarm sesame oil massage (Abhyanga) improves circulation, reduces stress, and strengthens bones. Try it on weekends!',
+    '🌾 *Ragi (Finger Millet) Tip*\nRagi is the richest plant source of calcium — great for kids and seniors. Sprouted ragi has even more bioavailability.',
+    '🫀 *Groundnut (Peanut) Tip*\nPeanuts have as much protein as meat! Great for muscle building. Choose un-roasted, natural varieties for max benefit.',
+    '🧘 *Oil Pulling Tip*\nSwish 1 tablespoon of sesame or coconut oil in your mouth for 10-15 min. Ancient Ayurvedic practice for oral health!',
+  ];
+
+  cron.schedule('30 1 * * 0', async () => {
+    try {
+      const { decrypt } = require('../config/crypto');
+      const tipIndex = Math.floor(new Date().getDate() / 7) % HEALTH_TIPS.length;
+      const tip = HEALTH_TIPS[tipIndex];
+
+      // Fetch all customers whose phone is not null
+      const { data: customers } = await supabase.from('customers').select('id,phone');
+      if (!customers?.length) return;
+
+      let sent = 0, skipped = 0;
+      for (const cust of customers) {
+        try {
+          // Check opt-out
+          const phone = (decrypt(cust.phone) || '').replace(/\D/g, '');
+          if (!phone || phone.length < 10) { skipped++; continue; }
+          const fullPhone = phone.length === 10 ? `91${phone}` : phone;
+          const { data: optout } = await supabase.from('settings')
+            .select('value').eq('key', `wa_optout_${fullPhone}`).maybeSingle();
+          if (optout?.value?.opted_out) { skipped++; continue; }
+
+          await gaSendText(fullPhone, `🌿 *Sathvam Health Tip of the Week*\n\n${tip}\n\n_From Sathvam Natural Products — sathvam.in_`);
+          sent++;
+          // Rate-limit: small delay between sends
+          await new Promise(r => setTimeout(r, 500));
+        } catch (e) { skipped++; }
+      }
+      console.log(`[HEALTH-TIP] Sent to ${sent} customers, skipped ${skipped}`);
+    } catch (e) { console.error('[HEALTH-TIP] Cron failed:', e.message); }
+  });
+
+  // ── Win-Back Campaign: Daily 10:00 AM IST (4:30 AM UTC) ──────────────────
+  cron.schedule('30 4 * * *', async () => {
+    try {
+      const { decrypt } = require('../config/crypto');
+      const cutoffDate = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const today      = new Date().toISOString().slice(0, 10);
+
+      // Get customers whose last order was 60+ days ago (only process a batch of 20 per day)
+      const { data: oldOrders } = await supabase
+        .from('webstore_orders')
+        .select('customer_email_hash, date')
+        .lte('date', cutoffDate)
+        .order('date', { ascending: false })
+        .limit(200);
+
+      if (!oldOrders?.length) return;
+
+      // Group by customer_email_hash — get latest order date
+      const latestByHash = {};
+      for (const o of oldOrders) {
+        if (!o.customer_email_hash) continue;
+        if (!latestByHash[o.customer_email_hash] || o.date > latestByHash[o.customer_email_hash]) {
+          latestByHash[o.customer_email_hash] = o.date;
+        }
+      }
+
+      // Filter those with NO order after cutoffDate
+      const { data: recentOrders } = await supabase
+        .from('webstore_orders')
+        .select('customer_email_hash')
+        .gt('date', cutoffDate)
+        .lte('date', today);
+      const recentHashes = new Set((recentOrders || []).map(o => o.customer_email_hash).filter(Boolean));
+      const lostHashes = Object.keys(latestByHash).filter(h => !recentHashes.has(h)).slice(0, 20);
+
+      if (!lostHashes.length) return;
+
+      let sent = 0;
+      for (const emailHash of lostHashes) {
+        try {
+          // Find customer by email hash
+          const { data: cust } = await supabase
+            .from('customers')
+            .select('id,name,phone')
+            .eq('email_hash', emailHash)
+            .maybeSingle();
+          if (!cust) continue;
+
+          const phone = (decrypt(cust.phone) || '').replace(/\D/g, '');
+          if (!phone || phone.length < 10) continue;
+          const fullPhone = phone.length === 10 ? `91${phone}` : phone;
+
+          // Check opt-out
+          const { data: optout } = await supabase.from('settings')
+            .select('value').eq('key', `wa_optout_${fullPhone}`).maybeSingle();
+          if (optout?.value?.opted_out) continue;
+
+          // Check if win-back already sent recently
+          const wbKey = `wa_winback_${cust.id}`;
+          const { data: lastWb } = await supabase.from('settings')
+            .select('value').eq('key', wbKey).maybeSingle();
+          if (lastWb?.value?.sent_at) {
+            const daysSince = (Date.now() - new Date(lastWb.value.sent_at).getTime()) / (24*60*60*1000);
+            if (daysSince < 30) continue; // Don't re-send within 30 days
+          }
+
+          // Create 10% win-back coupon
+          const name = (decrypt(cust.name) || '').split(' ')[0] || 'Customer';
+          const rand = Math.random().toString(36).slice(2, 7).toUpperCase();
+          const couponCode = `BACK${rand}`;
+          const expiresAt  = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+          await supabase.from('coupons').insert({
+            code: couponCode, type: 'percent', value: 10, min_order: 0,
+            max_uses: 1, uses_count: 0, expires_at: expiresAt,
+            active: true, description: `winback:${cust.id}`,
+          });
+
+          const msg =
+            `🌿 *நலமா? We Miss You, ${name}!*\n\n` +
+            `_It's been a while since your last Sathvam order._\n\n` +
+            `உங்களுக்காக ஒரு சிறப்பு தள்ளுபடி:\n` +
+            `*${couponCode}* — 10% OFF your next order!\n` +
+            `_(Valid until ${expiresAt})_\n\n` +
+            `🛒 Shop now: https://sathvam.in\n` +
+            `📞 +91 76187 73778`;
+
+          await gaSendText(fullPhone, msg);
+          await supabase.from('settings').upsert({ key: wbKey, value: { sent_at: new Date().toISOString(), coupon: couponCode } });
+          sent++;
+          await new Promise(r => setTimeout(r, 1000));
+        } catch (e) { console.error('[WINBACK] Customer error:', e.message); }
+      }
+      console.log(`[WINBACK] Win-back campaign sent to ${sent} customers`);
+    } catch (e) { console.error('[WINBACK] Cron failed:', e.message); }
+  });
+
+  // ── B2B Payment Reminder: Daily 9:00 AM IST (3:30 AM UTC) ────────────────
+  cron.schedule('35 3 * * *', async () => {
+    try {
+      // Get B2B orders that are shipped or lc_opened with payment_terms set
+      const { data: b2bOrders } = await supabase
+        .from('b2b_orders')
+        .select('id,order_no,date,total_value,stage,b2b_customer_id')
+        .in('stage', ['shipped', 'lc_opened']);
+
+      if (!b2bOrders?.length) return;
+
+      // Get payment terms for each customer
+      const customerIds = [...new Set(b2bOrders.map(o => o.b2b_customer_id).filter(Boolean))];
+      const { data: b2bCustomers } = await supabase
+        .from('b2b_customers')
+        .select('id,company_name,payment_terms')
+        .in('id', customerIds);
+
+      const custMap = {};
+      for (const c of b2bCustomers || []) custMap[c.id] = c;
+
+      const overdue = [];
+      const today   = new Date();
+
+      for (const order of b2bOrders) {
+        const cust = custMap[order.b2b_customer_id];
+        if (!cust) continue;
+        const paymentTermsDays = parseInt(cust.payment_terms) || 30;
+        const orderDate   = new Date(order.date);
+        const dueDate     = new Date(orderDate.getTime() + paymentTermsDays * 24 * 60 * 60 * 1000);
+        const daysOverdue = Math.floor((today - dueDate) / (24 * 60 * 60 * 1000));
+
+        if (daysOverdue >= 0) {
+          overdue.push({
+            orderNo:     order.order_no,
+            company:     cust.company_name,
+            total:       order.total_value,
+            daysOverdue,
+            dueDate:     dueDate.toISOString().slice(0, 10),
+          });
+        }
+      }
+
+      if (!overdue.length) return;
+
+      const inr = n => '₹' + Math.round(parseFloat(n) || 0).toLocaleString('en-IN');
+      const lines = overdue.map(o =>
+        `  • ${o.orderNo} — ${o.company} — ${inr(o.total)} — *${o.daysOverdue}d overdue*`
+      ).join('\n');
+
+      const msg =
+        `🏢 *B2B Payment Reminder*\n\n` +
+        `The following B2B orders have payments due or overdue:\n\n` +
+        `${lines}\n\n` +
+        `⚡ Total overdue: ${overdue.length} order(s)\n` +
+        `_Check: admin.sathvam.in → B2B Orders_`;
+
+      const adminPhones = [process.env.WA_ADMIN_PHONE1, process.env.WA_NOTIFY_TO]
+        .filter(Boolean).map(p => p.replace(/\D/g, ''));
+      for (const p of adminPhones) {
+        try { await gaSendText(p, msg); } catch (e) {}
+      }
+      console.log(`[B2B-PAYMENT] Reminder sent — ${overdue.length} overdue orders`);
+    } catch (e) { console.error('[B2B-PAYMENT] Cron failed:', e.message); }
+  });
+
+  console.log('Scheduler started — weekly report Mon 8 AM, daily reminders 9 AM / 1:30 PM / 7 PM IST, monitor agent 9 AM IST, low-stock 8 AM IST, birthday coupons 9 AM IST, health tips Sun 7 AM IST, win-back 10 AM IST, B2B payment reminder 9 AM IST');
 }
 
 module.exports = { startScheduler, buildWeeklyReport, checkDailyTasks, sendReminders };
