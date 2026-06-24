@@ -115,7 +115,7 @@ function buildStatusCardHtml(order, newStatus, opts = {}) {
     <img class="logo" src="${LOGO_B64}" />
     <div class="brand">
       <div class="brand-name">Sathvam Natural Products</div>
-      <div class="brand-sub">சத்வம் இயற்கை பொருட்கள் · Pure &amp; Natural</div>
+      <div class="brand-sub">சத்துவம் இயற்கை பொருட்கள் · Pure &amp; Natural</div>
     </div>
   </div>
   <div class="status-banner">
@@ -139,7 +139,7 @@ function buildStatusCardHtml(order, newStatus, opts = {}) {
   </div>
   <div class="footer">
     <div class="footer-left">🌐 sathvam.in &nbsp;|&nbsp; Pure • Natural • Cold-Pressed</div>
-    <div class="footer-contact">📞 +91 76187 73778</div>
+    <div class="footer-contact">📞 +91 70923 77092</div>
   </div>
 </div>
 </body></html>`;
@@ -295,7 +295,7 @@ function buildInvoiceHtml(o, autoPrint = false) {
       <div class="co-sub">
         Plot No. 6, Anand Jothi Nagar, Near ABS Hospital, Thanthoni, Tamil Nadu 639005<br>
         GSTIN: <strong>33ABFCS9387K1ZN</strong> &nbsp;|&nbsp; PAN: ABFCS9387K<br>
-        Phone: +91 76187 73778 &nbsp;|&nbsp; Email: sales@sathvam.in<br>
+        Phone: +91 70923 77092 &nbsp;|&nbsp; Email: sales@sathvam.in<br>
         Website: www.sathvam.in
       </div>
       </div>
@@ -377,7 +377,7 @@ function buildInvoiceHtml(o, autoPrint = false) {
 
   <div class="footer">
     This is a computer-generated tax invoice and does not require a physical signature.<br>
-    Thank you for shopping with Sathvam! &nbsp;|&nbsp; Queries: +91 76187 73778 &nbsp;|&nbsp; sales@sathvam.in
+    Thank you for shopping with Sathvam! &nbsp;|&nbsp; Queries: +91 70923 77092 &nbsp;|&nbsp; sales@sathvam.in
   </div>
   ${autoPrint ? '<script>window.onload=()=>{setTimeout(()=>window.print(),500);}<\/script>' : ''}
 </body></html>`;
@@ -426,7 +426,7 @@ router.post('/:id/send-whatsapp-invoice', auth, async (req, res) => {
       `💰 Total: ₹${total.toFixed(2)}  |  ✅ ${payMode}\n` +
       `📅 Date: ${o.date || ''}\n\n` +
       `📄 *Download Invoice PDF:*\n${pdfUrl}\n\n` +
-      `For any queries: *+91 76187 73778*`;
+      `For any queries: *+91 70923 77092*`;
 
     const ok = await gaSendText(phone, message);
     if (!ok) return res.status(500).json({ error: 'Green API send failed — check GREENAPI_INSTANCE_ID and GREENAPI_API_TOKEN' });
@@ -576,10 +576,10 @@ async function sendStatusEmail(order, newStatus, cancelReason) {
         <div style="background:#f9fafb;border-radius:8px;padding:14px 18px;margin:20px 0;font-size:13px;color:#6b7280">
           Order: <strong style="color:#1f2937">${orderNo}</strong>
         </div>
-        <p style="font-size:13px;color:#9ca3af;margin:0">Questions? Reply to this email or WhatsApp us at +91 76187 73778.</p>
+        <p style="font-size:13px;color:#9ca3af;margin:0">Questions? Reply to this email or WhatsApp us at +91 70923 77092.</p>
       </div>
       <div style="background:#f9fafb;padding:14px 32px;border-top:1px solid #e5e7eb;font-size:11px;color:#9ca3af">
-        Sathvam Natural Products · export@sathvam.in · +91 76187 73778
+        Sathvam Natural Products · export@sathvam.in · +91 70923 77092
       </div>
     </div>`;
 
@@ -639,7 +639,7 @@ async function sendStatusWhatsApp(order, newStatus, cancelReason) {
     }
   }
 
-  const footer = `\n📞 +91 76187 73778  |  📧 sales@sathvam.in\n🌐 sathvam.in\n\n_Regards,_\n*Sathvam Natural Products* 🌿`;
+  const footer = `\n📞 +91 70923 77092  |  📧 sales@sathvam.in\n🌐 sathvam.in\n\n_Regards,_\n*Sathvam Natural Products* 🌿`;
 
   // Build item lines for confirmed message
   const itemLines = (order.items || []).map(it => {
@@ -740,7 +740,7 @@ async function sendStatusWhatsApp(order, newStatus, cancelReason) {
       `🙏 வணக்கம் ${name}!`,
       ``,
       `🌟 உங்கள் ஆர்டர் *${orderNo}* வெற்றிகரமாக வழங்கப்பட்டது.`,
-      `சத்வம் இயற்கை பொருட்களை நம்பி வாங்கியதற்கு நன்றி! 🙏`,
+      `சத்துவம் இயற்கை பொருட்களை நம்பி வாங்கியதற்கு நன்றி! 🙏`,
       ``,
       `💛 உங்கள் ஆரோக்கியமான வாழ்க்கைக்காக நாங்கள் எப்போதும் இங்கே இருக்கிறோம்.`,
       `உங்கள் கருத்தை தெரிவிக்கவும் — அது எங்களுக்கு மிகவும் உதவும். ⭐`,
@@ -856,7 +856,7 @@ async function sendStatusWhatsApp(order, newStatus, cancelReason) {
       try {
         const pdfUrl = await generateInvoicePdfUrl(order);
         if (pdfUrl) {
-          const invoiceCaption = `🧾 *Invoice — ${orderNo}*\n\nவிலைப்பட்டியல் / Your tax invoice is attached below.\n\n📥 Download: ${pdfUrl}\n\n🌐 sathvam.in · 📞 +91 76187 73778`;
+          const invoiceCaption = `🧾 *Invoice — ${orderNo}*\n\nவிலைப்பட்டியல் / Your tax invoice is attached below.\n\n📥 Download: ${pdfUrl}\n\n🌐 sathvam.in · 📞 +91 70923 77092`;
           await sendViaBotSailor(phone, invoiceCaption);
         }
       } catch (invErr) {
@@ -1017,7 +1017,7 @@ async function updateOrder(req, res) {
                 `⭐ Please leave a Google review:\nhttps://g.page/r/sathvam-karur/review\n\n` +
                 `📸 Share your unboxing on Instagram: @sathvam.in\n` +
                 `🎁 Get featured + win a free product!\n\n` +
-                `❓ Any issues? Reply here or call +91 76187 73778`;
+                `❓ Any issues? Reply here or call +91 70923 77092`;
               const phone = custPhone.length === 10 ? `91${custPhone}` : custPhone;
               await gaSendText(phone, msg);
               console.log(`[REVIEW] Review request sent to ${phone.slice(0,4)}****`);
@@ -1096,7 +1096,7 @@ router.post('/botsailor/track', async (req, res) => {
       query = query.order('created_at', { ascending: false }).limit(10);
     }
     const { data: orders, error } = await query;
-    if (error || !orders?.length) return res.json({ message: `No orders found. Please check your order number or contact us at +91 76187 73778.` });
+    if (error || !orders?.length) return res.json({ message: `No orders found. Please check your order number or contact us at +91 70923 77092.` });
 
     // Find order matching phone
     let order = null;
@@ -1108,7 +1108,7 @@ router.post('/botsailor/track', async (req, res) => {
         break;
       }
     }
-    if (!order) return res.json({ message: `No order found for this phone number. Contact us at +91 76187 73778 for help.` });
+    if (!order) return res.json({ message: `No order found for this phone number. Contact us at +91 70923 77092 for help.` });
 
     const STATUS_LABELS = {
       confirmed:  '✅ Confirmed — being packed',
@@ -1128,12 +1128,12 @@ router.post('/botsailor/track', async (req, res) => {
       `📋 *Status:* ${statusLabel}${trackingInfo}${deliveredOn}\n` +
       `📅 *Ordered:* ${order.date || ''}\n` +
       `🛍️ *Items:* ${(order.items || []).map(i => `${i.name} ×${i.qty}`).join(', ')}\n\n` +
-      `Questions? Call *+91 76187 73778*`;
+      `Questions? Call *+91 70923 77092*`;
 
     res.json({ message, order_no: order.order_no, status: order.status });
   } catch (e) {
     console.error('WhatsApp track error:', e.message);
-    res.json({ message: 'Sorry, could not fetch order status. Please contact us at +91 76187 73778.' });
+    res.json({ message: 'Sorry, could not fetch order status. Please contact us at +91 70923 77092.' });
   }
 });
 
@@ -1231,27 +1231,45 @@ router.patch('/reviews/:id', auth, async (req, res) => {
 
 // ── Customer CRM ─────────────────────────────────────────────────────────────
 
-// GET /api/webstore-orders/crm — customer list with order stats
+// GET /api/webstore-orders/crm — customer list with order stats (merges registered customers + order customers)
 router.get('/crm', auth, async (req, res) => {
   try {
+    const customers = {};
+
+    // 1. All registered customers from customers table (300+)
+    const { data: regCustomers } = await supabase
+      .from('customers')
+      .select('id, name, phone, email, city, state, created_at')
+      .not('phone', 'is', null);
+    for (const c of regCustomers || []) {
+      const dec = decryptCustomer(c);
+      const phone = (dec.phone || '').replace(/\D/g, '');
+      const key = phone || dec.email || dec.name;
+      if (!key) continue;
+      customers[key] = { name: dec.name, phone: dec.phone, email: dec.email, city: dec.city, state: dec.state, order_count: 0, total_spent: 0, source: 'registered' };
+    }
+
+    // 2. Customers from webstore orders (adds order stats, may include guest checkouts)
     const { data: orders, error } = await supabase.from('webstore_orders')
       .select('customer,total,status,created_at')
       .order('created_at', { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
-    const customers = {};
     for (const o of orders || []) {
       const cust = o.customer ? decryptCustomer(o.customer) : {};
       const key = (cust.phone || '').replace(/\D/g, '') || cust.email || cust.name;
       if (!key) continue;
       if (!customers[key]) {
-        customers[key] = { name: cust.name, phone: cust.phone, email: cust.email, city: cust.city, state: cust.state, orders: 0, total_spent: 0, first_order: o.created_at, last_order: o.created_at };
+        customers[key] = { name: cust.name, phone: cust.phone, email: cust.email, city: cust.city, state: cust.state, order_count: 0, total_spent: 0, source: 'order' };
       }
-      customers[key].orders++;
-      if (o.status !== 'cancelled') customers[key].total_spent += parseFloat(o.total || 0);
-      if (o.created_at > customers[key].last_order) customers[key].last_order = o.created_at;
-      if (o.created_at < customers[key].first_order) customers[key].first_order = o.created_at;
+      customers[key].order_count = (customers[key].order_count || 0) + 1;
+      if (o.status !== 'cancelled') customers[key].total_spent = (customers[key].total_spent || 0) + parseFloat(o.total || 0);
     }
-    const list = Object.values(customers).sort((a, b) => b.total_spent - a.total_spent);
+
+    const list = Object.values(customers)
+      .filter(c => c.phone && !String(c.phone).startsWith('ENC:'))
+      .map(c => ({ ...c, phone: (c.phone || '').replace(/\D/g, '') }))
+      .filter(c => c.phone.length >= 10)
+      .sort((a, b) => (b.total_spent || 0) - (a.total_spent || 0));
     res.json(list);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
@@ -1329,7 +1347,7 @@ async function sendInvoiceWhatsApp(order) {
       `💰 Total: ₹${total.toFixed(2)}  |  ✅ Paid\n` +
       `📅 Date: ${order.date || new Date().toISOString().slice(0, 10)}\n\n` +
       `📄 *Download Invoice PDF:*\n${pdfUrl}\n\n` +
-      `For any queries: *+91 76187 73778*`;
+      `For any queries: *+91 70923 77092*`;
 
     const ok = await gaSendText(phone, message);
     if (!ok) { console.error('sendInvoiceWhatsApp: Green API send failed'); return; }
