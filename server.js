@@ -178,6 +178,7 @@ app.use('/api/cart-reminder',     require('./routes/cartReminder'));   // Cart r
 app.use('/api/aisensy',           require('./routes/aisensy'));       // AiSensy WhatsApp integration (testing)
 app.use('/api/thirukural',        require('./routes/thirukural').router); // Daily Thirukkural broadcast
 app.use('/api/broadcasts',        require('./routes/broadcasts'));          // All daily WA broadcasts
+app.use('/api/wa-marketing',      require('./routes/waMarketing'));          // WhatsApp Marketing (broadcast, schedule, templates, drip)
 app.use('/api/competitor-prices', require('./routes/competitorPrices'));
 app.use('/api/security',         require('./routes/security'));
 app.use('/api/restock-reminders', require('./routes/restockReminder'));
@@ -186,6 +187,7 @@ app.use('/api/ca-agent',          require('./routes/caAgent'));
 app.use('/api/google-ads',        require('./routes/googleAds'));
 app.use('/api/deploy-notify',     require('./routes/deployNotify'));
 app.use('/api/manager-daily',     require('./routes/managerDaily'));
+app.use('/api/engagement',        require('./routes/engagement'));    // Customer re-engagement broadcasts
 
 // ── Finance Intelligence — Universal Ledger + CFO + CCO ───────────────────────
 app.use('/api/ledger',            require('./routes/ledger'));
