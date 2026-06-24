@@ -12,12 +12,18 @@
  */
 
 const express  = require('express');
+const fs       = require('fs');
+const path     = require('path');
 const supabase = require('../config/supabase');
 const { auth } = require('../middleware/auth');
 const { decrypt } = require('../config/crypto');
-const { sendText: gaSendText } = require('../lib/greenapi');
+const { sendText: gaSendText, sendFile: gaSendFile } = require('../lib/greenapi');
+const { generateKuralCard, kuralCaption } = require('../lib/kuralCard');
 
 const router = express.Router();
+
+// Public URL where Green API can fetch the card image
+const CARD_PUBLIC_URL = `${process.env.PORTAL_URL || 'https://api.sathvam.in'}/api/thirukural/card-image`.replace('admin.', 'api.');
 
 // ── Thirukkural data (same set as push-agent.js) ──────────────────────────────
 const THIRUKKURALS = [
@@ -95,6 +101,32 @@ function kuralMessage(kural) {
   );
 }
 
+// ── GET /api/thirukural/card-image ────────────────────────────────────────────
+// Public — serves today's generated PNG card (fetched by Green API for WA image send)
+router.get('/card-image', async (req, res) => {
+  try {
+    const today   = new Date().toISOString().slice(0, 10);
+    const imgPath = `/tmp/thirukural_${today}.png`;
+
+    if (!fs.existsSync(imgPath)) {
+      // Generate on-demand if not yet created
+      const kural = todaysKural();
+      await generateKuralCard(kural);
+    }
+
+    if (!fs.existsSync(imgPath)) {
+      return res.status(404).json({ error: 'Card not yet generated for today' });
+    }
+
+    res.setHeader('Content-Type', 'image/png');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.sendFile(imgPath);
+  } catch (e) {
+    console.error('[KuralCard] card-image error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── GET /api/thirukural/today ──────────────────────────────────────────────────
 router.get('/today', auth, async (req, res) => {
   try {
@@ -115,15 +147,36 @@ router.get('/today', auth, async (req, res) => {
 router.post('/send-preview', auth, async (req, res) => {
   try {
     const kural    = todaysKural();
-    const adminNo  = (process.env.THIRUKURAL_APPROVAL_PHONE || process.env.WA_NOTIFY_TO || '').replace(/\D/g, '');
-    if (!adminNo) return res.status(400).json({ error: 'THIRUKURAL_APPROVAL_PHONE not set in .env' });
+    const adminNos = (process.env.THIRUKURAL_APPROVAL_PHONE || process.env.WA_NOTIFY_TO || '')
+      .split(',').map(n => n.trim().replace(/\D/g, '')).filter(n => n.length >= 10);
+    if (!adminNos.length) return res.status(400).json({ error: 'THIRUKURAL_APPROVAL_PHONE not set in .env' });
 
-    const preview =
-      `🔔 *Thirukkural Approval Request*\n\n` +
-      kuralMessage(kural) +
-      `\n\n---\nReply *APPROVE* to broadcast this to all customers.\nReply *SKIP* to cancel today's broadcast.`;
+    // Generate card image first
+    let cardGenerated = false;
+    try {
+      await generateKuralCard(kural, true); // force=true to always regenerate on preview
+      cardGenerated = true;
+    } catch (cardErr) {
+      console.error('[KuralCard] generation failed:', cardErr.message, '— falling back to text');
+    }
 
-    const r = await sendWA(adminNo, preview);
+    const approvalNote = `\n\n---\nReply *APPROVE* to broadcast this to all customers.\nReply *SKIP* to cancel today's broadcast.`;
+
+    let r = false;
+    for (const adminNo of adminNos) {
+      let sent = false;
+      if (cardGenerated) {
+        // Send card image + caption with approval note in caption
+        const caption = kuralCaption(kural) + approvalNote;
+        sent = await gaSendFile(adminNo, CARD_PUBLIC_URL, `thirukural_${kural.num}.png`, caption);
+      }
+      if (!sent) {
+        // Fallback: plain text
+        const preview = `🔔 *Thirukkural Approval Request*\n\n` + kuralMessage(kural) + approvalNote;
+        sent = await sendWA(adminNo, preview);
+      }
+      if (sent) r = true;
+    }
     if (!r) return res.status(400).json({ error: 'Failed to send to admin WA — check Green API credentials' });
 
     // Store pending state
@@ -145,7 +198,17 @@ router.post('/broadcast', auth, async (req, res) => {
     const { kural: customKural } = req.body;
     const kural = customKural || todaysKural();
 
-    const message = kuralMessage(kural);
+    // Pre-generate the card image before starting the broadcast
+    let cardGenerated = false;
+    try {
+      await generateKuralCard(kural);
+      cardGenerated = true;
+    } catch (cardErr) {
+      console.error('[KuralCard] generation failed:', cardErr.message, '— falling back to text');
+    }
+
+    const caption  = kuralCaption(kural);
+    const message  = kuralMessage(kural);
 
     // Fetch all customers with phone numbers
     const { data: customers, error } = await supabase
@@ -168,7 +231,11 @@ router.post('/broadcast', auth, async (req, res) => {
         if (digits.length < 10) { skipped++; continue; }
         const phone = digits.length === 10 ? `91${digits}` : digits;
 
-        const ok = await gaSendText(phone, message);
+        let ok = false;
+        if (cardGenerated) {
+          ok = await gaSendFile(phone, CARD_PUBLIC_URL, `thirukural_${kural.num}.png`, caption);
+        }
+        if (!ok) ok = await gaSendText(phone, message); // fallback to text
         if (ok) sent++; else failed++;
 
         // Throttle — 3 messages per second to avoid rate limits
@@ -201,6 +268,16 @@ router.post('/approve-from-wa', async (req, res) => {
     }
 
     const kural   = pending.value.kural;
+
+    let cardGenerated = false;
+    try {
+      await generateKuralCard(kural);
+      cardGenerated = true;
+    } catch (cardErr) {
+      console.error('[KuralCard] generation failed in approve-from-wa:', cardErr.message);
+    }
+
+    const caption = kuralCaption(kural);
     const message = kuralMessage(kural);
 
     const { data: customers } = await supabase
@@ -217,7 +294,11 @@ router.post('/approve-from-wa', async (req, res) => {
         if (digits.length < 10) { skipped++; continue; }
         const phone = digits.length === 10 ? `91${digits}` : digits;
 
-        const ok = await gaSendText(phone, message);
+        let ok = false;
+        if (cardGenerated) {
+          ok = await gaSendFile(phone, CARD_PUBLIC_URL, `thirukural_${kural.num}.png`, caption);
+        }
+        if (!ok) ok = await gaSendText(phone, message);
         if (ok) sent++; else failed++;
         await new Promise(ok => setTimeout(ok, 333));
       } catch { failed++; }
