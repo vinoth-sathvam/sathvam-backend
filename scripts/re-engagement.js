@@ -18,8 +18,10 @@ const { sendText } = require('../lib/greenapi');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
-const COOLDOWN_DAYS = 30;   // don't re-message same customer within 30 days
-const SEND_DELAY_MS = 2000; // delay between sends to avoid WhatsApp rate limits
+const COOLDOWN_DAYS  = 30;    // don't re-message same customer within 30 days
+const SEND_DELAY_MS  = 2000;  // delay between individual messages
+const BATCH_SIZE     = 10;    // messages per batch
+const BATCH_PAUSE_MS = 30000; // 30s pause between batches
 
 const DEFAULT_TEMPLATES = {
   at_risk: `Hi {name}! 👋 It's been a while since your last Sathvam order. Your fresh cold-pressed oils are just a tap away!\n\n🛒 Shop now: https://sathvam.in\n\n_— Team Sathvam 🌿_`,
@@ -117,8 +119,18 @@ async function run() {
   console.log(`[re-engagement] ${toSend.length} customer(s) to message`);
 
   const results = [];
+  console.log(`[re-engagement] ${toSend.length} customer(s) — ${BATCH_SIZE}/batch, ${BATCH_PAUSE_MS/1000}s pause between batches`);
 
-  for (const cust of toSend) {
+  for (let i = 0; i < toSend.length; i++) {
+    const cust       = toSend[i];
+    const batchNum   = Math.floor(i / BATCH_SIZE) + 1;
+    const posInBatch = i % BATCH_SIZE;
+
+    if (i > 0 && posInBatch === 0) {
+      console.log(`[re-engagement] Batch ${batchNum} starting — pausing ${BATCH_PAUSE_MS/1000}s…`);
+      await sleep(BATCH_PAUSE_MS);
+    }
+
     const firstName = (cust.name || '').split(' ')[0] || 'there';
     const tpl       = templates[cust.segment] || DEFAULT_TEMPLATES.at_risk;
     const message   = tpl.replace(/\{name\}/gi, firstName);
@@ -131,7 +143,7 @@ async function run() {
 
     try {
       const ok = await sendText(cust.phone, message);
-      console.log(`[${ok ? 'SENT' : 'FAIL'}] ${cust.phone} (${cust.name}) [${cust.segment}]`);
+      console.log(`[${ok ? 'SENT' : 'FAIL'}] [batch ${batchNum}] ${cust.phone} (${cust.name}) [${cust.segment}]`);
       results.push({ phone: cust.phone, name: cust.name, segment: cust.segment, status: ok ? 'sent' : 'failed' });
 
       if (ok) {

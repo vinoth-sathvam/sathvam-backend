@@ -25,7 +25,9 @@ const { decryptCustomer } = require('../config/crypto');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 const COOLDOWN_DAYS = 7;   // min days between flash offers to same customer
-const SEND_DELAY_MS = 2000;
+const SEND_DELAY_MS  = 2000;  // delay between individual messages
+const BATCH_SIZE     = 10;    // messages per batch
+const BATCH_PAUSE_MS = 30000; // 30s pause between batches
 const COUPON_CODE   = 'FLASH10';
 
 // ── Message pools ─────────────────────────────────────────────────────────────
@@ -148,10 +150,20 @@ async function run() {
   // Shuffle for variety
   toSend.sort(() => Math.random() - 0.5);
 
-  console.log(`[flash-offer] ${toSend.length} eligible customers to message`);
+  console.log(`[flash-offer] ${toSend.length} eligible customers — ${BATCH_SIZE}/batch, ${BATCH_PAUSE_MS/1000}s pause between batches`);
 
   const results = [];
-  for (const cust of toSend) {
+  for (let i = 0; i < toSend.length; i++) {
+    const cust      = toSend[i];
+    const batchNum  = Math.floor(i / BATCH_SIZE) + 1;
+    const posInBatch = i % BATCH_SIZE;
+
+    // Pause between batches (not before the very first message)
+    if (i > 0 && posInBatch === 0) {
+      console.log(`[flash-offer] Batch ${batchNum} starting — pausing ${BATCH_PAUSE_MS/1000}s…`);
+      await sleep(BATCH_PAUSE_MS);
+    }
+
     const firstName = (cust.name || '').split(' ')[0] || 'there';
     const message   = pick(pool).replace(/\{name\}/gi, firstName);
 
@@ -163,7 +175,7 @@ async function run() {
 
     try {
       const ok = await sendText(cust.phone, message);
-      console.log(`[${ok ? 'SENT' : 'FAIL'}] ${cust.phone} (${cust.name})`);
+      console.log(`[${ok ? 'SENT' : 'FAIL'}] [batch ${batchNum}] ${cust.phone} (${cust.name})`);
       results.push({ phone: cust.phone, name: cust.name, status: ok ? 'sent' : 'failed' });
       if (ok) cooldowns[cust.phone] = today;
       await sleep(SEND_DELAY_MS);
