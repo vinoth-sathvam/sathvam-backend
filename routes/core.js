@@ -218,6 +218,7 @@ products.put('/batch', auth, requireRole('admin', 'manager'), async (req, res) =
     description: p.description ?? undefined,
     hsn_code: p.hsnCode ?? undefined,
     commodity_id: p.commodityId ?? null,
+    fssai_license: p.fssaiLicense ?? null,
   }));
   const { error } = await supabase.from('products').upsert(updates, { onConflict: 'id' });
   if (error) return res.status(400).json({ error: error.message });
@@ -238,6 +239,7 @@ products.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
     image_url:p.imageUrl, description:p.description, hsn_code:p.hsnCode,
     offer_label:p.offer_label, offer_price:p.offer_price,
     offer_ends_at:p.offer_ends_at, commodity_id:p.commodityId,
+    fssai_license:p.fssaiLicense,
   };
   // Remove undefined keys so Supabase only updates fields actually provided
   const fields = Object.fromEntries(Object.entries(raw).filter(([,v]) => v !== undefined));
