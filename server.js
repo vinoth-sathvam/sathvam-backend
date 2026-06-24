@@ -188,6 +188,7 @@ app.use('/api/google-ads',        require('./routes/googleAds'));
 app.use('/api/deploy-notify',     require('./routes/deployNotify'));
 app.use('/api/manager-daily',     require('./routes/managerDaily'));
 app.use('/api/engagement',        require('./routes/engagement'));    // Customer re-engagement broadcasts
+app.use('/api/flash-offer',       require('./routes/flashOffer'));    // Daily flash offer WhatsApp (4-5 PM / 9-11 PM)
 
 // ── Finance Intelligence — Universal Ledger + CFO + CCO ───────────────────────
 app.use('/api/ledger',            require('./routes/ledger'));
