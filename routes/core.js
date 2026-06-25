@@ -1450,7 +1450,7 @@ const settings = express.Router();
 const EDITABLE_KEYS = [
   'SMTP_USER','SMTP_PASS','SMTP_FROM','SMTP_HOST','SMTP_PORT',
   'RAZORPAY_KEY_ID','RAZORPAY_KEY_SECRET','RAZORPAY_WEBHOOK_SECRET',
-  'GREENAPI_INSTANCE_ID','GREENAPI_API_TOKEN','WA_ADMIN_PHONE1','WA_ADMIN_PHONE2','WA_NOTIFY_TO',
+  'GREENAPI_INSTANCE_ID','GREENAPI_API_TOKEN','WA_ADMIN_PHONE1','WA_ADMIN_PHONE2','WA_NOTIFY_TO','WA_DISABLED',
   'ZOHO_CLIENT_ID','ZOHO_CLIENT_SECRET','ZOHO_ORG_ID','ZOHO_REFRESH_TOKEN',
   'VAPID_PUBLIC_KEY','VAPID_PRIVATE_KEY','VAPID_SUBJECT',
   'ANTHROPIC_API_KEY',
@@ -1486,6 +1486,38 @@ settings.post('/env-config', auth, requireRole('admin'), async (req, res) => {
     console.error('[env-config] save error:', e.message);
     res.status(500).json({ success: false, error: e.message });
   }
+});
+
+// ── WhatsApp global on/off toggle ────────────────────────────────────────────
+settings.post('/wa-toggle', auth, requireRole('admin'), (req, res) => {
+  const disable = req.body.disabled === true || req.body.disabled === 'true';
+  const value   = disable ? 'true' : 'false';
+  updateEnvVar('WA_DISABLED', value);
+  console.log(`[WA-TOGGLE] WhatsApp ${disable ? 'DISABLED' : 'ENABLED'} by ${req.user?.name || 'admin'}`);
+  res.json({ success: true, wa_disabled: disable });
+});
+
+settings.get('/wa-status', auth, requireRole('admin','manager'), (req, res) => {
+  res.json({ wa_disabled: process.env.WA_DISABLED === 'true' });
+});
+
+// ── Per-automation WhatsApp toggles ─────────────────────────────────────────
+settings.get('/wa-automations', auth, requireRole('admin'), async (req, res) => {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'wa_automations').maybeSingle();
+    res.json(data?.value || {});
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+settings.post('/wa-automations', auth, requireRole('admin'), async (req, res) => {
+  try {
+    const toggles = req.body; // { order_confirmed: false, flash_offer: false, ... }
+    const { error } = await supabase.from('settings').upsert({ key: 'wa_automations', value: toggles, updated_at: new Date() });
+    if (error) return res.status(500).json({ error: error.message });
+    // Cache in process memory for fast checks
+    global.__waAutomations = toggles;
+    res.json({ success: true, automations: toggles });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 settings.post('/smtp-config/test', auth, requireRole('admin'), async (req, res) => {

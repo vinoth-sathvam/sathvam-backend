@@ -25,7 +25,8 @@ const { decryptCustomer } = require('../config/crypto');
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 const COOLDOWN_DAYS = 7;   // min days between flash offers to same customer
-const SEND_DELAY_MS  = 2000;  // delay between individual messages
+const DAILY_LIMIT   = 10;  // max customers per run (random pick)
+const SEND_DELAY_MS  = 5000;  // delay between individual messages
 const BATCH_SIZE     = 10;    // messages per batch
 const BATCH_PAUSE_MS = 30000; // 30s pause between batches
 const COUPON_CODE   = 'FLASH10';
@@ -55,6 +56,34 @@ const NIGHT_MESSAGES = [
 
   `💛 Hi {name}! A small gift from Sathvam tonight —\n\n*10% off* on your next order of pure cold-pressed oils.\n\nYour health deserves the best 🌿\n\nUse *${COUPON_CODE}* at https://sathvam.in\n\n_Valid today only — Team Sathvam_`,
 ];
+
+// ── Coupon auto-enable ────────────────────────────────────────────────────────
+
+async function enableFlashCoupon() {
+  // expires_at is a DATE column — new Date('YYYY-MM-DD') is parsed as midnight UTC.
+  // Setting it to tomorrow's date means the coupon is valid until 5:30 AM IST next day,
+  // which effectively covers "today only" in IST without being already-expired.
+  const now = new Date();
+  const tomorrow = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  const expiresAt = tomorrow.toISOString().slice(0, 10); // 'YYYY-MM-DD'
+
+  const { data: existing } = await supabase
+    .from('coupons').select('id').eq('code', COUPON_CODE).maybeSingle();
+
+  if (existing) {
+    await supabase.from('coupons')
+      .update({ active: true, expires_at: expiresAt })
+      .eq('code', COUPON_CODE);
+    console.log(`[flash-offer] Coupon ${COUPON_CODE} activated — expires at ${expiresAt} (midnight IST)`);
+  } else {
+    await supabase.from('coupons').insert({
+      code: COUPON_CODE, type: 'percent', value: 10,
+      min_order: 0, max_uses: null, uses_count: 0,
+      expires_at: expiresAt, description: 'Flash offer — auto-created', active: true,
+    });
+    console.log(`[flash-offer] Coupon ${COUPON_CODE} created and activated — expires at ${expiresAt} (midnight IST)`);
+  }
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -147,14 +176,18 @@ async function run() {
     toSend.push(cust);
   }
 
-  // Shuffle for variety
+  // Shuffle and cap at DAILY_LIMIT — cooldown prevents same customer appearing on consecutive days
   toSend.sort(() => Math.random() - 0.5);
+  const selected = toSend.slice(0, DAILY_LIMIT);
 
-  console.log(`[flash-offer] ${toSend.length} eligible customers — ${BATCH_SIZE}/batch, ${BATCH_PAUSE_MS/1000}s pause between batches`);
+  // Enable coupon before sending (real runs only)
+  if (!dryRun) await enableFlashCoupon();
+
+  console.log(`[flash-offer] ${toSend.length} eligible, picking ${selected.length} randomly`);
 
   const results = [];
-  for (let i = 0; i < toSend.length; i++) {
-    const cust      = toSend[i];
+  for (let i = 0; i < selected.length; i++) {
+    const cust      = selected[i];
     const batchNum  = Math.floor(i / BATCH_SIZE) + 1;
     const posInBatch = i % BATCH_SIZE;
 
@@ -193,7 +226,7 @@ async function run() {
     // Save cooldowns
     await supabase.from('settings').upsert({ key: 'flash_offer_cooldowns', value: cooldowns, updated_at: new Date().toISOString() });
     // Append run log
-    history.unshift({ date: today, window, sent, failed, total: toSend.length, dryRun: false });
+    history.unshift({ date: today, window, sent, failed, total: selected.length, dryRun: false });
     if (history.length > 60) history.splice(60);
     await supabase.from('settings').upsert({ key: 'flash_offer_runs', value: history, updated_at: new Date().toISOString() });
   }

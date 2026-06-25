@@ -38,7 +38,7 @@ Write the caption in TWO sections — first in Tamil, then in English. Format ex
 [5-8 hashtags shared at the end]
 
 Rules for both sections:
-- Mention "Sathvam" — in Tamil always spell it as "சத்துவம்" (never சத்வம்) — use it at least twice across both sections
+- Mention "Sathvam" — in Tamil always spell it as "சத்துவம்" (never சத்துவம்) — use it at least twice across both sections
 - Strongly emphasize purity — 100% natural, zero chemicals, no preservatives, traditional cold-press/stone-ground methods (மரபு முறை / இயற்கை in Tamil)
 - Highlight factory-direct from Karur, Tamil Nadu
 - Include a call to action: order on www.sathvam.in

@@ -218,7 +218,7 @@ async function keywordReply(text, phone) {
         .ilike('order_no', orderNo)
         .maybeSingle();
       if (!order) {
-        return `❓ Order *${orderNo}* not found.\n\nPlease check the order number and try again.\nFor help call +91 76187 73778`;
+        return `❓ Order *${orderNo}* not found.\n\nPlease check the order number and try again.\nFor help call +91 70923 77092`;
       }
       const statusEmoji = {
         confirmed: '✅', processing: '⚙️', packed: '📦',
@@ -230,10 +230,10 @@ async function keywordReply(text, phone) {
         `📋 Status: *${order.status.toUpperCase()}*\n` +
         `📅 Date: ${order.date}\n` +
         `💰 Total: ₹${parseFloat(order.total || 0).toLocaleString('en-IN')}\n\n` +
-        `❓ Questions? Call +91 76187 73778`;
+        `❓ Questions? Call +91 70923 77092`;
     } catch (e) {
       console.error('WA order status error:', e.message);
-      return `❓ Could not fetch order status. Please try again or call +91 76187 73778`;
+      return `❓ Could not fetch order status. Please try again or call +91 70923 77092`;
     }
   }
 
@@ -247,7 +247,7 @@ async function keywordReply(text, phone) {
     } catch (e) { console.error('WA opt-out error:', e.message); }
     return `✅ You have been unsubscribed from Sathvam WhatsApp messages.\n\n` +
       `To re-subscribe, reply *START* or visit sathvam.in\n` +
-      `For urgent help: +91 76187 73778`;
+      `For urgent help: +91 70923 77092`;
   }
 
   // INVOICE <no> — invoice info
@@ -257,7 +257,7 @@ async function keywordReply(text, phone) {
       `To download your invoice, please visit:\n` +
       `🌐 https://sathvam.in/orders\n\n` +
       `Or contact us:\n` +
-      `📞 +91 76187 73778\n` +
+      `📞 +91 70923 77092\n` +
       `We'll send it to your email within 24 hours.`;
   }
 
@@ -291,7 +291,7 @@ async function keywordReply(text, phone) {
       `• And more!\n\n` +
       `Reply with a product name for details or visit:\n` +
       `🛒 https://sathvam.in\n\n` +
-      `📞 +91 76187 73778`;
+      `📞 +91 70923 77092`;
   }
 
   // HELP or MENU — command list
@@ -307,7 +307,7 @@ async function keywordReply(text, phone) {
       `🌿 *PRODUCTS* — See our product range\n` +
       `🚫 *STOP* — Unsubscribe from messages\n\n` +
       `🛒 Shop: https://sathvam.in\n` +
-      `📞 Help: +91 76187 73778`;
+      `📞 Help: +91 70923 77092`;
   }
 
   // All other message types fall through to AI
@@ -559,8 +559,9 @@ router.post('/webhook', async (req, res) => {
     const subscriber_name = body.senderData?.senderName || body.senderData?.chatName || null;
 
     // ── Admin approval flow for broadcasts ───────────────────────────────────
-    const adminNo  = (process.env.THIRUKURAL_APPROVAL_PHONE || process.env.WA_NOTIFY_TO || '').replace(/\D/g, '');
-    const isAdmin  = adminNo && (phone === adminNo || phone.endsWith(adminNo) || adminNo.endsWith(phone));
+    const adminNos = (process.env.THIRUKURAL_APPROVAL_PHONE || process.env.WA_NOTIFY_TO || '')
+      .split(',').map(n => n.trim().replace(/\D/g, '')).filter(Boolean);
+    const isAdmin  = adminNos.some(n => n && (phone === n || phone.endsWith(n) || n.endsWith(phone)));
     const msgLower = last_message.trim().toLowerCase();
 
     if (isAdmin) {

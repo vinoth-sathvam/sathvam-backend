@@ -9,7 +9,7 @@ const supabase     = require('../config/supabase');
 const { auth }     = require('../middleware/auth');
 const rateLimit    = require('express-rate-limit');
 const { decryptCustomer, hmac, encryptCustomer } = require('../config/crypto');
-const { sendText: gaSendText, sendFile: gaSendFile } = require('../lib/greenapi');
+const { sendText: gaSendText, sendFile: gaSendFile, sendContact: gaSendContact } = require('../lib/greenapi');
 const router       = express.Router();
 
 // Embed logo as base64 so wkhtmltoimage doesn't need network access
@@ -1004,6 +1004,35 @@ async function updateOrder(req, res) {
           }
         } catch (e) { console.error('[AUTO] Loyalty error:', e.message); }
 
+        // ── MILESTONE REWARD: 5th / 10th / 20th order WA ────────────────────
+        try {
+          const rawPhone = (decrypted.customer?.phone || '').replace(/\D/g, '');
+          const milestonePhone = rawPhone.length === 10 ? '91' + rawPhone : rawPhone;
+          const custName = (decrypted.customer?.name || '').split(' ')[0] || 'there';
+          if (milestonePhone && milestonePhone.length >= 12) {
+            const milestoneKey = 'milestone_order_counts';
+            const { data: milestoneRow } = await supabase.from('settings').select('value').eq('key', milestoneKey).single();
+            const counts = milestoneRow?.value || {};
+            counts[milestonePhone] = (counts[milestonePhone] || 0) + 1;
+            const count = counts[milestonePhone];
+            await supabase.from('settings').upsert({ key: milestoneKey, value: counts, updated_at: new Date().toISOString() });
+
+            const milestones = { 5: '100ml', 10: '250ml', 20: '500ml' };
+            if (milestones[count]) {
+              const freeItem = milestones[count];
+              const msg =
+                `🎉 *Wow ${custName}, you've ordered from us ${count} times!*\n\n` +
+                `You're one of our most valued customers 💚\n\n` +
+                `As a token of our gratitude, we're sending you a *FREE ${freeItem} cold-pressed oil sample* with your next order — absolutely on us! 🎁\n\n` +
+                `Just place your next order and mention "MILESTONE${count}" in the notes, and we'll pack it in 🌿\n\n` +
+                `Thank you for trusting Sathvam! 🙏\n_— Team Sathvam_`;
+              const { sendText: gaSendMilestone } = require('../lib/greenapi');
+              await gaSendMilestone(milestonePhone, msg);
+              console.log(`[MILESTONE] Order #${count} reward sent to ${milestonePhone.slice(0,4)}****`);
+            }
+          }
+        } catch (e) { console.error('[AUTO] Milestone error:', e.message); }
+
         // Schedule review request WA 24 hours after delivery
         const custPhone = (decrypted.customer?.phone || '').replace(/\D/g, '');
         const custName = (decrypted.customer?.name || '').split(' ')[0] || 'Customer';
@@ -1351,6 +1380,9 @@ async function sendInvoiceWhatsApp(order) {
 
     const ok = await gaSendText(phone, message);
     if (!ok) { console.error('sendInvoiceWhatsApp: Green API send failed'); return; }
+
+    // Send Sathvam contact card so customer can save our number with one tap
+    await gaSendContact(phone, '917092377092', 'Sathvam', 'Natural Oils', 'Sathvam Natural Products');
 
     await supabase.from('whatsapp_messages').insert({
       phone, contact_name: `${cust.name || ''} | ${order.order_no}`,

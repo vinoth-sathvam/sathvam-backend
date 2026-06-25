@@ -504,7 +504,7 @@ function startScheduler() {
             `*${couponCode}* — 10% off your next order!\n` +
             `_(Valid for 7 days — expires ${expiresAt})_\n\n` +
             `🛒 Shop now: *sathvam.in*\n` +
-            `❓ Help: +91 76187 73778`;
+            `❓ Help: +91 70923 77092`;
 
           if (phone) {
             await sendBirthdayWA(phone, waMsg);
@@ -668,7 +668,7 @@ function startScheduler() {
             `*${couponCode}* — 10% OFF your next order!\n` +
             `_(Valid until ${expiresAt})_\n\n` +
             `🛒 Shop now: https://sathvam.in\n` +
-            `📞 +91 76187 73778`;
+            `📞 +91 70923 77092`;
 
           await gaSendText(fullPhone, msg);
           await supabase.from('settings').upsert({ key: wbKey, value: { sent_at: new Date().toISOString(), coupon: couponCode } });
@@ -746,7 +746,61 @@ function startScheduler() {
     } catch (e) { console.error('[B2B-PAYMENT] Cron failed:', e.message); }
   });
 
-  console.log('Scheduler started — weekly report Mon 8 AM, daily reminders 9 AM / 1:30 PM / 7 PM IST, monitor agent 9 AM IST, low-stock 8 AM IST, birthday coupons 9 AM IST, health tips Sun 7 AM IST, win-back 10 AM IST, B2B payment reminder 9 AM IST');
+  // ── Scheduled WA Broadcast Processor — every 5 minutes ──────────────────
+  cron.schedule('*/5 * * * *', async () => {
+    try {
+      const { data } = await supabase.from('settings').select('value').eq('key', 'wa_schedules').maybeSingle();
+      const schedules = data?.value || [];
+      const now = new Date();
+      const pending = schedules.filter(s => s.status === 'pending' && new Date(s.scheduledAt) <= now);
+      if (!pending.length) return;
+
+      const { decrypt } = require('../config/crypto');
+      const { sendFile: gaSendFile } = require('../lib/greenapi');
+
+      for (const sched of pending) {
+        try {
+          // Fetch all non-opted-out phones
+          const { data: rawCustomers } = await supabase.from('customers').select('id,phone').not('phone', 'is', null).limit(5000);
+          const { data: optouts } = await supabase.from('settings').select('key').like('key', 'wa_optout_%');
+          const optoutSet = new Set((optouts || []).map(o => o.key));
+
+          const phones = (rawCustomers || []).map(c => {
+            const ph = (decrypt(c.phone) || '').replace(/\D/g, '');
+            return ph.length >= 10 && !optoutSet.has(`wa_optout_${ph}`) ? (ph.length === 10 ? '91' + ph : ph) : null;
+          }).filter(Boolean);
+
+          let sent = 0, failed = 0;
+          for (const phone of phones) {
+            try {
+              const ok = sched.imageUrl
+                ? await gaSendFile(phone, sched.imageUrl, 'sathvam.jpg', sched.message)
+                : await gaSendText(phone, sched.message);
+              if (ok) sent++; else failed++;
+            } catch (e) { failed++; }
+            await new Promise(r => setTimeout(r, 500));
+          }
+
+          // Mark as sent
+          const updatedSchedules = schedules.map(s =>
+            s.id === sched.id ? { ...s, status: 'sent', sentAt: new Date().toISOString(), sent, failed } : s
+          );
+          await supabase.from('settings').upsert({
+            key: 'wa_schedules',
+            value: updatedSchedules,
+            updated_at: new Date().toISOString(),
+          });
+          console.log(`[SCHEDULER] Scheduled broadcast "${sched.name}" sent: ${sent} OK, ${failed} failed`);
+        } catch (e) {
+          console.error('[SCHEDULER] Broadcast execution failed:', sched.id, e.message);
+        }
+      }
+    } catch (e) {
+      console.error('[SCHEDULER] Schedule processor error:', e.message);
+    }
+  });
+
+  console.log('Scheduler started — weekly report Mon 8 AM, daily reminders 9 AM / 1:30 PM / 7 PM IST, monitor agent 9 AM IST, low-stock 8 AM IST, birthday coupons 9 AM IST, health tips Sun 7 AM IST, win-back 10 AM IST, B2B payment reminder 9 AM IST, WA scheduled broadcasts every 5 min');
 }
 
 module.exports = { startScheduler, buildWeeklyReport, checkDailyTasks, sendReminders };

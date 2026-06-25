@@ -7,7 +7,7 @@ const { createInvoice, recordPayment } = require('../config/zoho');
 const { sendCustomerInvoice, sendInvoiceWhatsApp } = require('./webstoreOrders');
 const { auth, requireRole } = require('../middleware/auth');
 const { encrypt, hmac, encryptCustomer } = require('../config/crypto');
-const { sendText: gaSendText, sendFile: gaSendFile } = require('../lib/greenapi');
+const { sendText: gaSendText, sendFile: gaSendFile, sendToGroup } = require('../lib/greenapi');
 
 // ── Email transporter ─────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -107,6 +107,12 @@ async function sendWhatsAppAlert(order) {
       console.error('Admin WA alert failed:', e.message);
     }
   }
+
+  // Also send to factory group if configured
+  const groupId = process.env.WA_FACTORY_GROUP_ID;
+  if (groupId) {
+    try { await sendToGroup(groupId, text); } catch (e) { console.error('Group WA alert failed:', e.message); }
+  }
 }
 
 // ── WhatsApp order confirmation to customer ───────────────────────────────────
@@ -143,7 +149,7 @@ async function sendCustomerOrderWhatsApp(order) {
     `🚚 உங்கள் ஆர்டர் அனுப்பப்படும்போது தகவல் தெரிவிக்கப்படும்.\n` +
     `_We'll notify you once your order is dispatched._\n\n` +
     `❓ கேள்விகளா? | Questions?\n` +
-    `📞 *+91 76187 73778*\n` +
+    `📞 *+91 70923 77092*\n` +
     `🌐 sathvam.in`;
 
   try {
@@ -705,7 +711,7 @@ router.post('/place-cod', async (req, res) => {
           `━━━━━━━━━━━━━━━━━━━━━\n` +
           `🚚 நாங்கள் விரைவில் அனுப்புவோம்!\n` +
           `_We'll dispatch your order soon!_\n\n` +
-          `❓ கேள்விகளா? +91 76187 73778`;
+          `❓ கேள்விகளா? +91 70923 77092`;
         try { await gaSendText(custPhone, codMsg); } catch(e) {}
       }
     });

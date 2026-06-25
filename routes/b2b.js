@@ -702,7 +702,7 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
           <div style="font-size:10px;color:#6b7280;margin-top:4px;line-height:1.7">
             Plot No. 6, Anand Jothi Nagar, Near ABS Hospital, Thanthoni, Tamil Nadu 639005<br>
             GSTIN: 33ABFCS9387K1ZN | PAN: ABFCS9387K | CIN: U15400TN2021PTC142893 | TAN: CHES61531B<br>
-            Ph: +91 76187 73778 | Email: sales@sathvam.in | www.sathvam.in
+            Ph: +91 70923 77092 | Email: sales@sathvam.in | www.sathvam.in
           </div>
         </td>
         <td style="vertical-align:top;text-align:right">
@@ -806,7 +806,7 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
       <tr>
         <td style="width:60%;font-size:11px;color:#374151">
           <div><strong>Payment Options:</strong></div>
-          <div>UPI: sales@sathvam.in | Phone Pay / GPay: +91 76187 73778</div>
+          <div>UPI: sales@sathvam.in | Phone Pay / GPay: +91 70923 77092</div>
           <div>Bank Transfer: Contact us at sales@sathvam.in for bank details</div>
         </td>
         <td style="width:40%;text-align:right;vertical-align:bottom">
@@ -1331,7 +1331,7 @@ b2bOrders.post('/:id/email-logistics', auth, async (req, res) => {
           <div style="font-size:26px;font-weight:900;color:#0A4840;letter-spacing:1px;line-height:1">Sathvam</div>
         </div>
         <div style="font-size:13px;font-weight:700;color:#1f2937;margin-top:2px">Sathvam Oils and Spices Pvt Ltd</div>
-        <div style="font-size:10px;color:#6b7280;margin-top:4px;line-height:1.7">Plot No. 6, Anand Jothi Nagar, Near ABS Hospital, Thanthoni, Tamil Nadu 639005<br>GSTIN: 33ABFCS9387K1ZN | PAN: ABFCS9387K | CIN: U15400TN2021PTC142893 | TAN: CHES61531B<br>Ph: +91 76187 73778 | Email: sales@sathvam.in | www.sathvam.in</div>
+        <div style="font-size:10px;color:#6b7280;margin-top:4px;line-height:1.7">Plot No. 6, Anand Jothi Nagar, Near ABS Hospital, Thanthoni, Tamil Nadu 639005<br>GSTIN: 33ABFCS9387K1ZN | PAN: ABFCS9387K | CIN: U15400TN2021PTC142893 | TAN: CHES61531B<br>Ph: +91 70923 77092 | Email: sales@sathvam.in | www.sathvam.in</div>
       </td>
       <td style="vertical-align:top;text-align:right">
         <div style="font-size:20px;font-weight:900;color:#0A4840;letter-spacing:.5px">TAX INVOICE</div>
@@ -1401,7 +1401,7 @@ b2bOrders.post('/:id/email-logistics', auth, async (req, res) => {
     <table style="width:100%;margin-top:28px"><tr>
       <td style="width:60%;font-size:11px;color:#374151">
         <div><strong>Payment Options:</strong></div>
-        <div>UPI: sales@sathvam.in | Phone Pay / GPay: +91 76187 73778</div>
+        <div>UPI: sales@sathvam.in | Phone Pay / GPay: +91 70923 77092</div>
         <div>Bank Transfer: Contact us at sales@sathvam.in for bank details</div>
       </td>
       <td style="width:40%;text-align:right;vertical-align:bottom">
@@ -1431,7 +1431,7 @@ b2bOrders.post('/:id/email-logistics', auth, async (req, res) => {
             <tr style="background:#f9fafb"><td style="padding:9px 14px;font-size:13px;color:#6b7280">Invoice No</td><td style="padding:9px 14px;text-align:right;font-weight:700;font-size:13px">${liInvoiceNo||'—'}</td></tr>
             <tr><td style="padding:9px 14px;font-size:13px;color:#6b7280">Logistics Amount</td><td style="padding:9px 14px;text-align:right;font-weight:700;font-size:13px;color:#d97706">${fmtINR(liTotal)}</td></tr>
           </table>
-          <p style="margin:0;font-size:11px;color:#9ca3af">For queries, contact: sales@sathvam.in | +91 76187 73778</p>
+          <p style="margin:0;font-size:11px;color:#9ca3af">For queries, contact: sales@sathvam.in | +91 70923 77092</p>
         </div>
       </div>`,
       attachments: [{ filename: `Sathvam_Logistics_${order.order_no}_${liInvoiceNo||'INV'}.pdf`, content: pdfBuf, contentType: 'application/pdf' }],
