@@ -7,6 +7,7 @@ const { createInvoice, recordPayment } = require('../config/zoho');
 const { sendCustomerInvoice, sendInvoiceWhatsApp } = require('./webstoreOrders');
 const { auth, requireRole } = require('../middleware/auth');
 const { encrypt, hmac, encryptCustomer } = require('../config/crypto');
+const { insertLedger } = require('../utils/ledger');
 const { sendText: gaSendText, sendFile: gaSendFile, sendToGroup } = require('../lib/greenapi');
 
 // ── Email transporter ─────────────────────────────────────────────────────────
@@ -275,6 +276,23 @@ router.post('/verify', async (req, res) => {
         unit:         'pcs',
       })));
     }
+
+    // Auto-feed money_ledger — sales income
+    insertLedger({
+      txn_date:     o.date || new Date().toISOString().slice(0, 10),
+      direction:    'in',
+      amount:       parseFloat(o.total) || 0,
+      category:     'sales',
+      subcategory:  'webstore',
+      party:        rawCustomer.name || 'Webstore Customer',
+      party_type:   'customer',
+      payment_mode: 'online',
+      narration:    `Webstore order ${generatedOrderNo}`,
+      reference_no: razorpay_payment_id,
+      source_table: 'webstore_orders',
+      source_id:    dbId,
+      created_by:   'system',
+    }).catch(() => {});
 
     // Non-blocking: WhatsApp alert + Zoho invoice + customer confirmation + finished goods
     setImmediate(async () => {
@@ -684,6 +702,23 @@ router.post('/place-cod', async (req, res) => {
     }, { onConflict: 'id' });
 
     if (wsErr) return res.status(500).json({ error: 'Order save failed: ' + wsErr.message });
+
+    // Auto-feed money_ledger — COD sale (payment pending at delivery)
+    insertLedger({
+      txn_date:     order.date || new Date().toISOString().slice(0, 10),
+      direction:    'in',
+      amount:       parseFloat(order.total) || 0,
+      category:     'sales',
+      subcategory:  'webstore_cod',
+      party:        rawCustomer.name || 'COD Customer',
+      party_type:   'customer',
+      payment_mode: 'cash',
+      narration:    `COD order ${generatedOrderNo} — payment on delivery`,
+      reference_no: generatedOrderNo,
+      source_table: 'webstore_orders',
+      source_id:    dbId,
+      created_by:   'system',
+    }).catch(() => {});
 
     // Non-blocking notifications
     setImmediate(async () => {

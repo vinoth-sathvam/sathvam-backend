@@ -1,6 +1,7 @@
 const express = require('express');
 const supabase = require('../config/supabase');
 const { auth } = require('../middleware/auth');
+const { insertLedger } = require('../utils/ledger');
 const router = express.Router();
 
 router.get('/', auth, async (req, res) => {
@@ -15,6 +16,7 @@ router.get('/', auth, async (req, res) => {
 
 router.post('/', auth, async (req, res) => {
   const p = req.body;
+  const totalCost = (parseFloat(p.qty) || 0) * (parseFloat(p.pricePerKg) || 0);
   const { data, error } = await supabase.from('purchases').insert({
     date: p.date,
     material: p.material || '',
@@ -23,6 +25,25 @@ router.post('/', auth, async (req, res) => {
     notes: p.notes || '',
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
+
+  // Auto-feed money_ledger — procurement expense
+  if (totalCost > 0) {
+    insertLedger({
+      txn_date:     p.date || new Date().toISOString().slice(0, 10),
+      direction:    'out',
+      amount:       totalCost,
+      category:     'procurement',
+      subcategory:  p.material || 'raw_material',
+      party:        p.notes || '',
+      party_type:   'vendor',
+      payment_mode: 'bank_transfer',
+      narration:    `Purchase: ${p.material || 'material'} ${p.qty}kg @ ₹${p.pricePerKg}/kg`,
+      source_table: 'purchases',
+      source_id:    String(data.id),
+      created_by:   req.user?.name || req.user?.email || '',
+    }).catch(() => {});
+  }
+
   res.status(201).json(data);
 });
 

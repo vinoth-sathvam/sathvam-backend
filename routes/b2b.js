@@ -6,6 +6,7 @@ const supabase = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
 const { createInvoice, recordPayment, zoho } = require('../config/zoho');
 const { sendText: gaSendText } = require('../lib/greenapi');
+const { insertLedger } = require('../utils/ledger');
 
 const mailer = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -1785,6 +1786,29 @@ b2bOrders.post('/:id/payment', auth, requireRole('admin','manager','ceo'), async
 
   const { error } = await supabase.from('settings').upsert({ key: SETTINGS_KEY, value: allPayments });
   if (error) return res.status(400).json({ error: 'Payment update failed: ' + error.message });
+
+  // Auto-feed money_ledger — B2B payment received
+  setImmediate(async () => {
+    try {
+      const { data: ord } = await supabase.from('b2b_orders').select('order_no,buyer_name').eq('id', req.params.id).single();
+      const subcatMap = { advance: 'b2b_advance', remaining: 'b2b_balance', logistics: 'b2b_logistics' };
+      insertLedger({
+        txn_date:     date || new Date().toISOString().slice(0, 10),
+        direction:    type === 'logistics' ? 'out' : 'in',
+        amount:       parseFloat(amount) || 0,
+        category:     type === 'logistics' ? 'expense' : 'sales',
+        subcategory:  subcatMap[type] || 'b2b',
+        party:        ord?.buyer_name || 'B2B Customer',
+        party_type:   type === 'logistics' ? 'vendor' : 'customer',
+        payment_mode: 'bank_transfer',
+        narration:    `B2B ${type} payment — ${ord?.order_no || req.params.id}`,
+        reference_no: ref || '',
+        source_table: 'b2b_orders',
+        source_id:    req.params.id,
+        created_by:   req.user?.name || '',
+      }).catch(() => {});
+    } catch(_) {}
+  });
 
   res.json({ id: req.params.id, ...orderPayment });
   // Auto WhatsApp
