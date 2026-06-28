@@ -256,8 +256,10 @@ b2bOrders.put('/:id/stage', auth, requireRole('admin','manager','ceo'), async (r
     trackingUrl: carrierTrackingUrl,
   }));
 
-  // Non-blocking: Deduct finished goods + stock_ledger when shipped
-  if (stage === 'shipped') {
+  // Non-blocking: Deduct finished goods + stock_ledger when shipped (or any post-ship stage)
+  // Triggers on shipped, sailing, in_transit, delivered, etc. — checks for existing deductions to avoid duplicates
+  const POST_SHIP_STAGES = ['shipped','sailing','in_transit','arrived_at_port','customs_clearance','delivered'];
+  if (POST_SHIP_STAGES.includes(stage)) {
     setImmediate(async () => {
       try {
         const { data: orderItems } = await supabase.from('b2b_order_items').select('*').eq('order_id', req.params.id);
@@ -266,40 +268,44 @@ b2bOrders.put('/:id/stage', auth, requireRole('admin','manager','ceo'), async (r
         const orderNo = orderMeta?.order_no || req.params.id;
         const today   = new Date().toISOString().slice(0, 10);
 
-        // finished_goods OUT entries
-        const fgRows = orderItems.map(i => ({
-          product_name: i.product_name || 'Unknown',
-          category:     'oil',
-          unit:         'pcs',
-          qty:          parseFloat(i.shipped_qty != null ? i.shipped_qty : i.qty) || 1,
-          type:         'out',
-          date:         today,
-          notes:        `Auto-deducted on B2B ship — ${orderNo}`,
-          batch_ref:    orderNo,
-          created_by:   'system',
-          created_at:   new Date().toISOString(),
-          updated_at:   new Date().toISOString(),
-        }));
-        await supabase.from('finished_goods').insert(fgRows);
+        // Check if already deducted for this order (avoid duplicates)
+        const { data: existingFG } = await supabase.from('finished_goods').select('product_name,qty').eq('type','out').eq('batch_ref', orderNo);
+        const existingMap = {};
+        for (const r of (existingFG || [])) existingMap[r.product_name] = (existingMap[r.product_name]||0) + parseFloat(r.qty||0);
 
-        // stock_ledger OUT entries
-        const ledgerRows = orderItems
-          .filter(i => i.product_id)
-          .map(i => ({
-            product_id:   i.product_id,
-            product_name: i.product_name || 'Unknown',
-            date:         today,
-            type:         'out',
-            qty:          parseFloat(i.shipped_qty != null ? i.shipped_qty : i.qty) || 1,
-            unit:         i.unit || 'pcs',
-            rate:         parseFloat(i.unit_price) || 0,
-            total_value:  (parseFloat(i.shipped_qty != null ? i.shipped_qty : i.qty) || 1) * (parseFloat(i.unit_price) || 0),
-            channel:      'b2b',
-            reference:    orderNo,
-            notes:        `Shipped — B2B ${orderNo}`,
-          }));
+        // Only insert items that haven't been fully deducted yet
+        const fgRows = [];
+        const ledgerRows = [];
+        for (const i of orderItems) {
+          const pname = i.product_name || 'Unknown';
+          const needed = parseFloat(i.shipped_qty != null ? i.shipped_qty : i.qty) || 1;
+          const already = existingMap[pname] || 0;
+          const gap = needed - already;
+          if (gap <= 0) continue;
+
+          fgRows.push({
+            product_name: pname, category: 'other', unit: 'pcs',
+            qty: gap, type: 'out', date: today,
+            notes: `Auto-deducted on B2B ${stage} — ${orderNo}`,
+            batch_ref: orderNo, created_by: 'system',
+            created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+          });
+
+          if (i.product_id) {
+            ledgerRows.push({
+              product_id: i.product_id, product_name: pname,
+              date: today, type: 'out', qty: gap,
+              unit: i.unit || 'pcs', rate: parseFloat(i.unit_price) || 0,
+              total_value: gap * (parseFloat(i.unit_price) || 0),
+              channel: 'b2b', reference: orderNo,
+              notes: `${stage} — B2B ${orderNo}`,
+            });
+          }
+        }
+
+        if (fgRows.length) await supabase.from('finished_goods').insert(fgRows);
         if (ledgerRows.length) await supabase.from('stock_ledger').insert(ledgerRows);
-        console.log(`[B2B-STOCK] Deducted finished goods + stock_ledger for ${orderNo}`);
+        if (fgRows.length) console.log(`[B2B-STOCK] Deducted ${fgRows.length} items for ${orderNo} on ${stage}`);
       } catch (e) { console.error('[B2B-STOCK] Deduct error:', e.message); }
     });
   }

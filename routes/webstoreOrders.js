@@ -948,44 +948,48 @@ async function updateOrder(req, res) {
         } catch (e) { console.error('[AUTO] Pack deduct error:', e.message); }
       }
 
-      // ── SHIPPED: deduct finished goods + stock_ledger ──────────────────────
+      // ── SHIPPED: deduct finished goods + stock_ledger (skip if already deducted on payment) ──
       if (status === 'shipped') {
         try {
-          const rows = items.map(item => ({
-            product_name: item.productName || item.name || 'Unknown',
-            category:     'oil',
-            unit:         'pcs',
-            qty:          parseFloat(item.qty) || 1,
-            type:         'out',
-            date:         today,
-            notes:        `Auto-deducted on ship — Order ${orderNo}`,
-            batch_ref:    orderNo,
-            created_by:   'system',
-            created_at:   new Date().toISOString(),
-            updated_at:   new Date().toISOString(),
-          }));
-          await supabase.from('finished_goods').insert(rows);
+          // Check if already deducted (e.g. by payment verify)
+          const { data: existingFG } = await supabase.from('finished_goods').select('product_name,qty').eq('type','out').eq('batch_ref', orderNo);
+          const existingMap = {};
+          for (const r of (existingFG || [])) existingMap[r.product_name] = (existingMap[r.product_name]||0) + parseFloat(r.qty||0);
 
-          // Also decrement stock_ledger so StockProfitForecast stays accurate
-          const ledgerRows = items
-            .filter(item => item.product_id)
-            .map(item => ({
-              product_id:   item.product_id,
-              product_name: item.productName || item.name || 'Unknown',
-              date:         today,
-              type:         'out',
-              qty:          parseFloat(item.qty) || 1,
-              unit:         'pcs',
-              rate:         parseFloat(item.price) || 0,
-              total_value:  (parseFloat(item.qty) || 1) * (parseFloat(item.price) || 0),
-              channel:      'webstore',
-              reference:    orderNo,
-              notes:        `Shipped — Order ${orderNo}`,
-            }));
-          if (ledgerRows.length) {
-            await supabase.from('stock_ledger').insert(ledgerRows);
+          const fgRows = [];
+          const ledgerRows = [];
+          for (const item of items) {
+            const pname = item.productName || item.name || 'Unknown';
+            const needed = parseFloat(item.qty) || 1;
+            const already = existingMap[pname] || 0;
+            const gap = needed - already;
+            if (gap <= 0) continue;
+
+            fgRows.push({
+              product_name: pname, category: 'other', unit: 'pcs',
+              qty: gap, type: 'out', date: today,
+              notes: `Auto-deducted on ship — Order ${orderNo}`,
+              batch_ref: orderNo, created_by: 'system',
+              created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+            });
+
+            if (item.product_id) {
+              ledgerRows.push({
+                product_id: item.product_id,
+                product_name: pname, date: today, type: 'out',
+                qty: gap, unit: 'pcs',
+                rate: parseFloat(item.price) || 0,
+                total_value: gap * (parseFloat(item.price) || 0),
+                channel: 'webstore', reference: orderNo,
+                notes: `Shipped — Order ${orderNo}`,
+              });
+            }
           }
-          console.log(`[AUTO] Finished goods + stock_ledger deducted for order ${orderNo}`);
+
+          if (fgRows.length) await supabase.from('finished_goods').insert(fgRows);
+          if (ledgerRows.length) await supabase.from('stock_ledger').insert(ledgerRows);
+          if (fgRows.length) console.log(`[AUTO] Finished goods + stock_ledger deducted for order ${orderNo}`);
+          else console.log(`[AUTO] FG already deducted for ${orderNo}, skipped`);
         } catch (e) { console.error('[AUTO] FG deduct error:', e.message); }
       }
 
