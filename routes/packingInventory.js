@@ -237,10 +237,44 @@ router.get('/order-requirements', auth, async (req, res) => {
     const matMap = {};
     (materials||[]).forEach(m => { matMap[m.id] = m; });
 
-    // Get raw material stock
-    const { data: rawStock } = await supabase.from('raw_materials').select('*');
+    // Get raw material calculated stock (baseline + procured - consumed)
+    const { data: rawMats } = await supabase.from('raw_materials').select('*').eq('active', true);
+    const { data: rawLogs } = await supabase.from('raw_material_log').select('material_id, log_date, quantity_kg').order('log_date', { ascending: false });
+    const { data: procs } = await supabase.from('procurements').select('date, commodity_name, cleaned_qty, received_qty, status').in('status', ['received','stocked','cleaned']);
+    const { data: oilBatches } = await supabase.from('batches').select('date, oil_type, input_kg');
+    const { data: flourBatches } = await supabase.from('flour_batches').select('date, commodity, input_kg');
+
+    const lastAudit = {};
+    for (const log of (rawLogs || [])) { if (!lastAudit[log.material_id]) lastAudit[log.material_id] = log; }
+
+    const nameMatchesRaw = (src, matName) => {
+      const s = (src||'').toLowerCase().replace(/\s+seeds?$/,'').replace(/\s+\(.*\)/,'').trim();
+      const m = (matName||'').toLowerCase().replace(/\s+seeds?$/,'').replace(/\s+\(.*\)/,'').trim();
+      if (!s || !m) return false;
+      return s === m || s.startsWith(m) || m.startsWith(s);
+    };
+
     const rawMap = {};
-    (rawStock||[]).forEach(r => { rawMap[(r.commodity_name||r.name||'').toLowerCase()] = r; });
+    for (const mat of (rawMats||[])) {
+      const audit = lastAudit[mat.id];
+      const baselineQty = audit ? parseFloat(audit.quantity_kg) : 0;
+      const baselineDate = audit ? audit.log_date : '2000-01-01';
+      let procuredIn = 0;
+      for (const p of (procs||[])) {
+        if (p.date < baselineDate) continue;
+        if (!nameMatchesRaw(p.commodity_name, mat.name)) continue;
+        procuredIn += parseFloat(p.cleaned_qty || p.received_qty || 0);
+      }
+      let consumed = 0;
+      if (mat.category === 'oil_seed') {
+        for (const b of (oilBatches||[])) { if (b.date >= baselineDate && nameMatchesRaw(b.oil_type, mat.name)) consumed += parseFloat(b.input_kg||0); }
+      }
+      if (mat.category === 'millet' || mat.category === 'grain') {
+        for (const f of (flourBatches||[])) { if (f.date >= baselineDate && nameMatchesRaw(f.commodity, mat.name)) consumed += parseFloat(f.input_kg||0); }
+      }
+      const calcStock = Math.max(0, baselineQty + procuredIn - consumed);
+      rawMap[(mat.name||'').toLowerCase()] = { ...mat, current_stock: calcStock };
+    }
 
     // Aggregate requirements
     const packingNeeds = {}; // materialId → { material, needed, orders }
