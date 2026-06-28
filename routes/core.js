@@ -915,6 +915,23 @@ procurement.post('/mark-paid', auth, requireRole('admin','manager'), async (req,
         current_balance: Math.round(((parseFloat(bank.current_balance)||0) - totalAmt)*100)/100,
       }).eq('id', bank_account_id);
     }
+    // Auto-feed money_ledger — procurement payment
+    insertLedger({
+      txn_date:     txDate,
+      direction:    'out',
+      amount:       Math.round(totalAmt * 100) / 100,
+      category:     'procurement',
+      subcategory:  'raw_material',
+      party:        entries[0]?.supplier || '',
+      party_type:   'vendor',
+      payment_mode: payment_method || 'bank_transfer',
+      narration:    `Procurement payment — PO ${purchase_order_id}`,
+      reference_no: payment_ref || purchase_order_id,
+      source_table: 'procurements',
+      source_id:    purchase_order_id,
+      created_by:   req.user?.name || '',
+    }).catch(() => {});
+
     res.json({ ok: true, entries_updated: entries.length, total_amount: totalAmt });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -980,6 +997,25 @@ procurement.post('/add-logistics', auth, requireRole('admin','manager'), async (
         }).eq('id', bank_account_id);
       }
     }
+
+    // Auto-feed money_ledger — logistics cost
+    const txDate = paid_date || new Date().toISOString().slice(0, 10);
+    const suppliers = [...new Set(entries.map(e => e.supplier).filter(Boolean))].join(', ');
+    insertLedger({
+      txn_date:     txDate,
+      direction:    'out',
+      amount:       amount,
+      category:     'procurement',
+      subcategory:  'logistics',
+      party:        suppliers || '',
+      party_type:   'vendor',
+      payment_mode: 'bank_transfer',
+      narration:    `Procurement logistics — ${poIds.join(', ')}`,
+      reference_no: logistics_ref || '',
+      source_table: 'procurements',
+      source_id:    poIds.join(','),
+      created_by:   req.user?.name || '',
+    }).catch(() => {});
 
     res.json({ ok: true, purchase_order_ids: poIds, logistics_cost: amount, cost_per_kg: Math.round(costPerKg * 100) / 100, entries_updated: entries.length, total_qty: Math.round(totalQty * 100) / 100 });
   } catch(e) { res.status(500).json({ error: e.message }); }
