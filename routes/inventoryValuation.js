@@ -154,21 +154,22 @@ router.get('/', auth, async (req, res) => {
       fgBalance[row.product_name] += row.type === 'in' ? parseFloat(row.qty || 0) : -parseFloat(row.qty || 0);
     }
 
-    // Match product price by name
+    // Match product price by name — use ~40% of selling price as cost estimate
     const prodPriceMap = {};
     for (const p of (dbProds || [])) {
-      prodPriceMap[p.name?.toLowerCase()] = parseFloat(p.price || p.retail_price || p.website_price || 0);
+      const sellingPrice = parseFloat(p.price || p.retail_price || p.website_price || 0);
+      prodPriceMap[p.name?.toLowerCase()] = parseFloat((sellingPrice * 0.4).toFixed(2));
     }
 
     const fgItems = Object.entries(fgBalance)
       .filter(([, bal]) => bal > 0)
       .map(([name, balance]) => {
-        const unitPrice = prodPriceMap[name.toLowerCase()] || 0;
+        const costPrice = prodPriceMap[name.toLowerCase()] || 0;
         return {
           product_name: name,
           balance: Math.round(balance * 100) / 100,
-          unit_price: unitPrice,
-          value: parseFloat((balance * unitPrice).toFixed(2)),
+          unit_price: costPrice,
+          value: parseFloat((balance * costPrice).toFixed(2)),
         };
       })
       .sort((a, b) => b.value - a.value);
