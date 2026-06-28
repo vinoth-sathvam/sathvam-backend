@@ -8,6 +8,7 @@ const supabase = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
 const { createInvoice, recordPayment } = require('../config/zoho');
 const { sendText: gaSendText } = require('../lib/greenapi');
+const { insertLedger } = require('../utils/ledger');
 const { bustCache } = require('./public');
 
 const procUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -1426,6 +1427,23 @@ sales.post('/', auth, async (req, res) => {
     } catch (fgErr) {
       console.error('Finished goods POS deduction error:', fgErr.message);
     }
+
+    // Auto-feed money_ledger — POS sale income
+    insertLedger({
+      txn_date:     s.date || new Date().toISOString().slice(0, 10),
+      direction:    'in',
+      amount:       parseFloat(s.finalAmount || s.totalAmount) || 0,
+      category:     'sales',
+      subcategory:  'pos',
+      party:        s.customerName || 'Walk-in',
+      party_type:   'customer',
+      payment_mode: s.paymentMethod || 'cash',
+      narration:    `POS sale ${s.orderNo}`,
+      reference_no: s.orderNo || '',
+      source_table: 'sales',
+      source_id:    String(sale.id),
+      created_by:   req.user?.name || '',
+    }).catch(() => {});
   });
   res.status(201).json(sale);
 });

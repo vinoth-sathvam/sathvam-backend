@@ -2,6 +2,7 @@ const express  = require('express');
 const router   = express.Router();
 const { auth } = require('../middleware/auth');
 const supabase  = require('../config/supabase');
+const { insertLedger } = require('../utils/ledger');
 
 // Zoho helper — gracefully unavailable if env vars not set
 let zoho = null;
@@ -229,6 +230,24 @@ router.post('/receivables/:id/record-payment', auth, async (req, res) => {
       await supabase.from('bank_transactions').insert({ bank_account_id, date: date||new Date().toISOString().slice(0,10), type:'credit', amount:amt, description:`AR payment - ${id}`, reference: reference||'', category:'Receivable', created_by: req.user?.email||'' });
       await adjustBalance(bank_account_id, amt);
     }
+
+    // Auto-feed money_ledger — AR payment received
+    insertLedger({
+      txn_date:     date || new Date().toISOString().slice(0, 10),
+      direction:    'in',
+      amount:       amt,
+      category:     'sales',
+      subcategory:  id.startsWith('b2b-') ? 'b2b_ar' : 'webstore_ar',
+      party:        '',
+      party_type:   'customer',
+      payment_mode: mode || 'bank_transfer',
+      narration:    `AR payment — ${id}`,
+      reference_no: reference || '',
+      source_table: id.startsWith('b2b-') ? 'b2b_orders' : 'webstore_orders',
+      source_id:    id.replace(/^(b2b-|ws-)/, ''),
+      created_by:   req.user?.name || req.user?.email || '',
+    }).catch(() => {});
+
     res.json({ ok: true });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -359,6 +378,25 @@ router.post('/payables/:id/payments', auth, async (req, res) => {
       await adjustBalance(bank_account_id, -amt);
     }
     auditLog('vendor_bill', billId, 'payment', req.user?.email, { amount: amt, mode: mode||'bank_transfer' });
+
+    // Auto-feed money_ledger — vendor bill payment
+    const { data: billInfo } = await supabase.from('vendor_bills').select('vendor_name,bill_no,category').eq('id', billId).single();
+    insertLedger({
+      txn_date:     date || new Date().toISOString().slice(0, 10),
+      direction:    'out',
+      amount:       amt,
+      category:     'expense',
+      subcategory:  billInfo?.category || 'vendor_bill',
+      party:        billInfo?.vendor_name || '',
+      party_type:   'vendor',
+      payment_mode: mode || 'bank_transfer',
+      narration:    `Vendor bill payment — ${billInfo?.bill_no || billId}`,
+      reference_no: reference || '',
+      source_table: 'bill_payments',
+      source_id:    String(pmt.id),
+      created_by:   req.user?.name || req.user?.email || '',
+    }).catch(() => {});
+
     res.json({ ok: true, payment: pmt, bill_status: newStatus, paid_amount: newPaid });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -426,6 +464,24 @@ router.post('/bank/transactions', auth, async (req, res) => {
     const { data, error } = await supabase.from('bank_transactions').insert({ bank_account_id, date: date||new Date().toISOString().slice(0,10), type, amount:amt, description:description||'', reference:reference||'', category:category||'', created_by:req.user?.email||'' }).select().single();
     if (error) return res.status(400).json({ error: error.message });
     await adjustBalance(bank_account_id, type === 'credit' ? amt : -amt);
+
+    // Auto-feed money_ledger — bank transaction
+    insertLedger({
+      txn_date:     date || new Date().toISOString().slice(0, 10),
+      direction:    type === 'credit' ? 'in' : 'out',
+      amount:       amt,
+      category:     'bank_transfer',
+      subcategory:  category || '',
+      party:        description || '',
+      party_type:   'bank',
+      payment_mode: 'bank_transfer',
+      narration:    description || `Bank ${type}`,
+      reference_no: reference || '',
+      source_table: 'bank_transactions',
+      source_id:    String(data.id),
+      created_by:   req.user?.name || req.user?.email || '',
+    }).catch(() => {});
+
     res.status(201).json(data);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
