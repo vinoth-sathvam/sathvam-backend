@@ -1714,12 +1714,16 @@ b2bOrders.post('/:id/payment', auth, requireRole('admin','manager','ceo'), async
     orderPayment.advance_notes = orderPayment.advance_entries[orderPayment.advance_entries.length-1].notes;
     // only upgrade to advance_paid if not already fully_paid
     if (orderPayment.payment_status !== 'fully_paid') orderPayment.payment_status = 'advance_paid';
+    // Mark customer claim as verified
+    if (orderPayment.customer_advance_claim) orderPayment.customer_advance_claim.status = 'verified';
   } else if (type === 'remaining') {
     orderPayment.remaining_paid   = parseFloat(amount)||0;
     orderPayment.remaining_date   = date || new Date().toISOString().slice(0,10);
     orderPayment.remaining_ref    = ref || '';
     orderPayment.remaining_notes  = notes || '';
     orderPayment.payment_status   = 'fully_paid';
+    // Mark customer claim as verified
+    if (orderPayment.customer_balance_claim) orderPayment.customer_balance_claim.status = 'verified';
   } else {
     // logistics payment
     orderPayment.logistics_paid   = parseFloat(amount)||0;
