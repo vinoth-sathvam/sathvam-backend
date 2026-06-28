@@ -126,7 +126,7 @@ router.get('/b2b-requirements', auth, async (req, res) => {
   const { data: orders, error: oErr } = await supabase
     .from('b2b_orders')
     .select('id, order_no, buyer_name, stage, b2b_order_items(*)')
-    .in('stage', ['order_placed','confirmed','processing','in_production']);
+    .in('stage', ['buyer_request','order_placed','production','stuffing','customs_export']);
   if (oErr) return res.status(500).json({ error: oErr.message });
 
   // Get all packing materials
@@ -225,7 +225,7 @@ router.get('/order-requirements', auth, async (req, res) => {
     const { data: orders } = await supabase
       .from('b2b_orders')
       .select('id, order_no, buyer_name, stage, b2b_order_items(*)')
-      .in('stage', ['order_placed','confirmed','processing','in_production']);
+      .in('stage', ['buyer_request','order_placed','production','stuffing','customs_export']);
 
     // Get all products to map items to raw materials + packing
     const { data: prods } = await supabase.from('products').select('*').eq('active', true);
