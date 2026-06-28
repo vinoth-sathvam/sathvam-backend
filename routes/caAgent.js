@@ -1140,6 +1140,7 @@ router.get('/simple-dashboard', auth, roleGuard, async (req, res) => {
       employees, attendance,
       recurringExp,
       bills,
+      ledgerThis,
     ] = await Promise.all([
       supabase.from('bank_accounts').select('name,current_balance').eq('is_active', true),
       supabase.from('settings').select('value').eq('key','cash_in_factory').single(),
@@ -1154,6 +1155,8 @@ router.get('/simple-dashboard', auth, roleGuard, async (req, res) => {
       supabase.from('attendance').select('employee_id,status').gte('date',mStart).lte('date',mEnd),
       supabase.from('recurring_expenses').select('name,amount,due_day,category').eq('active',true),
       supabase.from('vendor_bills').select('amount,gst_amount,paid_amount,due_date,vendor_name').in('status',['unpaid','partial','overdue']).lte('due_date',next30),
+      // Money ledger — all entries for this month
+      supabase.from('money_ledger').select('amount,direction,category,subcategory').gte('txn_date',mStart).lte('txn_date',mEnd),
     ]);
 
     // ── Cash ──────────────────────────────────────────────────────────────────
@@ -1205,6 +1208,23 @@ router.get('/simple-dashboard', auth, roleGuard, async (req, res) => {
 
     const cashStatus = netPosition >= 50000 ? 'healthy' : netPosition >= 0 ? 'tight' : 'shortage';
 
+    // ── Money Ledger aggregation ──────────────────────────────────────────────
+    const ledgerRows = ledgerThis.data || [];
+    const ledgerIncome = {};
+    const ledgerExpense = {};
+    let ledgerIncomeTotal = 0, ledgerExpenseTotal = 0;
+    for (const row of ledgerRows) {
+      const amt = parseFloat(row.amount) || 0;
+      const key = row.subcategory || row.category || 'other';
+      if (row.direction === 'in') {
+        ledgerIncome[key] = r2((ledgerIncome[key]||0) + amt);
+        ledgerIncomeTotal += amt;
+      } else {
+        ledgerExpense[key] = r2((ledgerExpense[key]||0) + amt);
+        ledgerExpenseTotal += amt;
+      }
+    }
+
     res.json({
       month: mStr, as_of: today.toISOString().slice(0,10),
       cash: { bank: bankBalance, factory: cashInFactory, total: totalCash },
@@ -1220,6 +1240,13 @@ router.get('/simple-dashboard', auth, roleGuard, async (req, res) => {
         recurring: recurringTotal,
         bills_due_30: billsDue30,
         projected_total: projectedTotal,
+        procurement: r2(ledgerExpense['raw_material'] || ledgerExpense['procurement'] || 0),
+      },
+      ledger: {
+        income_total: r2(ledgerIncomeTotal),
+        income_by_source: ledgerIncome,
+        expense_total: r2(ledgerExpenseTotal),
+        expense_by_category: ledgerExpense,
       },
       bottom_line: { profit_loss: profitLoss, net_cash_after_expenses: netPosition, status: cashStatus },
     });

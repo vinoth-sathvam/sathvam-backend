@@ -53,13 +53,17 @@ router.get('/dashboard', auth, async (req, res) => {
     const ago30  = new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10);
     const week   = new Date(Date.now() + 7  * 864e5).toISOString().slice(0, 10);
 
-    const [bills, bankAccs, sales30, ws30, b2bPending, pmtSettings] = await Promise.all([
+    const [bills, bankAccs, sales30, ws30, b2bPending, pmtSettings, ledgerIn30, ledgerOut30] = await Promise.all([
       supabase.from('vendor_bills').select('amount,gst_amount,paid_amount,due_date,status').is('deleted_at', null),
       supabase.from('bank_accounts').select('name,current_balance,type').eq('is_active', true),
       supabase.from('sales').select('final_amount').eq('status','paid').gte('date', ago30),
       supabase.from('webstore_orders').select('total').in('status',['confirmed','shipped','delivered']).gte('date', ago30),
       supabase.from('b2b_orders').select('id,total_value,stage').not('stage','in','("delivered","cancelled")'),
       supabase.from('settings').select('value').eq('key', 'b2b_payments').single(),
+      // Money ledger — income last 30 days
+      supabase.from('money_ledger').select('amount,category,subcategory').eq('direction','in').gte('txn_date', ago30),
+      // Money ledger — expenses last 30 days
+      supabase.from('money_ledger').select('amount,category,subcategory').eq('direction','out').gte('txn_date', ago30),
     ]);
 
     const billList  = bills.data || [];
@@ -67,8 +71,14 @@ router.get('/dashboard', auth, async (req, res) => {
     const apOverdue = billList.filter(b => b.status !== 'paid' && b.due_date && b.due_date < today).reduce((s,b) => s + round2((b.amount||0)+(b.gst_amount||0)) - (b.paid_amount||0), 0);
     const apDueWeek = billList.filter(b => b.status !== 'paid' && b.due_date && b.due_date >= today && b.due_date <= week).length;
     const cashBal   = (bankAccs.data || []).reduce((s,a) => s + (a.current_balance || 0), 0);
-    const rev30     = (sales30.data||[]).reduce((s,x)=>s+(x.final_amount||0),0)
-                    + (ws30.data||[]).reduce((s,x)=>s+(x.total||0),0);
+
+    // Revenue 30d — POS + Webstore + B2B from source tables
+    const posSales30 = (sales30.data||[]).reduce((s,x)=>s+(x.final_amount||0),0);
+    const wsSales30  = (ws30.data||[]).reduce((s,x)=>s+(x.total||0),0);
+    // B2B revenue from money_ledger (direction=in, category=sales, subcategory starts with b2b)
+    const b2bLedger30 = (ledgerIn30.data||[]).filter(x => x.subcategory && x.subcategory.startsWith('b2b')).reduce((s,x)=>s+parseFloat(x.amount||0),0);
+    const rev30 = posSales30 + wsSales30 + b2bLedger30;
+
     const b2bPayments = pmtSettings?.data?.value || {};
     const arTotal   = (b2bPending.data||[]).reduce((s,x)=>{
       const pmt = b2bPayments[x.id] || {};
@@ -76,7 +86,34 @@ router.get('/dashboard', auth, async (req, res) => {
       return s + Math.max(0, (x.total_value||0) - paid);
     }, 0);
 
-    res.json({ ap_total:round2(apTotal), ap_overdue:round2(apOverdue), ap_due_this_week:apDueWeek, cash_balance:round2(cashBal), ar_total:round2(arTotal), revenue_30d:round2(rev30), bank_accounts: bankAccs.data||[] });
+    // Money ledger aggregation — income by subcategory
+    const incomeBySource = {};
+    for (const r of (ledgerIn30.data||[])) {
+      const key = r.subcategory || r.category || 'other';
+      incomeBySource[key] = round2((incomeBySource[key]||0) + parseFloat(r.amount||0));
+    }
+    const totalIncome30 = round2((ledgerIn30.data||[]).reduce((s,x)=>s+parseFloat(x.amount||0),0));
+
+    // Money ledger aggregation — expenses by category
+    const expenseByCategory = {};
+    for (const r of (ledgerOut30.data||[])) {
+      const key = r.subcategory || r.category || 'other';
+      expenseByCategory[key] = round2((expenseByCategory[key]||0) + parseFloat(r.amount||0));
+    }
+    const totalExpense30 = round2((ledgerOut30.data||[]).reduce((s,x)=>s+parseFloat(x.amount||0),0));
+
+    res.json({
+      ap_total:round2(apTotal), ap_overdue:round2(apOverdue), ap_due_this_week:apDueWeek,
+      cash_balance:round2(cashBal), ar_total:round2(arTotal),
+      revenue_30d:round2(rev30),
+      revenue_30d_breakdown: { pos: round2(posSales30), webstore: round2(wsSales30), b2b: round2(b2bLedger30) },
+      // Money ledger — unified income & expense view
+      income_30d: totalIncome30,
+      income_30d_by_source: incomeBySource,
+      expense_30d: totalExpense30,
+      expense_30d_by_category: expenseByCategory,
+      bank_accounts: bankAccs.data||[],
+    });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -840,7 +877,7 @@ router.get('/pnl', auth, async (req, res) => {
     const start = `${year}-${String(month).padStart(2,'0')}-01`;
     const end   = new Date(year, month, 0).toISOString().slice(0,10);
 
-    const [salesR, wsR, b2bR, procR, billsR, expR, payrollR] = await Promise.all([
+    const [salesR, wsR, b2bR, procR, billsR, expR, payrollR, ledgerR] = await Promise.all([
       supabase.from('sales').select('final_amount,total_amount,items').eq('status','paid').gte('date',start).lte('date',end),
       supabase.from('webstore_orders').select('subtotal,gst,total').in('status',['confirmed','shipped','delivered']).gte('date',start).lte('date',end),
       supabase.from('b2b_orders').select('total_value').in('stage',['shipped','delivered','invoice_sent','invoice_paid']).gte('created_at',start+'T00:00:00').lte('created_at',end+'T23:59:59'),
@@ -848,6 +885,8 @@ router.get('/pnl', auth, async (req, res) => {
       supabase.from('vendor_bills').select('amount,gst_amount,category').is('deleted_at',null).neq('status','cancelled').gte('bill_date',start).lte('bill_date',end),
       supabase.from('expenses').select('amount,category').gte('date',start).lte('date',end),
       supabase.from('payroll_records').select('net_salary').gte('month',start).lte('month',end),
+      // Money ledger for the period
+      supabase.from('money_ledger').select('amount,direction,category,subcategory').gte('txn_date',start).lte('txn_date',end),
     ]);
 
     const salesRev  = (salesR.data||[]).reduce((s,x)=>s+(parseFloat(x.final_amount||x.total_amount)||0),0);
@@ -855,7 +894,10 @@ router.get('/pnl', auth, async (req, res) => {
     const b2bRev    = (b2bR.data||[]).reduce((s,x)=>s+(parseFloat(x.total_value)||0),0);
     const totalRev  = round2(salesRev + wsRev + b2bRev);
 
-    const procCost  = (procR.data||[]).reduce((s,x)=>s+(parseFloat(x.ordered_qty||0)*parseFloat(x.ordered_price_per_kg||0)),0);
+    const procCostFromTable = (procR.data||[]).reduce((s,x)=>s+(parseFloat(x.ordered_qty||0)*parseFloat(x.ordered_price_per_kg||0)),0);
+    // Also include purchases from money_ledger (category=procurement)
+    const procCostFromLedger = (ledgerR.data||[]).filter(r => r.direction==='out' && r.category==='procurement').reduce((s,x)=>s+parseFloat(x.amount||0),0);
+    const procCost = Math.max(procCostFromTable, procCostFromLedger); // Use whichever is higher to avoid double-counting
     const grossProfit = round2(totalRev - procCost);
 
     // Operating expenses by category
@@ -867,6 +909,16 @@ router.get('/pnl', auth, async (req, res) => {
     const totalOpex = round2(Object.values(opexMap).reduce((s,v)=>s+v,0));
     const netProfit = round2(grossProfit - totalOpex);
 
+    // Money ledger income/expense summary
+    const ledgerIncome = {}, ledgerExpense = {};
+    let ledgerIncomeTotal = 0, ledgerExpenseTotal = 0;
+    for (const r of (ledgerR.data||[])) {
+      const amt = parseFloat(r.amount) || 0;
+      const key = r.subcategory || r.category || 'other';
+      if (r.direction === 'in') { ledgerIncome[key] = round2((ledgerIncome[key]||0)+amt); ledgerIncomeTotal += amt; }
+      else { ledgerExpense[key] = round2((ledgerExpense[key]||0)+amt); ledgerExpenseTotal += amt; }
+    }
+
     res.json({
       period: { year, month, start, end },
       revenue: { retail_sales: round2(salesRev), webstore: round2(wsRev), b2b: round2(b2bRev), total: totalRev },
@@ -877,6 +929,12 @@ router.get('/pnl', auth, async (req, res) => {
       total_opex: totalOpex,
       net_profit: netProfit,
       net_margin_pct: totalRev > 0 ? round2((netProfit/totalRev)*100) : 0,
+      ledger: {
+        income_total: round2(ledgerIncomeTotal),
+        income_by_source: ledgerIncome,
+        expense_total: round2(ledgerExpenseTotal),
+        expense_by_category: ledgerExpense,
+      },
     });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
