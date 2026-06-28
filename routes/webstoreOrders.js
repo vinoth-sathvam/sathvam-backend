@@ -928,7 +928,22 @@ async function updateOrder(req, res) {
                 }).eq('id', matId);
               }
             }
-            console.log(`[AUTO] Packing materials deducted for order ${orderNo}`);
+            // Deduct carton boxes (qty / perCarton)
+            for (const item of items) {
+              const prod = prodMap[item.product_id];
+              const qty = parseInt(item.qty) || 1;
+              const links = prod?.packing_links || {};
+              if (links.cartonId) {
+                const perCarton = parseInt(links.perCarton) || 12;
+                const cartonQty = Math.ceil(qty / perCarton);
+                const { data: mat } = await supabase.from('packing_materials').select('id,current_stock').eq('id', links.cartonId).single();
+                if (mat) {
+                  const newStock = Math.max(0, (parseFloat(mat.current_stock) || 0) - cartonQty);
+                  await supabase.from('packing_materials').update({ current_stock: newStock, updated_at: new Date().toISOString() }).eq('id', links.cartonId);
+                }
+              }
+            }
+            console.log(`[AUTO] Packing materials + cartons deducted for order ${orderNo}`);
           }
         } catch (e) { console.error('[AUTO] Pack deduct error:', e.message); }
       }

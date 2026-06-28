@@ -303,6 +303,56 @@ b2bOrders.put('/:id/stage', auth, requireRole('admin','manager','ceo'), async (r
     });
   }
 
+  // Non-blocking: Deduct packing materials (covers, bottles, labels, cartons) when stuffing
+  if (stage === 'stuffing') {
+    setImmediate(async () => {
+      try {
+        const { data: orderItems } = await supabase.from('b2b_order_items').select('*').eq('order_id', req.params.id);
+        const { data: orderMeta }  = await supabase.from('b2b_orders').select('order_no').eq('id', req.params.id).single();
+        if (!orderItems?.length) return;
+        const orderNo = orderMeta?.order_no || req.params.id;
+        const productIds = orderItems.map(i => i.product_id).filter(Boolean);
+        if (!productIds.length) return;
+
+        const { data: prods } = await supabase.from('products').select('id,name,packing_links,pack_size,pack_unit').in('id', productIds);
+        const prodMap = {};
+        for (const p of (prods || [])) prodMap[p.id] = p;
+
+        for (const item of orderItems) {
+          const prod = prodMap[item.product_id];
+          const qty = parseInt(item.shipped_qty != null ? item.shipped_qty : item.qty) || 1;
+          const links = prod?.packing_links || {};
+          const matIds = [
+            ...(Array.isArray(links.materialIds) ? links.materialIds : [links.coverId, links.bottleId].filter(Boolean)),
+            links.labelId,
+          ].filter(Boolean);
+
+          // Deduct covers, bottles, labels (1:1 per unit)
+          for (const matId of matIds) {
+            const { data: mat } = await supabase.from('packing_materials').select('id,current_stock').eq('id', matId).single();
+            if (!mat) continue;
+            const newStock = Math.max(0, (parseFloat(mat.current_stock) || 0) - qty);
+            await supabase.from('packing_materials').update({ current_stock: newStock, updated_at: new Date().toISOString() }).eq('id', matId);
+            await supabase.from('packing_audit_log').insert({ material_id: matId, audit_date: new Date().toISOString().slice(0,10), quantity: newStock, previous_qty: mat.current_stock, audited_by: 'auto-deduct', notes: `B2B stuffing — ${orderNo} — ${item.product_name} × ${qty}` });
+          }
+
+          // Deduct carton boxes (qty / perCarton)
+          if (links.cartonId) {
+            const perCarton = parseInt(links.perCarton) || 12;
+            const cartonQty = Math.ceil(qty / perCarton);
+            const { data: mat } = await supabase.from('packing_materials').select('id,current_stock').eq('id', links.cartonId).single();
+            if (mat) {
+              const newStock = Math.max(0, (parseFloat(mat.current_stock) || 0) - cartonQty);
+              await supabase.from('packing_materials').update({ current_stock: newStock, updated_at: new Date().toISOString() }).eq('id', links.cartonId);
+              await supabase.from('packing_audit_log').insert({ material_id: links.cartonId, audit_date: new Date().toISOString().slice(0,10), quantity: newStock, previous_qty: mat.current_stock, audited_by: 'auto-deduct', notes: `B2B carton — ${orderNo} — ${item.product_name} × ${qty} (${cartonQty} cartons @ ${perCarton}/ctn)` });
+            }
+          }
+        }
+        console.log(`[B2B-PACK] Packing materials + cartons deducted for ${orderNo}`);
+      } catch (e) { console.error('[B2B-PACK] Deduct error:', e.message); }
+    });
+  }
+
   // Non-blocking: Auto WhatsApp to buyer on stage change
   setImmediate(async () => {
     try {
