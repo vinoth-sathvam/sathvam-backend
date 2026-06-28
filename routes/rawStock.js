@@ -21,6 +21,22 @@ const DEFAULT_MATERIALS = [
   { name:'Sorghum Millet',   category:'millet', unit:'kg' },
 ];
 
+// ── Category auto-detection from commodity name ─────────────────────────────
+const CATEGORY_KEYWORDS = {
+  oil_seed: ['groundnut','sesame','coconut','copra','castor','neem','mustard','sunflower','flax','safflower','oil seed','oilseed'],
+  millet:   ['millet','ragi','kambu','thinai','varagu','kuthiraivali','samai','sorghum','bajra','jowar'],
+  spice:    ['pepper','turmeric','chilli','chili','coriander','cumin','fenugreek','cardamom','cinnamon','clove','ginger','garlic','methi','kasthuri','masala','powder','spice','ajwain','fennel','star anise','nutmeg','saffron','asafoetida','hing'],
+  grain:    ['rice','wheat','dal','dhal','lentil','gram','urad','moong','toor','chana','rajma','chickpea','barley','oats','maize','corn','flour','atta','besan','rawa','semolina','poha','jaggery','sugar'],
+};
+
+function guessCategory(name) {
+  const n = (name || '').toLowerCase();
+  for (const [cat, words] of Object.entries(CATEGORY_KEYWORDS)) {
+    if (words.some(w => n.includes(w))) return cat;
+  }
+  return 'other';
+}
+
 // ── Name-based fuzzy matching ─────────────────────────────────────────────────
 // Checks whether a source string (commodity_name / oil_type / commodity) matches
 // a raw_material name. Uses starts-with in either direction for partial names.
@@ -31,8 +47,59 @@ function nameMatches(source, materialName) {
   if (s === m) return true;
   // "Groundnut" matches "Groundnut Seeds"; "Sesame" matches "Sesame Seeds"
   if (m.startsWith(s) || s.startsWith(m)) return true;
-  // "Groundnut Seeds" procurement matches "Groundnut Seeds" material
+  // Word overlap: "Kasthuri Methi Powder" matches "Kasthuri Methi"
+  const sWords = s.split(/\s+/).filter(w => w.length > 2);
+  const mWords = m.split(/\s+/).filter(w => w.length > 2);
+  if (sWords.length >= 2 && mWords.length >= 2) {
+    const overlap = sWords.filter(w => mWords.some(mw => mw.includes(w) || w.includes(mw)));
+    if (overlap.length >= 2) return true;
+  }
   return false;
+}
+
+// ── Auto-sync: discover new commodities from procurements ────────────────────
+async function syncFromProcurements() {
+  const { data: existing } = await supabase.from('raw_materials').select('name').eq('active', true);
+  const existingNames = (existing || []).map(e => e.name.toLowerCase().trim());
+
+  const { data: procs } = await supabase
+    .from('procurements')
+    .select('commodity_name')
+    .in('status', ['received', 'stocked', 'cleaned']);
+
+  // Get unique commodity names from procurements
+  const seen = new Set();
+  const newMaterials = [];
+  for (const p of (procs || [])) {
+    const name = (p.commodity_name || '').trim();
+    if (!name || seen.has(name.toLowerCase())) continue;
+    seen.add(name.toLowerCase());
+
+    // Check if any existing material already matches this name
+    const alreadyExists = existingNames.some(en => {
+      if (en === name.toLowerCase()) return true;
+      if (en.startsWith(name.toLowerCase()) || name.toLowerCase().startsWith(en)) return true;
+      return false;
+    });
+
+    if (!alreadyExists) {
+      newMaterials.push({
+        name,
+        category: guessCategory(name),
+        unit: 'kg',
+        current_stock: 0,
+        min_stock: 0,
+        notes: 'Auto-added from procurement records',
+        active: true,
+        updated_at: new Date().toISOString(),
+      });
+    }
+  }
+
+  if (newMaterials.length > 0) {
+    await supabase.from('raw_materials').insert(newMaterials);
+  }
+  return newMaterials.length;
 }
 
 // GET all materials
@@ -47,11 +114,14 @@ router.get('/', auth, async (req, res) => {
   res.json(data || []);
 });
 
-// GET calculated stock — auto-computed from procurement, oil batches, flour batches
+// GET calculated stock — auto-computed from procurement, oil batches, flour batches, spice batches
 // For each material:
 //   calculated = last_physical_count + procurement_since_audit - consumption_since_audit
 router.get('/calculated', auth, async (req, res) => {
   try {
+    // Auto-sync new commodities from procurements before calculating
+    await syncFromProcurements();
+
     // 1. All active raw materials
     const { data: materials } = await supabase
       .from('raw_materials').select('*').eq('active', true)
@@ -80,6 +150,14 @@ router.get('/calculated', auth, async (req, res) => {
     // 5. All flour batches
     const { data: flourBatches } = await supabase
       .from('flour_batches').select('date, commodity, input_kg');
+
+    // 6. All spice powder batches (ingredients consumed)
+    let spiceBatches = [];
+    try {
+      const { data: sb } = await supabase
+        .from('spice_powder_batches').select('date, ingredients');
+      spiceBatches = sb || [];
+    } catch(e) { /* table may not exist */ }
 
     const result = (materials || []).map(mat => {
       const audit = lastAudit[mat.id];
@@ -114,8 +192,8 @@ router.get('/calculated', auth, async (req, res) => {
         }
       }
 
-      // Sum flour batch consumption OUT since last audit (only for millet category)
-      if (mat.category === 'millet') {
+      // Sum flour batch consumption OUT since last audit (for millet and grain categories)
+      if (mat.category === 'millet' || mat.category === 'grain') {
         for (const f of (flourBatches || [])) {
           if (f.date < baselineDate) continue;
           if (!nameMatches(f.commodity, mat.name)) continue;
@@ -123,6 +201,23 @@ router.get('/calculated', auth, async (req, res) => {
           if (qty > 0) {
             batchConsumed += qty;
             batchBreakdown.push({ date: f.date, qty, source: `${f.commodity} cleaning batch` });
+          }
+        }
+      }
+
+      // Sum spice batch consumption OUT since last audit (for spice category)
+      if (mat.category === 'spice' || mat.category === 'other') {
+        for (const sb of spiceBatches) {
+          if (sb.date < baselineDate) continue;
+          const ingredients = Array.isArray(sb.ingredients) ? sb.ingredients : [];
+          for (const ing of ingredients) {
+            const ingName = ing.name || ing.commodity || '';
+            if (!nameMatches(ingName, mat.name)) continue;
+            const qty = parseFloat(ing.qty || ing.amount_kg || 0);
+            if (qty > 0) {
+              batchConsumed += qty;
+              batchBreakdown.push({ date: sb.date, qty, source: `Spice batch: ${ingName}` });
+            }
           }
         }
       }
@@ -215,17 +310,38 @@ router.delete('/:id', auth, requireRole('admin'), async (req, res) => {
   res.json({ ok: true });
 });
 
-// POST seed defaults
+// POST seed defaults + auto-discover from procurements
 router.post('/seed', auth, requireRole('admin'), async (req, res) => {
   const { data: existing } = await supabase.from('raw_materials').select('name');
   const existingNames = new Set((existing||[]).map(e => e.name));
+
+  // 1. Seed hardcoded defaults
   const toInsert = DEFAULT_MATERIALS
     .filter(m => !existingNames.has(m.name))
     .map(m => ({ ...m, current_stock:0, min_stock:0, notes:'', active:true, updated_at:new Date().toISOString() }));
-  if (toInsert.length === 0) return res.json({ seeded: 0, message:'Already seeded' });
-  const { data, error } = await supabase.from('raw_materials').insert(toInsert).select();
-  if (error) return res.status(400).json({ error: error.message });
-  res.json({ seeded: (data||[]).length });
+
+  let seeded = 0;
+  if (toInsert.length > 0) {
+    const { data } = await supabase.from('raw_materials').insert(toInsert).select();
+    seeded += (data||[]).length;
+  }
+
+  // 2. Auto-discover from procurements
+  const synced = await syncFromProcurements();
+  seeded += synced;
+
+  if (seeded === 0) return res.json({ seeded: 0, message: 'All materials already exist' });
+  res.json({ seeded, message: `Added ${seeded} material${seeded>1?'s':''}` });
+});
+
+// POST sync from procurements (manual trigger)
+router.post('/sync', auth, requireRole('admin','manager'), async (req, res) => {
+  try {
+    const count = await syncFromProcurements();
+    res.json({ synced: count, message: count > 0 ? `Added ${count} new material${count>1?'s':''}` : 'All procurement commodities already tracked' });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 module.exports = router;

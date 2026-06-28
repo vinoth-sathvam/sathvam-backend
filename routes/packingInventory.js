@@ -25,7 +25,7 @@ router.get('/', auth, async (req, res) => {
 
 // ── POST create material ───────────────────────────────────────────────────────
 router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
-  const { name, category, product_name, size, cover_size, spec, unit, current_stock, min_stock, reorder_qty, unit_price, supplier, notes } = req.body;
+  const { name, category, product_name, size, cover_size, spec, unit, current_stock, min_stock, reorder_qty, unit_price, supplier, notes, compatible_products } = req.body;
   if (!name || !category) return res.status(400).json({ error: 'name and category required' });
   // spec supersedes old size/cover_size fields
   const resolvedSize = spec || size || '';
@@ -37,6 +37,7 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
     unit_price: parseFloat(unit_price)||0, supplier: supplier||'',
     notes: notes||'', active: true, updated_at: new Date().toISOString(),
   };
+  if (Array.isArray(compatible_products)) insertObj.compatible_products = compatible_products;
   // include spec column only if it exists (won't cause error if it doesn't)
   if (spec !== undefined) insertObj.spec = spec;
   const { data, error } = await supabase.from('packing_materials').insert(insertObj).select().single();
@@ -47,7 +48,7 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
 // ── PUT update material ────────────────────────────────────────────────────────
 router.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const u = { updated_at: new Date().toISOString() };
-  const fields = ['name','category','product_name','size','cover_size','unit','current_stock','min_stock','reorder_qty','unit_price','avg_cost','supplier','notes','active','pkg_type_key'];
+  const fields = ['name','category','product_name','size','cover_size','unit','current_stock','min_stock','reorder_qty','unit_price','avg_cost','supplier','notes','active','pkg_type_key','compatible_products'];
   fields.forEach(f => { if (req.body[f] != null) u[f] = req.body[f]; });
   // 'spec' is a frontend alias for 'size' — map it
   if (req.body.spec != null) u.size = req.body.spec;
@@ -174,6 +175,178 @@ router.get('/b2b-requirements', auth, async (req, res) => {
   })).sort((a,b) => b.shortfall - a.shortfall);
 
   res.json({ requirements: result, order_count: (orders||[]).length });
+});
+
+// ── POST deduct — auto-deduct packing materials on sale/dispatch ─────────────
+router.post('/deduct', auth, async (req, res) => {
+  const { items, reference } = req.body;
+  // items: [{ materialId, qty }]
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items array required' });
+  const today = new Date().toISOString().slice(0,10);
+  const results = [];
+  const errors = [];
+
+  for (const item of items) {
+    if (!item.materialId || !item.qty || item.qty <= 0) continue;
+    const qty = parseInt(item.qty);
+
+    // Fetch current stock
+    const { data: cur } = await supabase.from('packing_materials')
+      .select('id, name, current_stock')
+      .eq('id', item.materialId).single();
+    if (!cur) { errors.push({ materialId: item.materialId, error: 'not found' }); continue; }
+
+    const prevQty = cur.current_stock || 0;
+    const newQty = Math.max(0, prevQty - qty);
+
+    // Log audit entry
+    await supabase.from('packing_audit_log').insert({
+      material_id: item.materialId, audit_date: today, quantity: newQty,
+      previous_qty: prevQty, audited_by: 'auto-deduct',
+      notes: `Auto-deducted ${qty} pcs on dispatch — ${reference || ''}`,
+    });
+
+    // Update stock
+    const { data, error } = await supabase.from('packing_materials').update({
+      current_stock: newQty, updated_at: new Date().toISOString(),
+    }).eq('id', item.materialId).select().single();
+
+    if (error) { errors.push({ materialId: item.materialId, error: error.message }); }
+    else { results.push({ id: data.id, name: data.name, prev: prevQty, deducted: qty, new: newQty }); }
+  }
+
+  res.json({ success: true, deducted: results, errors, reference });
+});
+
+// ── GET order-requirements — raw materials + packing for pending B2B orders ──
+router.get('/order-requirements', auth, async (req, res) => {
+  try {
+    // Get active B2B orders
+    const { data: orders } = await supabase
+      .from('b2b_orders')
+      .select('id, order_no, buyer_name, stage, b2b_order_items(*)')
+      .in('stage', ['order_placed','confirmed','processing','in_production']);
+
+    // Get all products to map items to raw materials + packing
+    const { data: prods } = await supabase.from('products').select('*').eq('active', true);
+    const prodMap = {};
+    (prods||[]).forEach(p => { prodMap[p.name] = p; prodMap[(p.name||'').toLowerCase()] = p; });
+
+    // Get packing materials
+    const { data: materials } = await supabase.from('packing_materials').select('*').eq('active', true);
+    const matMap = {};
+    (materials||[]).forEach(m => { matMap[m.id] = m; });
+
+    // Get raw material stock
+    const { data: rawStock } = await supabase.from('raw_materials').select('*');
+    const rawMap = {};
+    (rawStock||[]).forEach(r => { rawMap[(r.commodity_name||r.name||'').toLowerCase()] = r; });
+
+    // Aggregate requirements
+    const packingNeeds = {}; // materialId → { material, needed, orders }
+    const rawNeeds = {};     // commodityName → { commodity, neededKg, orders }
+
+    for (const order of (orders||[])) {
+      for (const item of (order.b2b_order_items||[])) {
+        const pname = (item.product_name||'').trim();
+        const qty = parseInt(item.qty) || 0;
+        if (!pname || qty === 0) continue;
+
+        // Find product
+        const prod = prodMap[pname] || prodMap[pname.toLowerCase()];
+
+        // Packing material needs from product packingLinks
+        if (prod) {
+          const links = prod.packing_links || {};
+          const materialIds = Array.isArray(links.materialIds) ? links.materialIds : (links.coverId ? [links.coverId] : links.bottleId ? [links.bottleId] : []);
+          if (links.labelId) materialIds.push(links.labelId);
+
+          for (const mid of materialIds) {
+            const mat = matMap[mid];
+            if (!mat) continue;
+            if (!packingNeeds[mid]) packingNeeds[mid] = { material: mat, needed: 0, orders: [] };
+            packingNeeds[mid].needed += qty;
+            packingNeeds[mid].orders.push({ order_no: order.order_no, buyer: order.buyer_name, qty });
+          }
+
+          // Raw material needs — compute kg needed per product
+          const ps = parseFloat(prod.pack_size) || 0;
+          const pu = (prod.pack_unit||'GM').toUpperCase();
+          const kgPerUnit = pu==='KG'?ps : pu==='GM'?ps/1000 : pu==='L'?ps*0.92 : pu==='ML'?ps/1000*0.92 : ps/1000;
+          const totalKg = kgPerUnit * qty;
+
+          // Match to commodity
+          const cat = (prod.cat||'').toLowerCase();
+          let commodityName = '';
+          if (cat === 'oil') {
+            // Extract oil type from product name
+            const oilMatch = pname.match(/(groundnut|sesame|coconut|castor|mustard|neem|deepam)/i);
+            commodityName = oilMatch ? oilMatch[1].toLowerCase() + ' seeds' : prod.cat;
+          } else {
+            commodityName = pname.replace(/\s*\d+(?:\.\d+)?(?:ml|ML|L|g|gm|GM|kg|KG)\s*/gi,'').trim().toLowerCase();
+          }
+
+          if (commodityName && totalKg > 0) {
+            if (!rawNeeds[commodityName]) {
+              const raw = rawMap[commodityName] || {};
+              rawNeeds[commodityName] = { name: commodityName, currentStock: raw.current_stock||0, unit: 'kg', neededKg: 0, orders: [] };
+            }
+            rawNeeds[commodityName].neededKg += Math.round(totalKg * 100) / 100;
+            rawNeeds[commodityName].orders.push({ order_no: order.order_no, buyer: order.buyer_name, qty, kgNeeded: Math.round(totalKg * 100) / 100 });
+          }
+        }
+
+        // Also match packing by product name + size (fallback when no packingLinks)
+        const sizeMatch = pname.match(/(\d+(?:\.\d+)?(?:ml|ML|L|g|gm|GM|kg|KG))/i);
+        const size = sizeMatch ? sizeMatch[1].toLowerCase().replace(/gm$/i,'g') : '';
+        const baseName = pname.replace(/\s*\d+(?:\.\d+)?(?:ml|ML|L|g|gm|GM|kg|KG)\s*/i,'').trim();
+
+        for (const m of (materials||[])) {
+          const nameMatch = m.product_name && (
+            m.product_name.toLowerCase() === baseName.toLowerCase() ||
+            pname.toLowerCase().includes(m.product_name.toLowerCase())
+          );
+          const sizeOk = !m.size || !size || m.size.toLowerCase() === size;
+          if (nameMatch && sizeOk) {
+            if (!packingNeeds[m.id]) packingNeeds[m.id] = { material: m, needed: 0, orders: [] };
+            // Only add if not already counted from packingLinks
+            const alreadyCounted = prod && (() => {
+              const links = prod.packing_links || {};
+              const mids = Array.isArray(links.materialIds) ? links.materialIds : (links.coverId ? [links.coverId] : links.bottleId ? [links.bottleId] : []);
+              if (links.labelId) mids.push(links.labelId);
+              return mids.includes(m.id);
+            })();
+            if (!alreadyCounted) {
+              packingNeeds[m.id].needed += qty;
+              packingNeeds[m.id].orders.push({ order_no: order.order_no, buyer: order.buyer_name, qty });
+            }
+          }
+        }
+      }
+    }
+
+    // Build results
+    const packingResult = Object.values(packingNeeds).map(r => ({
+      id: r.material.id, name: r.material.name, category: r.material.category,
+      size: r.material.size, needed: r.needed,
+      available: r.material.current_stock || 0,
+      shortfall: Math.max(0, r.needed - (r.material.current_stock||0)),
+      status: r.needed <= (r.material.current_stock||0) ? 'ok' : 'shortage',
+      orders: r.orders,
+    })).sort((a,b) => b.shortfall - a.shortfall);
+
+    const rawResult = Object.values(rawNeeds).map(r => ({
+      name: r.name, neededKg: r.neededKg,
+      available: r.currentStock,
+      shortfall: Math.max(0, r.neededKg - r.currentStock),
+      status: r.neededKg <= r.currentStock ? 'ok' : 'shortage',
+      orders: r.orders,
+    })).sort((a,b) => b.shortfall - a.shortfall);
+
+    res.json({ packing: packingResult, rawMaterials: rawResult, orderCount: (orders||[]).length });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── POST seed defaults ────────────────────────────────────────────────────────
