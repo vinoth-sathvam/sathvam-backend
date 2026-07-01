@@ -7,7 +7,7 @@ const { RekognitionClient, CreateCollectionCommand, IndexFacesCommand,
         SearchFacesByImageCommand, DeleteFacesCommand } = require('@aws-sdk/client-rekognition');
 const supabase   = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
-const { sendText: gaSendText, isAutomationDisabled } = require('../lib/greenapi');
+const { sendText: gaSendText, sendToGroup, isAutomationDisabled } = require('../lib/greenapi');
 
 const COLLECTION_ID = 'sathvam-employees';
 const MATCH_THRESHOLD = 90; // % confidence required
@@ -70,6 +70,12 @@ async function sendWhatsAppToAdmin(message) {
   try {
     await gaSendText(phone, message);
   } catch (e) { console.error('[kiosk] WA error:', e.message); }
+}
+
+async function sendToFactoryGroup(message) {
+  const groupId = process.env.WA_FACTORY_GROUP_ID;
+  if (!groupId) return;
+  try { await sendToGroup(groupId, message); } catch (e) { console.error('[kiosk] group WA error:', e.message); }
 }
 
 // ── Leave balance helper ──────────────────────────────────────────────────────
@@ -253,16 +259,16 @@ router.post('/checkin', kioskAuth, async (req, res) => {
 
     // Late arrival alert
     if (time > lateThreshold) {
-      sendWhatsAppToAdmin(
-        `⏰ *Late Arrival*\n${emp.name} checked in at *${time} IST* (expected by ${cfg.late_after || '09:30'}).`
-      ).catch(() => {});
+      const lateMsg = `⏰ *Late Arrival*\n${emp.name} checked in at *${time} IST* (expected by ${cfg.late_after || '09:30'}).`;
+      sendWhatsAppToAdmin(lateMsg).catch(() => {});
+      sendToFactoryGroup(lateMsg).catch(() => {});
     }
 
     // Birthday alert
     if (isBirthday) {
-      sendWhatsAppToAdmin(
-        `🎂 *Birthday Today!*\nToday is *${emp.name}*'s birthday! Don't forget to wish them. 🎉`
-      ).catch(() => {});
+      const bdayMsg = `🎂 *Birthday Today!*\nToday is *${emp.name}*'s birthday! Don't forget to wish them. 🎉`;
+      sendWhatsAppToAdmin(bdayMsg).catch(() => {});
+      sendToFactoryGroup(bdayMsg).catch(() => {});
     }
 
   } else if (!existing?.time_out) {
@@ -278,16 +284,16 @@ router.post('/checkin', kioskAuth, async (req, res) => {
 
     // Overtime alert (only for full check_out, not break)
     if (action === 'check_out' && time > overtimeThreshold) {
-      sendWhatsAppToAdmin(
-        `🕕 *Overtime Alert*\n${emp.name} checked out at *${time} IST* (after ${cfg.overtime_after || '18:00'}).\nChecked in: ${existing.time_in}`
-      ).catch(() => {});
+      const otMsg = `🕕 *Overtime Alert*\n${emp.name} checked out at *${time} IST* (after ${cfg.overtime_after || '18:00'}).\nChecked in: ${existing.time_in}`;
+      sendWhatsAppToAdmin(otMsg).catch(() => {});
+      sendToFactoryGroup(otMsg).catch(() => {});
     }
 
     // Early departure alert (only for full check_out, not break)
     if (action === 'check_out' && time < earlyThreshold) {
-      sendWhatsAppToAdmin(
-        `🚪 *Early Departure*\n${emp.name} left at *${time} IST* (before ${cfg.early_before || '17:00'}).\nChecked in: ${existing.time_in}`
-      ).catch(() => {});
+      const earlyMsg = `🚪 *Early Departure*\n${emp.name} left at *${time} IST* (before ${cfg.early_before || '17:00'}).\nChecked in: ${existing.time_in}`;
+      sendWhatsAppToAdmin(earlyMsg).catch(() => {});
+      sendToFactoryGroup(earlyMsg).catch(() => {});
     }
 
     // Fetch leave balance for checkout display (full checkout only)
@@ -512,10 +518,42 @@ cron.schedule('30 4 * * *', async () => {
       notes: 'Auto-marked absent (no biometric check-in by 10:00 AM IST)', change_reason: '',
     }));
     await supabase.from('attendance').upsert(rows, { onConflict: 'employee_id,date' });
-    await sendWhatsAppToAdmin(
-      `📋 *Absent Today (Auto-marked)*\n${absent.length} employee(s) did not check in by 10:00 AM IST on ${date}:\n\n${absent.map(e => `• ${e.name}`).join('\n')}`
-    );
+    const absentMsg = `📋 *Absent Today (Auto-marked)*\n${absent.length} employee(s) did not check in by 10:00 AM IST on ${date}:\n\n${absent.map(e => `• ${e.name}`).join('\n')}`;
+    await sendWhatsAppToAdmin(absentMsg);
+    sendToFactoryGroup(absentMsg).catch(() => {});
   } catch (e) { console.error('[kiosk-cron] auto-absent error:', e.message); }
+});
+
+// ── Cron: daily attendance summary at 10:30 AM IST (05:00 UTC) ──────────────
+cron.schedule('0 5 * * *', async () => {
+  try {
+    const { date } = getIST();
+    const { data: allEmps } = await supabase.from('employees').select('id, name').eq('active', true);
+    const { data: attRecs } = await supabase.from('attendance').select('employee_id, status, time_in').eq('date', date);
+    if (!allEmps?.length) return;
+
+    const attMap = Object.fromEntries((attRecs || []).map(r => [String(r.employee_id), r]));
+    const present = [], absent = [], late = [];
+    const cfg = await getShiftConfig();
+    const lateThreshold = (cfg.late_after || '09:30') + ':00';
+
+    for (const e of allEmps) {
+      const rec = attMap[String(e.id)];
+      if (!rec || rec.status === 'absent') { absent.push(e.name); }
+      else { present.push(e.name); if (rec.time_in > lateThreshold) late.push(e.name); }
+    }
+
+    const msg =
+      `📊 *Daily Attendance — ${date}*\n\n` +
+      `✅ Present: *${present.length}/${allEmps.length}*\n` +
+      `❌ Absent: *${absent.length}*${absent.length ? '\n' + absent.map(n => `  • ${n}`).join('\n') : ''}\n` +
+      (late.length ? `⏰ Late: *${late.length}*\n${late.map(n => `  • ${n}`).join('\n')}\n` : '') +
+      `\n_Sathvam Kiosk — ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata', timeStyle: 'short' })} IST_`;
+
+    sendToFactoryGroup(msg).catch(() => {});
+    sendWhatsAppToAdmin(msg).catch(() => {});
+    console.log(`[kiosk-cron] attendance summary sent — ${present.length} present, ${absent.length} absent`);
+  } catch (e) { console.error('[kiosk-cron] attendance summary error:', e.message); }
 });
 
 // ── Cron: missed-checkout alert at 7 PM IST (13:30 UTC) ─────────────────────
@@ -531,9 +569,9 @@ cron.schedule('30 13 * * *', async () => {
     const { data: emps } = await supabase.from('employees').select('id, name').in('id', ids);
     const nameMap = Object.fromEntries((emps || []).map(e => [String(e.id), e.name]));
     const lines   = records.map(r => `• ${nameMap[String(r.employee_id)] || r.employee_id} (in: ${r.time_in})`);
-    await sendWhatsAppToAdmin(
-      `⚠️ *Missed Checkout Alert*\n${records.length} employee(s) not checked out by 7:00 PM IST on ${date}:\n\n${lines.join('\n')}\n\nPlease verify they have left.`
-    );
+    const missedMsg = `⚠️ *Missed Checkout Alert*\n${records.length} employee(s) not checked out by 7:00 PM IST on ${date}:\n\n${lines.join('\n')}\n\nPlease verify they have left.`;
+    await sendWhatsAppToAdmin(missedMsg);
+    sendToFactoryGroup(missedMsg).catch(() => {});
   } catch (e) { console.error('[kiosk-cron] missed-checkout error:', e.message); }
 });
 
