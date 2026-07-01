@@ -7,7 +7,7 @@ const { RekognitionClient, CreateCollectionCommand, IndexFacesCommand,
         SearchFacesByImageCommand, DeleteFacesCommand } = require('@aws-sdk/client-rekognition');
 const supabase   = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
-const { sendText: gaSendText } = require('../lib/greenapi');
+const { sendText: gaSendText, isAutomationDisabled } = require('../lib/greenapi');
 
 const COLLECTION_ID = 'sathvam-employees';
 const MATCH_THRESHOLD = 90; // % confidence required
@@ -64,6 +64,7 @@ function invalidateShiftCache() { _shiftCfgAt = 0; }
 
 // ── WhatsApp helper ───────────────────────────────────────────────────────────
 async function sendWhatsAppToAdmin(message) {
+  if (await isAutomationDisabled('kiosk_alerts')) return;
   const phone = process.env.WA_ADMIN_PHONE1;
   if (!phone) { console.warn('[kiosk] WA_ADMIN_PHONE1 not set — skipping alert'); return; }
   try {

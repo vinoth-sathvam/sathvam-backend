@@ -7,7 +7,7 @@ const nodemailer = require('nodemailer');
 const supabase   = require('../config/supabase');
 const router     = express.Router();
 
-const { sendText: gaSendText } = require('../lib/greenapi');
+const { sendText: gaSendText, isAutomationDisabled } = require('../lib/greenapi');
 const SERVICE_KEY   = process.env.SCHEDULER_SECRET || process.env.SUPABASE_SERVICE_KEY?.slice(-16);
 const STORE_URL     = 'https://sathvam.in';
 
@@ -117,6 +117,8 @@ function serviceAuth(req, res, next) {
 
 // POST /api/restock-reminders/run
 router.post('/run', serviceAuth, async (req, res) => {
+  if (await isAutomationDisabled('restock_reminder')) return res.json({ skipped: true, reason: 'restock_reminder disabled via toggle' });
+
   const today = new Date().toISOString().slice(0, 10);
   const results = { sent: 0, skipped: 0, errors: [] };
 

@@ -1103,24 +1103,14 @@ Be direct. Use Indian CA language. Cite specific IT/GST sections where relevant.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// WHATSAPP ALERT
+// WHATSAPP ALERT (via Green API)
 // ─────────────────────────────────────────────────────────────────────────────
 
+const { sendText: gaSendText, isAutomationDisabled } = require('../lib/greenapi');
+
 async function sendWhatsApp(phone, message) {
-  const phoneId = process.env.WA_PHONE_NUMBER_ID;
-  const token   = process.env.WA_ACCESS_TOKEN;
-  if (!phoneId || !token) {
-    console.log('WhatsApp not configured — skipping alert');
-    return;
-  }
   try {
-    const res = await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
-      method:  'POST',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ messaging_product: 'whatsapp', to: phone, type: 'text', text: { body: message } }),
-    });
-    const data = await res.json();
-    if (data.error) throw new Error(JSON.stringify(data.error));
+    await gaSendText(phone, message);
     console.log('WhatsApp alert sent to', phone);
   } catch (e) {
     console.error('WhatsApp send failed:', e.message);
@@ -1132,6 +1122,9 @@ async function sendWhatsApp(phone, message) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function main() {
+  // Check automation toggle
+  if (await isAutomationDisabled('ca_agent_alert')) { console.log('CA Agent disabled via toggle'); return; }
+
   const runId = new Date().toISOString().replace(/\.\d{3}Z$/, '');
   console.log(`\n[${runId}] Sathvam CA Agent starting...`);
 

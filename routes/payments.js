@@ -8,7 +8,7 @@ const { sendCustomerInvoice, sendInvoiceWhatsApp } = require('./webstoreOrders')
 const { auth, requireRole } = require('../middleware/auth');
 const { encrypt, hmac, encryptCustomer } = require('../config/crypto');
 const { insertLedger } = require('../utils/ledger');
-const { sendText: gaSendText, sendFile: gaSendFile, sendToGroup } = require('../lib/greenapi');
+const { sendText: gaSendText, sendFile: gaSendFile, sendToGroup, isAutomationDisabled } = require('../lib/greenapi');
 
 // ── Email transporter ─────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
@@ -78,6 +78,8 @@ async function sendViaBotSailor(phone, message, imageUrl = SATHVAM_LOGO_URL) {
 
 // ── WhatsApp order alert (to admin) ──────────────────────────────────────────
 async function sendWhatsAppAlert(order) {
+  if (await isAutomationDisabled('order_confirmed')) return; // respect toggle
+
   const adminNumbers = [
     process.env.WA_NOTIFY_TO,
     process.env.WA_ADMIN_PHONE1,
@@ -629,6 +631,7 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
 
     if (event.event === 'payment.failed') {
       const payment = event.payload.payment.entity;
+      if (!await isAutomationDisabled('order_confirmed')) { // payment alerts follow order notification toggle
       const adminNumbers = [process.env.WA_ADMIN_PHONE1, process.env.WA_NOTIFY_TO]
         .filter(Boolean).map(n => n.replace(/\D/g, ''));
       const amt = (payment.amount || 0) / 100;
@@ -642,6 +645,7 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
       for (const phone of adminNumbers) {
         try { await gaSendText(phone, msg); } catch(e) {}
       }
+      } // end automation toggle check
       console.log(`Payment failed: ${payment.id} ₹${amt} — ${payment.error_description}`);
     }
 

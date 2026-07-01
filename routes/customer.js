@@ -6,7 +6,7 @@ const nodemailer = require('nodemailer');
 const { OAuth2Client } = require('google-auth-library');
 const make2FA    = require('./twoFactor');
 const { encrypt, decrypt, hmac, encryptCustomer, decryptCustomer } = require('../config/crypto');
-const { sendText: gaSendText } = require('../lib/greenapi');
+const { sendText: gaSendText, isAutomationDisabled } = require('../lib/greenapi');
 const router     = express.Router();
 
 // ── WhatsApp welcome message (English + Tamil) ────────────────────────────────

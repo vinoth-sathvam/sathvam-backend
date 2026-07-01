@@ -1,7 +1,7 @@
 const cron       = require('node-cron');
 const nodemailer = require('nodemailer');
 const supabase   = require('./supabase');
-const { sendText: gaSendText } = require('../lib/greenapi');
+const { sendText: gaSendText, isAutomationDisabled } = require('../lib/greenapi');
 
 const mailer = nodemailer.createTransport({
   host:   process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -284,6 +284,7 @@ function startScheduler() {
 
   // ── Morning reminder: 9:00 AM IST (3:30 AM UTC) — always send ─────────────
   cron.schedule('30 3 * * *', async () => {
+    if (await isAutomationDisabled('manager_reminders')) return;
     const today = new Date().toISOString().slice(0,10);
     const pending = [
       'Set today\'s opening balance in Expenses tab',
@@ -297,6 +298,7 @@ function startScheduler() {
 
   // ── Afternoon check: 1:30 PM IST (8:00 AM UTC) — only if tasks missing ────
   cron.schedule('0 8 * * *', async () => {
+    if (await isAutomationDisabled('manager_reminders')) return;
     try {
       const tasks  = await checkDailyTasks();
       const pending = [];
@@ -312,6 +314,7 @@ function startScheduler() {
 
   // ── Evening summary: 7:00 PM IST (1:30 PM UTC) — status + nudge + sales WA ─
   cron.schedule('30 13 * * *', async () => {
+    if (!await isAutomationDisabled('manager_reminders')) {
     try {
       const tasks  = await checkDailyTasks();
       const pending = [];
@@ -326,9 +329,10 @@ function startScheduler() {
         console.log('Evening check: all daily tasks completed — no reminder needed');
       }
     } catch (e) { console.error('Evening check failed:', e.message); }
+    }
 
     // Send daily sales summary WA to admin phones
-    try {
+    if (!await isAutomationDisabled('daily_sales_summary')) try {
       const today = new Date().toISOString().slice(0, 10);
       const [wsoRes, salesRes] = await Promise.all([
         supabase.from('webstore_orders').select('total,status').eq('date', today),
@@ -364,6 +368,7 @@ function startScheduler() {
 
   // ── AI Monitor Agent: 9:00 AM IST (3:30 AM UTC) daily ────────────────────
   cron.schedule('30 3 * * *', async () => {
+    if (await isAutomationDisabled('manager_reminders')) return;
     try {
       // Lazy-require to avoid circular dependency at startup
       const monitorAgent = require('../routes/monitorAgent');
@@ -386,6 +391,7 @@ function startScheduler() {
 
   // ── Low Stock Alert: 8:00 AM IST (2:30 AM UTC) daily ─────────────────────
   cron.schedule('30 2 * * *', async () => {
+    if (await isAutomationDisabled('low_stock_alert')) return;
     try {
       // Get finished goods stock levels
       const { data: products } = await supabase
@@ -454,6 +460,7 @@ function startScheduler() {
 
   // ── Birthday coupon: 9:00 AM IST (3:30 AM UTC) daily ─────────────────────
   cron.schedule('30 3 * * *', async () => {
+    if (await isAutomationDisabled('birthday_greeting')) return;
     try {
       const { decrypt } = require('../config/crypto');
       const today = new Date();
@@ -553,6 +560,7 @@ function startScheduler() {
   ];
 
   cron.schedule('30 1 * * 0', async () => {
+    if (await isAutomationDisabled('health_tips')) return;
     try {
       const { decrypt } = require('../config/crypto');
       const tipIndex = Math.floor(new Date().getDate() / 7) % HEALTH_TIPS.length;
@@ -585,6 +593,7 @@ function startScheduler() {
 
   // ── Win-Back Campaign: Daily 10:00 AM IST (4:30 AM UTC) ──────────────────
   cron.schedule('30 4 * * *', async () => {
+    if (await isAutomationDisabled('re_engagement')) return;
     try {
       const { decrypt } = require('../config/crypto');
       const cutoffDate = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
@@ -682,6 +691,7 @@ function startScheduler() {
 
   // ── B2B Payment Reminder: Daily 9:00 AM IST (3:30 AM UTC) ────────────────
   cron.schedule('35 3 * * *', async () => {
+    if (await isAutomationDisabled('b2b_payment_reminder')) return;
     try {
       // Get B2B orders that are shipped or lc_opened with payment_terms set
       const { data: b2bOrders } = await supabase
@@ -748,6 +758,7 @@ function startScheduler() {
 
   // ── Scheduled WA Broadcast Processor — every 5 minutes ──────────────────
   cron.schedule('*/5 * * * *', async () => {
+    if (await isAutomationDisabled('scheduled_broadcasts')) return;
     try {
       const { data } = await supabase.from('settings').select('value').eq('key', 'wa_schedules').maybeSingle();
       const schedules = data?.value || [];

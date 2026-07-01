@@ -3,7 +3,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const supabase = require('../config/supabase');
-const { sendText: gaSendText } = require('../lib/greenapi');
+const { sendText: gaSendText, isAutomationDisabled } = require('../lib/greenapi');
 const router = express.Router();
 
 if (!process.env.MAGIC_LINK_SECRET) { console.error('FATAL: MAGIC_LINK_SECRET not set'); process.exit(1); }

@@ -78,25 +78,23 @@ async function runAgent(prompt) {
   return { reply: 'Agent reached max iterations.', toolStepsLog };
 }
 
+const { sendText: gaSendText } = require('../lib/greenapi');
+
 async function sendWhatsApp(phone, message) {
-  const phoneId = process.env.WA_PHONE_NUMBER_ID;
-  const token   = process.env.WA_ACCESS_TOKEN;
-  if (!phoneId || !token) {
-    console.log('WhatsApp not configured — skipping send');
-    console.log('\n--- BRIEFING ---\n' + message + '\n--- END ---');
-    return;
+  try {
+    await gaSendText(phone, message);
+    console.log('WhatsApp sent to', phone);
+  } catch (e) {
+    console.error('WhatsApp send failed:', e.message);
   }
-  const res = await fetch(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
-    method:  'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ messaging_product: 'whatsapp', to: phone, type: 'text', text: { body: message } }),
-  });
-  const data = await res.json();
-  if (data.error) throw new Error('WhatsApp error: ' + JSON.stringify(data.error));
-  console.log('WhatsApp sent to', phone);
 }
 
+const { isAutomationDisabled } = require('../lib/greenapi');
+
 async function main() {
+  // Check automation toggle (manager_reminders controls this)
+  if (await isAutomationDisabled('manager_reminders')) { console.log('Morning briefing disabled via toggle'); return; }
+
   console.log(`\n[${new Date().toISOString()}] Sathvam Master AI Morning Briefing starting...`);
 
   const prompt = `Good morning. Give me the complete morning briefing for Sathvam Natural Products.

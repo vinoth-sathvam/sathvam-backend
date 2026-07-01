@@ -14,7 +14,7 @@
 
 require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
 const { createClient } = require('@supabase/supabase-js');
-const { sendText: gaSendText } = require('../lib/greenapi');
+const { sendText: gaSendText, isAutomationDisabled } = require('../lib/greenapi');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
@@ -23,6 +23,7 @@ async function sendWA(phone, message) {
 }
 
 async function run() {
+  if (await isAutomationDisabled('payment_reminder')) { console.log('Payment reminder disabled via toggle'); return; }
 
   const now      = new Date();
   const from     = new Date(now - 3 * 24 * 60 * 60 * 1000).toISOString(); // 3 days ago

@@ -9,7 +9,7 @@ const supabase     = require('../config/supabase');
 const { auth }     = require('../middleware/auth');
 const rateLimit    = require('express-rate-limit');
 const { decryptCustomer, hmac, encryptCustomer } = require('../config/crypto');
-const { sendText: gaSendText, sendFile: gaSendFile, sendContact: gaSendContact } = require('../lib/greenapi');
+const { sendText: gaSendText, sendFile: gaSendFile, sendContact: gaSendContact, isAutomationDisabled } = require('../lib/greenapi');
 const router       = express.Router();
 
 // Embed logo as base64 so wkhtmltoimage doesn't need network access
@@ -618,6 +618,15 @@ async function generateInvoicePdfUrl(order) {
 }
 
 async function sendStatusWhatsApp(order, newStatus, cancelReason) {
+  // Check per-automation toggle
+  const toggleKey = {
+    confirmed: 'order_confirmed', packed: 'order_packed',
+    dispatched: 'order_shipped', shipped: 'order_shipped',
+    delivered: 'order_delivered',
+    cancelled: 'order_cancelled', rejected: 'order_cancelled',
+  }[newStatus];
+  if (toggleKey && await isAutomationDisabled(toggleKey)) return;
+
   const cust   = order.customer || {};
   const digits = (cust.phone || '').replace(/\D/g, '');
   if (!digits) return;
@@ -1024,7 +1033,7 @@ async function updateOrder(req, res) {
         } catch (e) { console.error('[AUTO] Loyalty error:', e.message); }
 
         // ── MILESTONE REWARD: 5th / 10th / 20th order WA ────────────────────
-        try {
+        if (!await isAutomationDisabled('milestone_reward')) try {
           const rawPhone = (decrypted.customer?.phone || '').replace(/\D/g, '');
           const milestonePhone = rawPhone.length === 10 ? '91' + rawPhone : rawPhone;
           const custName = (decrypted.customer?.name || '').split(' ')[0] || 'there';
@@ -1058,6 +1067,7 @@ async function updateOrder(req, res) {
         if (custPhone) {
           setTimeout(async () => {
             try {
+              if (await isAutomationDisabled('delivery_followup')) return;
               const msg = `⭐ *நன்றி ${custName}!*\n_Thank you for your Sathvam order!_\n\n` +
                 `உங்கள் ஆர்டர் ${orderNo} டெலிவரி ஆனதற்கு நன்றி 🙏\n` +
                 `_Your order ${orderNo} has been delivered!_\n\n` +
