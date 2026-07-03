@@ -26,7 +26,7 @@ const path           = require('path');
 const supabase       = require('../config/supabase');
 const { auth }       = require('../middleware/auth');
 const { decrypt }    = require('../config/crypto');
-const { sendText: gaSendText, sendFile: gaSendFile } = require('../lib/greenapi');
+const { sendText: gaSendText, sendFile: gaSendFile, isAutomationDisabled } = require('../lib/greenapi');
 
 // In-memory broadcast progress store (broadcastId → { sent, failed, skipped, total, done, error })
 const broadcastProgress = new Map();
@@ -848,6 +848,7 @@ async function sendViaBotSailor(phone, message, imageUrl = null) {
 }
 
 async function broadcastToAllCustomers(message, imageUrl = null, broadcastMeta = {}, broadcastId = null) {
+  if (await isAutomationDisabled('scheduled_broadcasts')) { console.log('[broadcasts] Disabled via toggle'); return { sent: 0, failed: 0, skipped: 0 }; }
   const { data: customers } = await supabase
     .from('customers').select('id, name, phone').not('phone', 'is', null);
 

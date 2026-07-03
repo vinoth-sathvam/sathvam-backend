@@ -14,7 +14,7 @@ const { spawn } = require('child_process');
 const path     = require('path');
 const { auth, requireRole } = require('../middleware/auth');
 const supabase = require('../config/supabase');
-const { sendText, sendFile } = require('../lib/greenapi');
+const { sendText, sendFile, isAutomationDisabled } = require('../lib/greenapi');
 const { decryptCustomer }    = require('../config/crypto');
 
 const SEND_DELAY_MS  = 2000;
@@ -58,6 +58,7 @@ router.get('/stats', auth, async (req, res) => {
 
 // POST /api/customer-delight/batch-notify  — "Oil pressed today" WhatsApp blast
 router.post('/batch-notify', auth, requireRole('admin'), async (req, res) => {
+  if (await isAutomationDisabled('batch_announcement')) return res.status(403).json({ error: 'batch_announcement automation is disabled' });
   try {
     const { oilType, outputLiters, batchDate, imageUrl, customMessage } = req.body;
 

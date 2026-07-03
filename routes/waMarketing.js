@@ -6,7 +6,7 @@
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const { auth } = require('../middleware/auth');
-const { sendText: gaSendText, sendFile: gaSendFile } = require('../lib/greenapi');
+const { sendText: gaSendText, sendFile: gaSendFile, isAutomationDisabled } = require('../lib/greenapi');
 const { decryptCustomer, decrypt } = require('../config/crypto');
 const router = express.Router();
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -68,6 +68,7 @@ router.get('/contacts', auth, async (req, res) => {
 // ── POST /broadcast ───────────────────────────────────────────────────────────
 
 router.post('/broadcast', auth, async (req, res) => {
+  if (await isAutomationDisabled('flash_offer')) return res.status(403).json({ error: 'flash_offer automation is disabled' });
   const { message, segment = 'all', phones: customPhones, imageUrl, caption } = req.body;
   if (!message && !caption) return res.status(400).json({ error: 'message or caption required' });
 

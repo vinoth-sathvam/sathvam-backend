@@ -16,7 +16,7 @@
 const express    = require('express');
 const fs         = require('fs');
 const { auth }   = require('../middleware/auth');
-const { toChatId } = require('../lib/greenapi');
+const { toChatId, isAutomationDisabled } = require('../lib/greenapi');
 
 const router     = express.Router();
 
@@ -79,6 +79,7 @@ async function runGenerator(data, type) {
 
 // ── POST /api/cart-reminder/send ──────────────────────────────────────────────
 router.post('/send', auth, async (req, res) => {
+  if (await isAutomationDisabled('checkout_recovery')) return res.status(403).json({ error: 'checkout_recovery automation is disabled' });
   const { phone, name, items, cart_value } = req.body;
 
   if (!phone)                           return res.status(400).json({ error: 'phone required' });
@@ -103,6 +104,7 @@ router.post('/send', auth, async (req, res) => {
 
 // ── POST /api/cart-reminder/send-order ────────────────────────────────────────
 router.post('/send-order', auth, async (req, res) => {
+  if (await isAutomationDisabled('checkout_recovery')) return res.status(403).json({ error: 'checkout_recovery automation is disabled' });
   const { phone, name, order_no, status, items, cart_value,
           tracking_no, courier, cancel_reason, payment_method } = req.body;
 

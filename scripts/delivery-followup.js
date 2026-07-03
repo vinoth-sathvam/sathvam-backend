@@ -10,7 +10,7 @@
 
 require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
 const { createClient }    = require('@supabase/supabase-js');
-const { sendText }        = require('../lib/greenapi');
+const { sendText, isAutomationDisabled } = require('../lib/greenapi');
 const { decryptCustomer } = require('../config/crypto');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -42,6 +42,7 @@ function buildMessage(name) {
 }
 
 async function run() {
+  if (await isAutomationDisabled('delivery_followup')) { console.log('[delivery-followup] Disabled via toggle'); return; }
   const args   = process.argv.slice(2);
   const dryRun = args.includes('--dry-run');
   const today  = new Date();

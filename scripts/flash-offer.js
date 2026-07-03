@@ -19,7 +19,7 @@
 
 require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
 const { createClient } = require('@supabase/supabase-js');
-const { sendText }     = require('../lib/greenapi');
+const { sendText, isAutomationDisabled } = require('../lib/greenapi');
 const { decryptCustomer } = require('../config/crypto');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
@@ -109,6 +109,7 @@ function detectWindow() {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function run() {
+  if (await isAutomationDisabled('flash_offer')) { console.log('[flash-offer] Disabled via toggle'); return; }
   const args   = process.argv.slice(2);
   const winArg = (args.find(a => a.startsWith('--window=')) || '').replace('--window=', '');
   const dryRun = args.includes('--dry-run');

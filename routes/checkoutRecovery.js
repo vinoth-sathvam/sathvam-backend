@@ -21,7 +21,7 @@ const express  = require('express');
 const cron     = require('node-cron');
 const { v4: uuidv4 } = require('uuid');
 const { createClient } = require('@supabase/supabase-js');
-const { sendText }     = require('../lib/greenapi');
+const { sendText, isAutomationDisabled } = require('../lib/greenapi');
 const { auth }         = require('../middleware/auth');
 
 const router  = express.Router();
@@ -90,6 +90,7 @@ function buildMessage(template, session) {
 
 // ── Auto-sweep: send WA to abandoned sessions ─────────────────────────────────
 async function processAbandoned(dryRun = false) {
+  if (await isAutomationDisabled('checkout_recovery')) { console.log('[checkoutRecovery] Disabled via toggle'); return { sent: 0, skipped: 0 }; }
   const config   = await loadConfig();
   const sessions = await loadSessions();
   if (!config.auto_enabled && !dryRun) return { sent: 0, skipped: 0 };
@@ -197,6 +198,7 @@ router.get('/sessions', auth, async (req, res) => {
 // ── POST /sessions/:id/send-wa ────────────────────────────────────────────────
 // Admin: manually send WA to a session
 router.post('/sessions/:id/send-wa', auth, async (req, res) => {
+  if (await isAutomationDisabled('checkout_recovery')) return res.status(403).json({ error: 'checkout_recovery automation is disabled' });
   const { id } = req.params;
   try {
     const [sessions, config] = await Promise.all([loadSessions(), loadConfig()]);

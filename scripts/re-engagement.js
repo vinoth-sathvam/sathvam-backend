@@ -14,7 +14,7 @@
 
 require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
 const { createClient } = require('@supabase/supabase-js');
-const { sendText } = require('../lib/greenapi');
+const { sendText, isAutomationDisabled } = require('../lib/greenapi');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
@@ -51,6 +51,7 @@ function normPhone(p) {
 }
 
 async function run() {
+  if (await isAutomationDisabled('re_engagement')) { console.log('[re-engagement] Disabled via toggle'); return; }
   const args      = process.argv.slice(2);
   const segArg    = (args.find(a => a.startsWith('--segment=')) || '').replace('--segment=', '');
   const dryRun    = args.includes('--dry-run');
