@@ -151,7 +151,8 @@ products.post('/', auth, requireRole('admin'), async (req, res) => {
   const p = req.body;
   const { data, error } = await supabase.from('products').insert({
     name:p.name, sku:p.sku, cat:p.cat, unit:p.unit||'pcs',
-    pack_size:p.packSize, pack_unit:p.packUnit, oil_type_key:p.oilTypeKey,
+    pack_size:p.packSize, pack_unit:p.packUnit, pcs_per_box:p.pcsPerBox||null,
+    oil_type_key:p.oilTypeKey,
     raw_mat_key:p.rawMatKey, cake_type_key:p.cakeTypeKey||null,
     reorder:p.reorder||0, gst:p.gst||0,
     price:p.price||0, retail_price:p.retailPrice, website_price:p.websitePrice,
@@ -198,7 +199,7 @@ products.put('/batch', auth, requireRole('admin', 'manager'), async (req, res) =
   const updates = prods.filter(p => p.id).map(p => ({
     id: p.id,
     name: p.name, sku: p.sku, cat: p.cat, unit: p.unit,
-    pack_size: p.packSize, pack_unit: p.packUnit,
+    pack_size: p.packSize, pack_unit: p.packUnit, pcs_per_box: p.pcsPerBox ?? null,
     oil_type_key: p.oilTypeKey, raw_mat_key: p.rawMatKey, cake_type_key: p.cakeTypeKey ?? null,
     reorder: p.reorder || 0, gst: p.gst || 0,
     price: p.price || 0,
@@ -215,7 +216,7 @@ products.put('/batch', auth, requireRole('admin', 'manager'), async (req, res) =
     packing_links: p.packingLinks ?? null,
     featured: p.featured || false,
     active: p.active !== false,
-    image_url: p.imageUrl ?? undefined,
+    image_url: p.imageUrl ?? p.image_url ?? undefined,
     description: p.description ?? undefined,
     hsn_code: p.hsnCode ?? undefined,
     commodity_id: p.commodityId ?? null,
@@ -229,7 +230,8 @@ products.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const p = req.body;
   const raw = {
     name:p.name, sku:p.sku, cat:p.cat, unit:p.unit,
-    pack_size:p.packSize, pack_unit:p.packUnit, oil_type_key:p.oilTypeKey,
+    pack_size:p.packSize, pack_unit:p.packUnit, pcs_per_box:p.pcsPerBox,
+    oil_type_key:p.oilTypeKey,
     cake_type_key:p.cakeTypeKey, reorder:p.reorder, gst:p.gst, price:p.price,
     retail_price:p.retailPrice, website_price:p.websitePrice,
     intl_price:p.intlPrice, retail_profit_pct:p.retailProfitPct,
@@ -237,7 +239,7 @@ products.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
     intl_profit_pct:p.intlProfitPct, intl_carton_key:p.intlCartonKey,
     label_cost:p.labelCost, pkg_type_key:p.pkgTypeKey,
     packing_links:p.packingLinks, featured:p.featured,
-    image_url:p.imageUrl, description:p.description, hsn_code:p.hsnCode,
+    image_url:p.imageUrl??p.image_url, description:p.description, hsn_code:p.hsnCode,
     offer_label:p.offer_label, offer_price:p.offer_price,
     offer_ends_at:p.offer_ends_at, commodity_id:p.commodityId,
     fssai_license:p.fssaiLicense,
