@@ -8,17 +8,13 @@ const supabase = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
 const { createInvoice, recordPayment } = require('../config/zoho');
 const { sendText: gaSendText } = require('../lib/greenapi');
+const { decrypt } = require('../config/crypto');
 const { insertLedger } = require('../utils/ledger');
 const { bustCache } = require('./public');
+const { uploadFile } = require('../config/storage');
 
 const procUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const INVOICE_MIME = { 'image/jpeg':'jpg','image/jpg':'jpg','image/png':'png','image/webp':'webp','application/pdf':'pdf' };
-async function ensurePOBillsBucket() {
-  const { data: buckets } = await supabase.storage.listBuckets();
-  if (!buckets?.find(b => b.name === 'po-bills')) {
-    await supabase.storage.createBucket('po-bills', { public: true, fileSizeLimit: 10485760 });
-  }
-}
 
 const ENV_PATH = path.join(__dirname, '../.env');
 
@@ -1046,7 +1042,6 @@ procurement.post('/bulk', auth, requireRole('admin','manager'), async (req, res)
 // ── POST /procurement/:id/attach-bill — attach vendor invoice (bill no + optional scan) ──
 procurement.post('/:id/attach-bill', auth, requireRole('admin','manager'), procUpload.single('bill_scan'), async (req, res) => {
   try {
-    await ensurePOBillsBucket();
     const { vendor_bill_no } = req.body;
     const updates = {};
 
@@ -1056,12 +1051,7 @@ procurement.post('/:id/attach-bill', auth, requireRole('admin','manager'), procU
       const ext = INVOICE_MIME[req.file.mimetype];
       if (!ext) return res.status(400).json({ error: 'Invalid file type. Allowed: jpg, png, webp, pdf' });
       const fileName = `proc-${req.params.id}-${Date.now()}.${ext}`;
-      const { error: upErr } = await supabase.storage.from('po-bills').upload(fileName, req.file.buffer, {
-        contentType: req.file.mimetype, upsert: true,
-      });
-      if (upErr) return res.status(500).json({ error: 'Upload failed: ' + upErr.message });
-      const { data: urlData } = supabase.storage.from('po-bills').getPublicUrl(fileName);
-      updates.bill_scan_url = urlData.publicUrl;
+      updates.bill_scan_url = await uploadFile('po-bills', fileName, req.file.buffer, req.file.mimetype);
     }
 
     const { data, error } = await supabase.from('procurements').update(updates).eq('id', req.params.id).select().single();
@@ -1356,8 +1346,44 @@ sales.get('/next-invoice-no', auth, async (req, res) => {
 sales.get('/', auth, async (req, res) => {
   const { data, error } = await supabase.from('sales').select('*, sale_items(*)').order('date', { ascending: false }).limit(1000);
   if (error) return res.status(500).json({ error: 'Failed to load sales' });
-  res.json(data);
+  // Decrypt PII fields (customer_name, customer_phone, customer_email)
+  const decrypted = (data || []).map(s => ({
+    ...s,
+    customer_name: decrypt(s.customer_name) || s.customer_name,
+    customer_phone: decrypt(s.customer_phone) || s.customer_phone,
+    customer_email: decrypt(s.customer_email) || s.customer_email,
+  }));
+  res.json(decrypted);
 });
+
+// POST /api/sales/send-invoice-whatsapp — generate PDF from HTML and send via WhatsApp
+sales.post('/send-invoice-whatsapp', auth, async (req, res) => {
+  const { html, phone, orderNo, customerName } = req.body;
+  if (!html || !phone) return res.status(400).json({ error: 'html and phone required' });
+  try {
+    const puppeteer = require('puppeteer');
+    const browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] });
+    const page = await browser.newPage();
+    await page.setContent(html, { waitUntil: 'networkidle0', timeout: 15000 });
+    const pdfBuffer = await page.pdf({ format: 'A4', printBackground: true, margin: { top: '10mm', bottom: '10mm', left: '10mm', right: '10mm' } });
+    await browser.close();
+
+    // Upload to S3 Storage
+    const invoiceFileName = `INV-${orderNo || Date.now()}.pdf`;
+    const publicUrl = await uploadFile('invoices', invoiceFileName, pdfBuffer, 'application/pdf');
+
+    // Send via Green API
+    const { sendFile } = require('../lib/greenapi');
+    const caption = `🧾 Tax Invoice — ${orderNo || 'Sathvam'}\nCustomer: ${customerName || ''}\n\nThank you for shopping with Sathvam! 🌿`;
+    const sent = await sendFile(phone, publicUrl, `Invoice-${orderNo || 'Sathvam'}.pdf`, caption);
+
+    res.json({ success: sent, url: publicUrl });
+  } catch (e) {
+    console.error('[send-invoice-whatsapp]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 sales.post('/', auth, async (req, res) => {
   const s = req.body;
   const { data: sale, error } = await supabase.from('sales').insert({

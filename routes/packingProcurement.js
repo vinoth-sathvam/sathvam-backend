@@ -3,6 +3,7 @@ const multer  = require('multer');
 const router  = express.Router();
 const { auth, requireRole } = require('../middleware/auth');
 const supabase = require('../config/supabase');
+const { uploadFile } = require('../config/storage');
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }); // 10 MB
 
@@ -11,13 +12,6 @@ const BILL_MIME = {
   'image/jpeg': 'jpg', 'image/jpg': 'jpg', 'image/png': 'png',
   'image/webp': 'webp', 'application/pdf': 'pdf',
 };
-
-async function ensureBillsBucket() {
-  const { data: buckets } = await supabase.storage.listBuckets();
-  if (!buckets?.find(b => b.name === 'po-bills')) {
-    await supabase.storage.createBucket('po-bills', { public: true, fileSizeLimit: 10485760 });
-  }
-}
 
 const round2 = v => Math.round((v||0)*100)/100;
 
@@ -156,9 +150,8 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
             notes: `Advance paid for PO ${data.po_number} | Mode: ${advance_method||'—'}${advance_ref?' | Ref: '+advance_ref:''}`,
             created_by: req.user?.email || 'system',
           }).select('id').single();
-          if (payable) {
-            await supabase.from('packing_procurement').update({ payable_id: payable.id }).eq('id', data.id);
-          }
+          // Note: payable_id column is UUID but vendor_bills.id is integer — skip to avoid type mismatch
+          if (payable) console.log(`[AUTO] Vendor bill #${payable.id} created for PO ${data.po_number}`);
         } catch(e) { console.error('[AUTO] Packing advance bill error:', e.message); }
       });
     }
@@ -291,7 +284,7 @@ router.post('/:id/receive', auth, requireRole('admin','manager'), async (req, re
       }).select().single();
       if (payable) {
         payableId = payable.id;
-        poUpdates.payable_id = payableId;
+        // Note: payable_id column is UUID type but vendor_bills.id is integer — skip storing to avoid type mismatch
       }
     }
 
@@ -305,7 +298,6 @@ router.post('/:id/receive', auth, requireRole('admin','manager'), async (req, re
 // ── POST /:id/attach-bill — attach vendor hardcopy bill (bill no + optional scan) ──
 router.post('/:id/attach-bill', auth, requireRole('admin','manager'), upload.single('bill_scan'), async (req, res) => {
   try {
-    await ensureBillsBucket();
     const { vendor_bill_no } = req.body;
     const updates = { updated_at: new Date().toISOString() };
 
@@ -315,12 +307,7 @@ router.post('/:id/attach-bill', auth, requireRole('admin','manager'), upload.sin
       const ext = BILL_MIME[req.file.mimetype];
       if (!ext) return res.status(400).json({ error: 'Invalid file type. Allowed: jpg, png, webp, pdf' });
       const fileName = `po-${req.params.id}-${Date.now()}.${ext}`;
-      const { error: upErr } = await supabase.storage.from('po-bills').upload(fileName, req.file.buffer, {
-        contentType: req.file.mimetype, upsert: true,
-      });
-      if (upErr) return res.status(500).json({ error: 'File upload failed: ' + upErr.message });
-      const { data: urlData } = supabase.storage.from('po-bills').getPublicUrl(fileName);
-      updates.bill_scan_url = urlData.publicUrl;
+      updates.bill_scan_url = await uploadFile('po-bills', fileName, req.file.buffer, req.file.mimetype);
     }
 
     const { data, error } = await supabase.from('packing_procurement').update(updates).eq('id', req.params.id).select().single();

@@ -1,6 +1,7 @@
 const express  = require('express');
 const router   = express.Router();
 const supabase = require('../config/supabase');
+const { uploadFile, deleteFile } = require('../config/storage');
 const multer   = require('multer');
 
 const _upload    = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
@@ -205,12 +206,7 @@ router.post('/assets', auth, _upload.single('image'), async (req, res) => {
     const { product_id, product_name, platform = 'both', asset_type = 'product_photo' } = req.body;
     const storagePath = `pomelli/${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`;
 
-    const { error: uploadErr } = await supabase.storage
-      .from(IMG_BUCKET)
-      .upload(storagePath, req.file.buffer, { contentType: req.file.mimetype, upsert: false });
-    if (uploadErr) return res.status(500).json({ error: 'Storage upload failed' });
-
-    const { data: { publicUrl } } = supabase.storage.from(IMG_BUCKET).getPublicUrl(storagePath);
+    const publicUrl = await uploadFile(IMG_BUCKET, storagePath, req.file.buffer, req.file.mimetype);
 
     const { data, error } = await supabase.from('pomelli_assets').insert({
       product_id:   product_id   || null,
@@ -249,7 +245,7 @@ router.delete('/assets/:id', auth, async (req, res) => {
   const { data: asset } = await supabase.from('pomelli_assets')
     .select('storage_path').eq('id', req.params.id).single();
   if (asset?.storage_path) {
-    await supabase.storage.from(IMG_BUCKET).remove([asset.storage_path]);
+    await deleteFile(IMG_BUCKET, asset.storage_path);
   }
   await supabase.from('pomelli_assets').delete().eq('id', req.params.id);
   res.json({ ok: true });

@@ -1079,4 +1079,40 @@ router.get('/audit-log', ...adminOrCeo, async (req, res) => {
   }
 });
 
+// ── GET /api/security/db-status — current database source ────────────────────
+router.get('/db-status', auth, requireRole('admin'), async (req, res) => {
+  const url = process.env.SUPABASE_URL || '';
+  res.json({
+    source: url.includes('supabase.co') ? 'supabase' : 'local',
+    url: url.replace(/\/\/.*:.*@/, '//***@'), // mask credentials
+  });
+});
+
+// ── POST /api/security/db-switch — toggle between local PostgreSQL and Supabase
+router.post('/db-switch', auth, requireRole('admin'), async (req, res) => {
+  const { target } = req.body; // 'local' or 'supabase'
+  if (!['local', 'supabase'].includes(target)) {
+    return res.status(400).json({ error: 'target must be "local" or "supabase"' });
+  }
+
+  const envPath = '/home/ubuntu/sathvam-backend/.env';
+  const localUrl = 'http://postgrest:3000';
+  const supabaseUrl = 'https://qgoyiwtxgelupamskhaa.supabase.co';
+  const newUrl = target === 'local' ? localUrl : supabaseUrl;
+
+  try {
+    const fs = require('fs');
+    let env = fs.readFileSync(envPath, 'utf8');
+    env = env.replace(/^SUPABASE_URL=.*/m, `SUPABASE_URL=${newUrl}`);
+    fs.writeFileSync(envPath, env);
+
+    // Restart backend containers via docker compose
+    await execAsync('docker compose -f /home/ubuntu/docker-compose.yml restart backend', { timeout: 60000 });
+
+    res.json({ success: true, source: target, message: `Switched to ${target}. Backend restarting...` });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

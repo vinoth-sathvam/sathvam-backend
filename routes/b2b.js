@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const nodemailer = require('nodemailer');
 const supabase = require('../config/supabase');
+const { uploadFile, deleteFile } = require('../config/storage');
 const { auth, requireRole } = require('../middleware/auth');
 const { createInvoice, recordPayment, zoho } = require('../config/zoho');
 const { sendText: gaSendText } = require('../lib/greenapi');
@@ -940,6 +941,484 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
   }
 });
 
+// ── Email docs to logistics vendor ────────────────────────────────────────────
+projects.post('/:id/email-logistics-vendor', auth, requireRole('admin','manager','ceo'), async (req, res) => {
+  try {
+    const { data: proj } = await supabase.from('projects')
+      .select('id,project_name,b2b_order_id,buyer_name,pi_no,mfg_invoice_no,merch_invoice_no')
+      .eq('id', req.params.id).single();
+    if (!proj) return res.status(404).json({ error: 'Project not found' });
+
+    // Load full project data
+    const { data: fullRow } = await supabase.from('settings').select('value').eq('key', `project_full_${req.params.id}`).single();
+    const full = fullRow?.value || {};
+    const logistics = full.logistics || {};
+    const financials = full.financials || {};
+
+    // Determine recipients
+    const extraEmails = (req.body.emails || '').split(',').map(e=>e.trim()).filter(Boolean);
+    const vendorEmail = logistics.vendorEmail || '';
+    const allEmails = [...new Set([vendorEmail, ...extraEmails].filter(Boolean))];
+    if (!allEmails.length) return res.status(400).json({ error: 'No logistics vendor email configured. Set it in Logistics Vendor section.' });
+
+    // Load B2B order for buyer info
+    let buyerName = proj.buyer_name || full.buyerName || '';
+    let orderNo = '';
+    if (proj.b2b_order_id) {
+      const { data: ord } = await supabase.from('b2b_orders').select('order_no,buyer_name').eq('id', proj.b2b_order_id).single();
+      if (ord) { orderNo = ord.order_no; buyerName = buyerName || ord.buyer_name; }
+    }
+
+    // Build email body
+    const mfgItems = (full.mfg?.items || []).filter(i => i.product);
+    const merchItems = (full.merch?.items || []).filter(i => i.product);
+    const boxes = full.packingBoxes || [];
+    const totalPcs = boxes.reduce((s,b) => s + (b.products||[]).reduce((s2,pr) => s2 + (Number(pr.qty)||1), 0), 0);
+    const totalGross = boxes.reduce((s,b) => s + (parseFloat(b.grossWt)||0), 0);
+    const totalNet = boxes.reduce((s,b) => s + (parseFloat(b.netWt)||0), 0);
+
+    const itemList = [...mfgItems, ...merchItems].map(it =>
+      `<tr><td style="border:1px solid #e5e7eb;padding:6px 10px;font-size:13px">${it.exportName||it.product||''}</td>` +
+      `<td style="border:1px solid #e5e7eb;padding:6px 10px;text-align:center;font-size:13px">${it.packSize||''} ${it.packUnit||''}</td>` +
+      `<td style="border:1px solid #e5e7eb;padding:6px 10px;text-align:center;font-size:13px">${it.qty||''}</td>` +
+      `<td style="border:1px solid #e5e7eb;padding:6px 10px;font-size:13px">${it.hsnCode||''}</td></tr>`
+    ).join('');
+
+    const emailHtml = `
+      <div style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto">
+        <div style="background:#0A4840;color:#fff;padding:16px 24px;border-radius:8px 8px 0 0">
+          <h2 style="margin:0;font-size:18px">📦 Export Documents — ${proj.project_name || orderNo}</h2>
+          <p style="margin:4px 0 0;font-size:13px;color:#a7f3d0">From SATHVAM OILS AND SPICES PVT LTD</p>
+        </div>
+        <div style="background:#fff;border:1px solid #e5e7eb;border-top:none;padding:20px 24px;border-radius:0 0 8px 8px">
+          <p style="color:#374151;font-size:14px">Dear ${logistics.vendorName || 'Logistics Team'},</p>
+          <p style="color:#374151;font-size:14px">Please find attached the export documents for customs filing:</p>
+
+          <table style="width:100%;border-collapse:collapse;margin:16px 0;font-size:13px">
+            <tr><td style="padding:6px 0;color:#6b7280;width:160px"><strong>Project / Order</strong></td><td style="color:#111827;font-weight:600">${proj.project_name||''} ${orderNo?'('+orderNo+')':''}</td></tr>
+            <tr><td style="padding:6px 0;color:#6b7280"><strong>Buyer / Consignee</strong></td><td style="color:#111827">${buyerName}</td></tr>
+            <tr><td style="padding:6px 0;color:#6b7280"><strong>Destination</strong></td><td style="color:#111827">${full.portOfDischarge||full.buyerCountry||''}</td></tr>
+            <tr><td style="padding:6px 0;color:#6b7280"><strong>MFG Invoice</strong></td><td style="color:#111827">${full.mfg?.invoiceNo||'—'} (${mfgItems.length} items)</td></tr>
+            <tr><td style="padding:6px 0;color:#6b7280"><strong>MERCH Invoice</strong></td><td style="color:#111827">${full.merch?.invoiceNo||'—'} (${merchItems.length} items)</td></tr>
+            <tr><td style="padding:6px 0;color:#6b7280"><strong>Total Boxes/Sacks</strong></td><td style="color:#111827">${boxes.length} (${totalPcs} pcs)</td></tr>
+            <tr><td style="padding:6px 0;color:#6b7280"><strong>Gross / Net Weight</strong></td><td style="color:#111827">${totalGross.toFixed(2)} kg / ${totalNet.toFixed(2)} kg</td></tr>
+            <tr><td style="padding:6px 0;color:#6b7280"><strong>Port of Loading</strong></td><td style="color:#111827">${full.portOfLoading||'—'}</td></tr>
+            <tr><td style="padding:6px 0;color:#6b7280"><strong>Terms</strong></td><td style="color:#111827">${full.terms||full.paymentTerms||'CIF'}</td></tr>
+          </table>
+
+          <h3 style="color:#1f2937;font-size:14px;margin:20px 0 8px;border-bottom:2px solid #0A4840;padding-bottom:6px">Product Summary</h3>
+          <table style="width:100%;border-collapse:collapse">
+            <tr style="background:#f1f5f9"><th style="border:1px solid #d1d5db;padding:8px 10px;text-align:left;font-size:12px">Product</th><th style="border:1px solid #d1d5db;padding:8px 10px;text-align:center;font-size:12px">Pack Size</th><th style="border:1px solid #d1d5db;padding:8px 10px;text-align:center;font-size:12px">Qty</th><th style="border:1px solid #d1d5db;padding:8px 10px;font-size:12px">HSN</th></tr>
+            ${itemList}
+          </table>
+
+          <p style="margin-top:20px;color:#374151;font-size:14px">Attached documents:</p>
+          <ul style="color:#374151;font-size:13px">
+            <li>MFG Proforma / Export Invoice</li>
+            <li>MERCH Proforma / Export Invoice</li>
+            <li>Combined Packing List</li>
+          </ul>
+
+          <p style="color:#374151;font-size:14px">Please confirm receipt and proceed with customs documentation. Reply to this email for any queries.</p>
+
+          <div style="margin-top:24px;padding-top:16px;border-top:1px solid #e5e7eb">
+            <p style="margin:0;font-weight:700;color:#0A4840;font-size:13px">SATHVAM OILS AND SPICES PVT LTD</p>
+            <p style="margin:2px 0 0;color:#6b7280;font-size:12px">GST: 33ABFCS9387K1ZN | IEC: ABFCS9387K</p>
+            <p style="margin:2px 0 0;color:#6b7280;font-size:12px">MOB: +917092177092 | EMAIL: SALES@SATHVAM.IN</p>
+          </div>
+        </div>
+      </div>`;
+
+    // Send email
+    const nodemailer = require('nodemailer');
+    const mailer = nodemailer.createTransport({
+      host: process.env.SMTP_HOST || 'smtp.gmail.com',
+      port: parseInt(process.env.SMTP_PORT || '465'),
+      secure: process.env.SMTP_PORT !== '587',
+      auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    });
+
+    const subject = `📦 Export Documents — ${proj.project_name||orderNo} — ${buyerName} [${full.mfg?.invoiceNo||''}${full.merch?.invoiceNo?', '+full.merch.invoiceNo:''}]`;
+
+    await mailer.sendMail({
+      from: process.env.SMTP_FROM || `"Sathvam Export" <${process.env.SMTP_USER}>`,
+      to: allEmails.join(', '),
+      replyTo: process.env.SMTP_USER,
+      subject,
+      html: emailHtml,
+    });
+
+    // Record in project data
+    const sentRecord = {
+      id: Date.now().toString(36) + Math.random().toString(36).slice(2,6),
+      date: new Date().toISOString(),
+      to: allEmails,
+      subject,
+      sentBy: req.user?.name || req.user?.username || 'admin',
+      type: 'docs_to_logistics',
+    };
+    const emailLog = full._emailLog || [];
+    emailLog.push(sentRecord);
+    full._emailLog = emailLog;
+    await supabase.from('settings').upsert({ key: `project_full_${req.params.id}`, value: full });
+
+    res.json({ success: true, sentTo: allEmails.join(', '), record: sentRecord });
+  } catch (err) {
+    console.error('[email-logistics-vendor]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── AI Project Monitor Agent ─────────────────────────────────────────────────
+projects.post('/:id/ai-monitor', auth, requireRole('admin','manager','ceo'), async (req, res) => {
+  try {
+    const { data: projRow } = await supabase.from('projects')
+      .select('*').eq('id', req.params.id).single();
+    if (!projRow) return res.status(404).json({ error: 'Project not found' });
+
+    const { data: fullRow } = await supabase.from('settings').select('value').eq('key', `project_full_${req.params.id}`).single();
+    const full = fullRow?.value || {};
+    const log = full.logistics || {};
+    const fin = full.financials || {};
+
+    // Load B2B order + payments
+    let order = null, payments = {};
+    if (projRow.b2b_order_id) {
+      const { data: ord } = await supabase.from('b2b_orders').select('*').eq('id', projRow.b2b_order_id).single();
+      order = ord;
+      const { data: pmtRow } = await supabase.from('settings').select('value').eq('key', 'b2b_payments').single();
+      payments = (pmtRow?.value || {})[projRow.b2b_order_id] || {};
+    }
+
+    // ── Rule-based checks ────────────────────────────────────────────────
+    const findings = [];
+    const warn = (cat, msg, sev='medium') => findings.push({ category: cat, message: msg, severity: sev });
+
+    // INVOICES
+    const mfgItems = (full.mfg?.items||[]).filter(i=>i.product);
+    const merchItems = (full.merch?.items||[]).filter(i=>i.product);
+    if (!full.mfg?.invoiceNo && mfgItems.length > 0) warn('invoice', 'MFG Invoice number not assigned yet', 'high');
+    if (!full.merch?.invoiceNo && merchItems.length > 0) warn('invoice', 'MERCH Invoice number not assigned yet', 'high');
+    if (!full.mfg?.invoiceDate && full.mfg?.invoiceNo) warn('invoice', 'MFG Invoice date missing');
+    if (!full.merch?.invoiceDate && full.merch?.invoiceNo) warn('invoice', 'MERCH Invoice date missing');
+
+    // ITEMS with missing data
+    [...mfgItems, ...merchItems].forEach(it => {
+      if (!it.hsnCode) warn('item', `"${it.exportName||it.product}" missing HSN code`, 'high');
+      if (!it.qty || parseFloat(it.qty) <= 0) warn('item', `"${it.exportName||it.product}" has zero/missing quantity`, 'high');
+      if (!it.unitPriceINR || parseFloat(it.unitPriceINR) <= 0) warn('item', `"${it.exportName||it.product}" has no unit price`, 'high');
+      if (!it.packSize) warn('item', `"${it.exportName||it.product}" missing pack size`);
+    });
+
+    // PACKING
+    const boxes = full.packingBoxes || [];
+    if (boxes.length === 0 && (mfgItems.length + merchItems.length) > 0) warn('packing', 'No packing boxes/sacks created yet', 'high');
+    boxes.forEach(b => {
+      if (!b.grossWt || parseFloat(b.grossWt) <= 0) warn('packing', `Box ${b.displayLabel||b.id}: missing gross weight`);
+      if (!b.netWt || parseFloat(b.netWt) <= 0) warn('packing', `Box ${b.displayLabel||b.id}: missing net weight`);
+      if (parseFloat(b.netWt) > parseFloat(b.grossWt)) warn('packing', `Box ${b.displayLabel||b.id}: net weight > gross weight — impossible`, 'high');
+      if (!(b.products||[]).length) warn('packing', `Box ${b.displayLabel||b.id}: empty — no products assigned`, 'high');
+    });
+
+    // BUYER INFO
+    if (!full.buyerName) warn('buyer', 'Buyer/consignee name missing', 'high');
+    if (!full.buyerAddress) warn('buyer', 'Buyer address missing for invoice');
+    if (!full.buyerCountry) warn('buyer', 'Buyer country missing');
+    if (!full.portOfDischarge) warn('buyer', 'Port of discharge not set');
+
+    // LOGISTICS
+    if (!log.vendorName && boxes.length > 0) warn('logistics', 'Logistics vendor not assigned', 'medium');
+    if (!log.vendorEmail && log.vendorName) warn('logistics', 'Logistics vendor email missing — cannot send docs', 'medium');
+    if (log.vendorName && !log.docsSentDate) warn('logistics', 'Documents not yet sent to logistics vendor', 'medium');
+    if (log.docsSentDate && !log.vendorConfirmed) warn('logistics', 'Logistics vendor has not confirmed receipt of docs');
+    if (!log.billAmt && order && ['shipped','sailing','in_transit','delivered'].includes(order.stage)) warn('logistics', 'Shipment dispatched but logistics bill amount not recorded', 'high');
+    if (log.billAmt && !log.billDate) warn('logistics', 'Logistics bill amount set but bill date missing');
+
+    // FINANCIALS
+    const mfgTotal = mfgItems.reduce((s,it) => s + (parseFloat(it.totalINR)||0), 0);
+    const merchTotal = merchItems.reduce((s,it) => s + (parseFloat(it.totalINR)||0), 0);
+    const totalVal = mfgTotal + merchTotal;
+    if (totalVal <= 0 && (mfgItems.length + merchItems.length) > 0) warn('finance', 'Total invoice value is ₹0 — check item prices', 'critical');
+
+    const advPaid = parseFloat(payments.advance_paid || 0);
+    const remPaid = parseFloat(payments.remaining_paid || 0);
+    const logiPaid = parseFloat(payments.logistics_paid || 0);
+    const totalPaid = advPaid + remPaid + logiPaid;
+    const logiCharge = parseFloat(fin.logisticsCharge || order?.logistics_charge || 0);
+    const otherCharge = parseFloat(fin.otherCharges || order?.other_charges || 0);
+    const totalDue = totalVal + logiCharge + otherCharge;
+    const outstanding = Math.max(0, totalDue - totalPaid);
+
+    if (advPaid <= 0 && order && !['order_placed','confirmed'].includes(order.stage)) warn('finance', 'No advance payment received but order is past confirmation stage', 'high');
+    if (outstanding > 0 && order && ['delivered','payment_received'].includes(order.stage)) warn('finance', `Outstanding balance ₹${Math.round(outstanding).toLocaleString()} but order marked as delivered`, 'high');
+
+    // SHIPPING
+    if (!full.piNo && !full.mfg?.piNo) warn('shipping', 'Proforma Invoice number not set');
+    if (!full.portOfLoading) warn('shipping', 'Port of loading not configured');
+    if (!full.vessel) warn('shipping', 'Vessel/flight info not set');
+
+    // COMPLIANCE
+    if (!full.lutArn) warn('compliance', 'LUT ARN not set — required for export without IGST');
+
+    // EMAIL LOG
+    const emailLog = full._emailLog || [];
+    if (emailLog.length === 0 && log.vendorName) warn('communication', 'No emails sent to logistics vendor yet');
+
+    // ORDER STAGE vs PROJECT STATE
+    if (order) {
+      if (order.stage === 'order_placed' && (full.mfg?.invoiceNo || full.merch?.invoiceNo)) warn('workflow', 'Invoice assigned but B2B order still at "Order Placed" — update order stage');
+      if (['shipped','sailing','in_transit'].includes(order.stage) && !log.vendorName) warn('workflow', 'Shipment in transit but no logistics vendor assigned — who shipped this?', 'high');
+    }
+
+    // ── AI Analysis ──────────────────────────────────────────────────────────
+    let aiSummary = '';
+    try {
+      const Anthropic = require('@anthropic-ai/sdk');
+      const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+      const snapshot = {
+        project: projRow.project_name,
+        buyer: full.buyerName,
+        country: full.buyerCountry,
+        orderStage: order?.stage,
+        mfgInvoice: full.mfg?.invoiceNo || null,
+        merchInvoice: full.merch?.invoiceNo || null,
+        mfgItemCount: mfgItems.length,
+        merchItemCount: merchItems.length,
+        totalBoxes: boxes.length,
+        totalValue: Math.round(totalVal),
+        advancePaid: advPaid,
+        balancePaid: remPaid,
+        outstanding: Math.round(outstanding),
+        logisticsVendor: log.vendorName || null,
+        logisticsDocsSent: !!log.docsSentDate,
+        logisticsConfirmed: !!log.vendorConfirmed,
+        logisticsBillAmount: parseFloat(log.billAmt) || 0,
+        emailsSent: emailLog.length,
+        piNo: full.piNo || full.mfg?.piNo || null,
+        portOfLoading: full.portOfLoading || null,
+        portOfDischarge: full.portOfDischarge || null,
+        terms: full.terms || full.paymentTerms || null,
+        ruleFindings: findings.length,
+        criticalFindings: findings.filter(f => f.severity === 'critical').length,
+        highFindings: findings.filter(f => f.severity === 'high').length,
+      };
+
+      const resp = await claude.messages.create({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 800,
+        system: `You are an AI export operations monitor for Sathvam Oils & Spices, an Indian FMCG exporter.
+Analyze the B2B export project state and provide:
+1. A 2-3 sentence overall assessment
+2. Top 3 actionable next steps (what to do RIGHT NOW)
+3. Any automation suggestions (what could be automated in this workflow)
+4. Risk alerts (deadline risks, compliance risks, payment risks)
+Keep it concise and actionable. Use bullet points. No markdown headers.`,
+        messages: [{ role: 'user', content: `Project snapshot:\n${JSON.stringify(snapshot, null, 2)}\n\nRule-based findings (${findings.length}):\n${findings.map(f => `[${f.severity.toUpperCase()}] ${f.category}: ${f.message}`).join('\n')}` }],
+      });
+      aiSummary = resp.content?.[0]?.text || '';
+    } catch (aiErr) {
+      console.error('[ai-monitor] Claude error:', aiErr.message);
+      aiSummary = 'AI analysis unavailable — check ANTHROPIC_API_KEY.';
+    }
+
+    res.json({
+      projectName: projRow.project_name,
+      orderStage: order?.stage || null,
+      findings,
+      aiSummary,
+      stats: {
+        total: findings.length,
+        critical: findings.filter(f => f.severity === 'critical').length,
+        high: findings.filter(f => f.severity === 'high').length,
+        medium: findings.filter(f => f.severity === 'medium').length,
+      },
+      checkedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error('[ai-monitor]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── AI Project Chat — can read project data, answer questions, and apply fixes ──
+projects.post('/:id/ai-chat', auth, requireRole('admin','manager','ceo'), async (req, res) => {
+  try {
+    const { message, history } = req.body;
+    if (!message) return res.status(400).json({ error: 'message required' });
+
+    // Load project data
+    const { data: fullRow } = await supabase.from('settings').select('value').eq('key', `project_full_${req.params.id}`).single();
+    const full = fullRow?.value || {};
+    const { data: projRow } = await supabase.from('projects').select('*').eq('id', req.params.id).single();
+
+    // Build context
+    const mfgItems = (full.mfg?.items||[]).filter(i=>i.product);
+    const merchItems = (full.merch?.items||[]).filter(i=>i.product);
+    const boxes = full.packingBoxes || [];
+    const allItems = [...mfgItems.map((it,i)=>({...it,_section:"mfg",_idx:i})), ...merchItems.map((it,i)=>({...it,_section:"merch",_idx:i}))];
+
+    const itemsJson = allItems.map(it => ({
+      section: it._section,
+      index: it._idx,
+      product: it.exportName || it.product,
+      hsnCode: it.hsnCode || null,
+      qty: it.qty,
+      packSize: it.packSize,
+      packUnit: it.packUnit,
+      unitPriceINR: it.unitPriceINR,
+      totalINR: it.totalINR,
+      cat: it.cat || '',
+    }));
+
+    const Anthropic = require('@anthropic-ai/sdk');
+    const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+    const systemPrompt = `You are the AI operations assistant for Sathvam Oils & Spices Pvt Ltd, an Indian FMCG exporter of cold-pressed oils, spices, millets, and food products.
+
+You are chatting inside a B2B export project. You can:
+1. Answer questions about the project, export procedures, Indian customs, HSN codes, compliance
+2. **Fix data** by returning a JSON action block that the system will execute
+
+PROJECT DATA:
+- Project: ${projRow?.project_name || full.projectName || ''}
+- Buyer: ${full.buyerName || ''} (${full.buyerCountry || ''})
+- MFG Items: ${mfgItems.length}, MERCH Items: ${merchItems.length}
+- Boxes: ${boxes.length}
+- MFG Invoice: ${full.mfg?.invoiceNo || 'not set'}
+- MERCH Invoice: ${full.merch?.invoiceNo || 'not set'}
+- Port: ${full.portOfLoading || '—'} → ${full.portOfDischarge || '—'}
+- Logistics Vendor: ${full.logistics?.vendorName || 'not set'}
+
+ALL ITEMS (use section + index to reference):
+${JSON.stringify(itemsJson, null, 1)}
+
+WHEN THE USER ASKS YOU TO FIX SOMETHING (e.g. "fix HSN codes", "set all missing HSN"):
+Return your response text FOLLOWED BY an action block like this:
+
+\`\`\`action
+{
+  "type": "update_items",
+  "updates": [
+    {"section": "mfg", "index": 0, "field": "hsnCode", "value": "15081000"},
+    {"section": "merch", "index": 3, "field": "hsnCode", "value": "07132090"}
+  ]
+}
+\`\`\`
+
+Supported action types:
+- "update_items": update item fields (hsnCode, exportName, packSize, packUnit, unitPriceINR, qty)
+- "update_project": update project fields: {"type":"update_project","updates":{"portOfLoading":"CHENNAI","vessel":"BY SEA"}}
+- "update_logistics": update logistics fields: {"type":"update_logistics","updates":{"vendorName":"ABC Logistics"}}
+
+HSN CODE REFERENCE (8-digit Indian Customs Tariff):
+- Groundnut oil: 15081000
+- Sesame oil: 15154000
+- Coconut oil: 15131100
+- Mustard oil: 15141100
+- Castor oil: 15153000
+- Sunflower oil: 15121100
+- Rice bran oil: 15159030
+- Turmeric powder: 09103020
+- Chilli powder: 09042110
+- Coriander powder: 09092110
+- Cumin powder: 09093110
+- Pepper powder: 09041110
+- Sambar powder: 21039090
+- Rasam powder: 21039090
+- Curry powder: 09109100
+- Garam masala: 09109990
+- Rice: 10063090
+- Wheat flour (atta): 11010010
+- Ragi flour: 11029090
+- Millet (general): 10089090
+- Foxtail millet: 10082900
+- Little millet: 10089040
+- Barnyard millet: 10089050
+- Kodo millet: 10089060
+- Bajra: 10082100
+- Jowar/Sorghum: 10070090
+- Moong dal: 07132090
+- Toor dal: 07139090
+- Urad dal: 07139020
+- Chana dal: 07132010
+- Masoor dal: 07139040
+- Jaggery: 17011490
+- Palm jaggery: 17011490
+- Poha/Aval/Beaten rice: 19041090
+- Vermicelli: 19021900
+- Papad: 19059090
+- Pickle: 20011000
+- Honey: 04090000
+- Ghee: 04059010
+- Cardamom: 09083110
+- Clove: 09071010
+- Cinnamon: 09061010
+- Fenugreek: 09109930
+- Idli/Dosa Batter: 19019090
+- Flakes/Cornflakes: 19041020
+
+Be concise but thorough. When fixing HSN codes, match product names to the closest category above. If unsure, say so.`;
+
+    const messages = [
+      ...(history || []).slice(-10).map(m => ({ role: m.role, content: m.content })),
+      { role: 'user', content: message },
+    ];
+
+    const resp = await claude.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 2000,
+      system: systemPrompt,
+      messages,
+    });
+
+    const aiText = resp.content?.[0]?.text || '';
+
+    // Parse action block if present
+    const actionMatch = aiText.match(/```action\s*\n([\s\S]*?)\n```/);
+    let actionResult = null;
+    if (actionMatch) {
+      try {
+        const action = JSON.parse(actionMatch[1]);
+        if (action.type === 'update_items' && Array.isArray(action.updates)) {
+          const mfg = { ...(full.mfg || {}), items: [...(full.mfg?.items || [])] };
+          const merch = { ...(full.merch || {}), items: [...(full.merch?.items || [])] };
+          let applied = 0;
+          action.updates.forEach(u => {
+            const items = u.section === 'mfg' ? mfg.items : merch.items;
+            if (items[u.index] && u.field && u.value !== undefined) {
+              items[u.index] = { ...items[u.index], [u.field]: u.value };
+              applied++;
+            }
+          });
+          full.mfg = mfg;
+          full.merch = merch;
+          await supabase.from('settings').upsert({ key: `project_full_${req.params.id}`, value: full });
+          actionResult = { type: 'update_items', applied, total: action.updates.length };
+        } else if (action.type === 'update_project' && action.updates) {
+          Object.assign(full, action.updates);
+          await supabase.from('settings').upsert({ key: `project_full_${req.params.id}`, value: full });
+          actionResult = { type: 'update_project', fields: Object.keys(action.updates) };
+        } else if (action.type === 'update_logistics' && action.updates) {
+          full.logistics = { ...(full.logistics || {}), ...action.updates };
+          await supabase.from('settings').upsert({ key: `project_full_${req.params.id}`, value: full });
+          actionResult = { type: 'update_logistics', fields: Object.keys(action.updates) };
+        }
+      } catch (parseErr) {
+        console.error('[ai-chat] Action parse error:', parseErr.message);
+      }
+    }
+
+    // Clean action block from visible text
+    const cleanText = aiText.replace(/```action\s*\n[\s\S]*?\n```/g, '').trim();
+
+    res.json({ reply: cleanText, action: actionResult, updatedFull: actionResult ? full : null });
+  } catch (err) {
+    console.error('[ai-chat]', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // DELETE project + all related data
 projects.delete('/:id', auth, requireRole('admin'), async (req, res) => {
   await supabase.from('project_items').delete().eq('project_id', req.params.id);
@@ -977,17 +1456,7 @@ projects.post('/:id/shipping-docs', auth, requireRole('admin','manager'), projUp
     const ext = req.file.originalname.split('.').pop().toLowerCase();
     const path = `shipping-docs/${req.params.id}/${type}_${fileId}.${ext}`;
 
-    // Ensure bucket exists
-    const { data: buckets } = await supabase.storage.listBuckets();
-    if (!buckets?.find(b => b.name === 'documents')) {
-      await supabase.storage.createBucket('documents', { public: true, fileSizeLimit: 20 * 1024 * 1024 });
-    }
-
-    const { error: upErr } = await supabase.storage.from('documents')
-      .upload(path, req.file.buffer, { contentType: req.file.mimetype, upsert: false });
-    if (upErr) return res.status(500).json({ error: upErr.message });
-
-    const { data: { publicUrl } } = supabase.storage.from('documents').getPublicUrl(path);
+    const publicUrl = await uploadFile('documents', path, req.file.buffer, req.file.mimetype);
 
     const { data: existing } = await supabase.from('settings').select('value').eq('key', `project_shipping_docs_${req.params.id}`).maybeSingle();
     const docs = existing?.value || {};
@@ -1015,7 +1484,7 @@ projects.delete('/:id/shipping-docs/:type/:fileId', auth, requireRole('admin','m
     const arr = Array.isArray(docs[type]) ? docs[type] : docs[type] ? [docs[type]] : [];
     const target = arr.find(f => f.id === fileId);
     if (target?.path) {
-      await supabase.storage.from('documents').remove([target.path]);
+      await deleteFile('documents', target.path);
     }
     const remaining = arr.filter(f => f.id !== fileId);
     if (remaining.length === 0) delete docs[type];
@@ -1035,7 +1504,7 @@ projects.delete('/:id/shipping-docs/:type', auth, requireRole('admin','manager')
     const docs = existing?.value || {};
     const arr = Array.isArray(docs[type]) ? docs[type] : docs[type] ? [docs[type]] : [];
     for (const f of arr) {
-      if (f.path) await supabase.storage.from('documents').remove([f.path]);
+      if (f.path) await deleteFile('documents', f.path);
     }
     delete docs[type];
     await supabase.from('settings').upsert({ key: `project_shipping_docs_${req.params.id}`, value: docs, updated_at: new Date() });
@@ -1741,6 +2210,29 @@ b2bOrders.post('/:id/balance-claim', auth, async (req, res) => {
   res.json({ ok: true, claim });
 });
 
+// POST /api/b2b/orders/:id/logistics-claim — customer submits logistics payment details (notification to admin)
+b2bOrders.post('/:id/logistics-claim', auth, async (req, res) => {
+  if (req.user.type === 'b2b_customer' && !(await ownsOrder(req.user.id, req.params.id)))
+    return res.status(403).json({ error: 'Forbidden' });
+  const { amount, txnRef, date, notes } = req.body;
+  if (!amount || parseFloat(amount) <= 0) return res.status(400).json({ error: 'Amount is required' });
+  const SETTINGS_KEY = 'b2b_payments';
+  const all = await getSettingsBlob(SETTINGS_KEY);
+  const claim = { amount: parseFloat(amount), txnRef: txnRef||'', date: date||new Date().toISOString().slice(0,10), notes: notes||'', submittedAt: new Date().toISOString(), status: 'pending_verification' };
+  all[req.params.id] = { ...(all[req.params.id]||{}), customer_logistics_claim: claim };
+  await saveSettingsBlob(SETTINGS_KEY, all);
+  // WhatsApp notification to admin
+  try {
+    const { data: order } = await supabase.from('b2b_orders').select('order_no,b2b_customers(company_name,contact_name)').eq('id', req.params.id).single();
+    const company = order?.b2b_customers?.company_name || 'Customer';
+    const wa = process.env.WA_ADMIN_PHONE1||process.env.ADMIN_WHATSAPP_PHONE;
+    if (wa) {
+      gaSendText(wa, `🚛 Logistics Payment Claim\n${order?.order_no||req.params.id} · ${company}\nAmount: ₹${parseFloat(amount).toLocaleString('en-IN')}\nRef: ${txnRef||'—'}\nDate: ${date||'Today'}\n\nPlease verify and record the logistics payment in the admin panel.`).catch(()=>{});
+    }
+  } catch(_) {}
+  res.json({ ok: true, claim });
+});
+
 // POST /api/b2b/orders/:id/payment — admin records advance, remaining, or logistics payment
 b2bOrders.post('/:id/payment', auth, requireRole('admin','manager','ceo'), async (req, res) => {
   const { type, amount, date, ref, notes } = req.body;
@@ -1774,11 +2266,31 @@ b2bOrders.post('/:id/payment', auth, requireRole('admin','manager','ceo'), async
     // Mark customer claim as verified
     if (orderPayment.customer_advance_claim) orderPayment.customer_advance_claim.status = 'verified';
   } else if (type === 'remaining') {
-    orderPayment.remaining_paid   = parseFloat(amount)||0;
-    orderPayment.remaining_date   = date || new Date().toISOString().slice(0,10);
-    orderPayment.remaining_ref    = ref || '';
-    orderPayment.remaining_notes  = notes || '';
-    orderPayment.payment_status   = 'fully_paid';
+    // Migrate legacy single-entry format to array (like advance)
+    if (!Array.isArray(orderPayment.remaining_entries)) {
+      orderPayment.remaining_entries = orderPayment.remaining_paid > 0
+        ? [{ amount: orderPayment.remaining_paid, date: orderPayment.remaining_date||'', ref: orderPayment.remaining_ref||'', notes: orderPayment.remaining_notes||'' }]
+        : [];
+    }
+    orderPayment.remaining_entries.push({
+      amount: parseFloat(amount)||0,
+      date:   date || new Date().toISOString().slice(0,10),
+      ref:    ref   || '',
+      notes:  notes || '',
+    });
+    orderPayment.remaining_paid   = orderPayment.remaining_entries.reduce((s,e)=>s+(parseFloat(e.amount)||0), 0);
+    orderPayment.remaining_date   = orderPayment.remaining_entries[orderPayment.remaining_entries.length-1].date;
+    orderPayment.remaining_ref    = orderPayment.remaining_entries[orderPayment.remaining_entries.length-1].ref;
+    orderPayment.remaining_notes  = orderPayment.remaining_entries[orderPayment.remaining_entries.length-1].notes;
+    // Auto-detect fully_paid: check if total paid covers total due
+    const _advPaid  = parseFloat(orderPayment.advance_paid)||0;
+    const _remPaid  = orderPayment.remaining_paid;
+    const _logiPaid = parseFloat(orderPayment.logistics_paid)||0;
+    const _totalPaid = _advPaid + _remPaid + _logiPaid;
+    // Fetch order value to compare
+    const { data: _ord } = await supabase.from('b2b_orders').select('total_value,logistics_charge,other_charges').eq('id', req.params.id).single();
+    const _totalDue = (parseFloat(_ord?.total_value)||0) + (parseFloat(_ord?.logistics_charge)||0) + (parseFloat(_ord?.other_charges)||0);
+    orderPayment.payment_status = _totalPaid >= _totalDue && _totalDue > 0 ? 'fully_paid' : 'advance_paid';
     // Mark customer claim as verified
     if (orderPayment.customer_balance_claim) orderPayment.customer_balance_claim.status = 'verified';
   } else {
@@ -1787,6 +2299,8 @@ b2bOrders.post('/:id/payment', auth, requireRole('admin','manager','ceo'), async
     orderPayment.logistics_date   = date || new Date().toISOString().slice(0,10);
     orderPayment.logistics_ref    = ref || '';
     orderPayment.logistics_notes  = notes || '';
+    // Mark customer claim as verified
+    if (orderPayment.customer_logistics_claim) orderPayment.customer_logistics_claim.status = 'verified';
   }
   allPayments[req.params.id] = orderPayment;
 
@@ -1869,12 +2383,7 @@ b2bProfile.put('/', auth, async (req, res) => {
 // ── Helpers ──────────────────────────────────────────────────────────────
 const b2bUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const B2B_DOC_BUCKET = 'b2b-docs';
-async function ensureB2bBucket() {
-  const { data: buckets } = await supabase.storage.listBuckets();
-  if (!buckets?.find(b => b.name === B2B_DOC_BUCKET)) {
-    await supabase.storage.createBucket(B2B_DOC_BUCKET, { public: true, fileSizeLimit: 10 * 1024 * 1024 });
-  }
-}
+// ensureB2bBucket no longer needed — S3 storage helper handles bucket/prefix automatically
 async function getSettingsBlob(key) {
   const { data } = await supabase.from('settings').select('value').eq('key', key).maybeSingle();
   return data?.value || {};
@@ -1984,11 +2493,8 @@ b2bPaymentProof.post('/:orderId', auth, b2bUpload.single('proof'), async (req, r
   const ALLOWED = { 'image/jpeg':'jpg','image/jpg':'jpg','image/png':'png','image/webp':'webp','application/pdf':'pdf' };
   const ext = ALLOWED[req.file.mimetype];
   if (!ext) return res.status(400).json({ error: 'Allowed types: jpg, png, webp, pdf' });
-  await ensureB2bBucket();
   const fname = `proof-${req.params.orderId}-${Date.now()}.${ext}`;
-  const { error: upErr } = await supabase.storage.from(B2B_DOC_BUCKET).upload(fname, req.file.buffer, { contentType: req.file.mimetype });
-  if (upErr) return res.status(500).json({ error: 'Upload failed: ' + upErr.message });
-  const { data: { publicUrl } } = supabase.storage.from(B2B_DOC_BUCKET).getPublicUrl(fname);
+  const publicUrl = await uploadFile(B2B_DOC_BUCKET, fname, req.file.buffer, req.file.mimetype);
   const SETTINGS_KEY = 'b2b_payments';
   const all = await getSettingsBlob(SETTINGS_KEY);
   all[req.params.orderId] = { ...(all[req.params.orderId]||{}), proof_url: publicUrl, proof_filename: req.file.originalname, proof_uploaded_at: new Date().toISOString() };
@@ -2005,11 +2511,8 @@ b2bCustomerDocs.post('/:orderId', auth, b2bUpload.single('doc'), async (req, res
   const ALLOWED = { 'image/jpeg':'jpg','image/jpg':'jpg','image/png':'png','image/webp':'webp','application/pdf':'pdf' };
   const ext = ALLOWED[req.file.mimetype];
   if (!ext) return res.status(400).json({ error: 'Allowed types: jpg, png, webp, pdf' });
-  await ensureB2bBucket();
   const fname = `cust-doc-${req.params.orderId}-${Date.now()}.${ext}`;
-  const { error: upErr } = await supabase.storage.from(B2B_DOC_BUCKET).upload(fname, req.file.buffer, { contentType: req.file.mimetype });
-  if (upErr) return res.status(500).json({ error: 'Upload failed: ' + upErr.message });
-  const { data: { publicUrl } } = supabase.storage.from(B2B_DOC_BUCKET).getPublicUrl(fname);
+  const publicUrl = await uploadFile(B2B_DOC_BUCKET, fname, req.file.buffer, req.file.mimetype);
   const KEY = `b2b_cust_docs_${req.params.orderId}`;
   const all = await getSettingsBlob(KEY);
   const docs = Array.isArray(all.docs) ? all.docs : [];

@@ -6,6 +6,7 @@ const fs           = require('fs');
 const os           = require('os');
 const path         = require('path');
 const supabase     = require('../config/supabase');
+const { uploadFile } = require('../config/storage');
 const { auth }     = require('../middleware/auth');
 const rateLimit    = require('express-rate-limit');
 const { decryptCustomer, hmac, encryptCustomer } = require('../config/crypto');
@@ -164,12 +165,8 @@ async function renderCardJpeg(html) {
 
 async function uploadCardImage(buf, prefix) {
   const fileName = `${prefix}-${Date.now()}.jpg`;
-  const { error } = await supabase.storage
-    .from('cards')
-    .upload(fileName, buf, { contentType: 'image/jpeg', upsert: true });
-  if (error) throw new Error(`Card image upload failed: ${error.message}`);
-  const { data } = supabase.storage.from('cards').getPublicUrl(fileName);
-  return data.publicUrl;
+  const url = await uploadFile('cards', fileName, buf, 'image/jpeg');
+  return url;
 }
 
 async function sendViaBotSailor(phone, message, imageUrl = null) {
@@ -403,15 +400,9 @@ router.post('/:id/send-whatsapp-invoice', auth, async (req, res) => {
       { format: 'A4', printBackground: true, margin: { top: '15mm', bottom: '15mm', left: '12mm', right: '12mm' } }
     );
 
-    // ── 2. Upload PDF to Supabase Storage ────────────────────────────────────
+    // ── 2. Upload PDF to S3 Storage ──────────────────────────────────────────
     const fileName = `invoice-${o.order_no}-${Date.now()}.pdf`;
-    const { error: upErr } = await supabase.storage
-      .from('invoices')
-      .upload(fileName, pdfBuf, { contentType: 'application/pdf', upsert: true });
-    if (upErr) throw new Error(`PDF upload failed: ${upErr.message}`);
-
-    const { data: urlData } = supabase.storage.from('invoices').getPublicUrl(fileName);
-    const pdfUrl = urlData.publicUrl;
+    const pdfUrl = await uploadFile('invoices', fileName, pdfBuf, 'application/pdf');
 
     // ── 3. Send text message + PDF link via Green API ───────────────────────
     const subtotal = parseFloat(o.subtotal || 0);
@@ -605,12 +596,8 @@ async function generateInvoicePdfUrl(order) {
       { format: 'A4', printBackground: true, margin: { top: '15mm', bottom: '15mm', left: '12mm', right: '12mm' } }
     );
     const fileName = `invoice-${order.order_no || order.orderNo}-${Date.now()}.pdf`;
-    const { error: upErr } = await supabase.storage
-      .from('invoices')
-      .upload(fileName, pdfBuf, { contentType: 'application/pdf', upsert: true });
-    if (upErr) { console.error('Invoice PDF upload:', upErr.message); return null; }
-    const { data: urlData } = supabase.storage.from('invoices').getPublicUrl(fileName);
-    return urlData.publicUrl || null;
+    const url = await uploadFile('invoices', fileName, pdfBuf, 'application/pdf');
+    return url || null;
   } catch (e) {
     console.error('generateInvoicePdfUrl:', e.message);
     return null;
@@ -1388,15 +1375,9 @@ async function sendInvoiceWhatsApp(order) {
       { format: 'A4', printBackground: true, margin: { top: '15mm', bottom: '15mm', left: '12mm', right: '12mm' } }
     );
 
-    // Upload to Supabase storage
+    // Upload to S3 storage
     const fileName = `invoice-${order.order_no}-${Date.now()}.pdf`;
-    const { error: upErr } = await supabase.storage
-      .from('invoices')
-      .upload(fileName, pdfBuf, { contentType: 'application/pdf', upsert: true });
-    if (upErr) { console.error('Invoice PDF upload error:', upErr.message); return; }
-
-    const { data: urlData } = supabase.storage.from('invoices').getPublicUrl(fileName);
-    const pdfUrl = urlData.publicUrl;
+    const pdfUrl = await uploadFile('invoices', fileName, pdfBuf, 'application/pdf');
 
     const total   = parseFloat(order.total || 0);
     const message =
@@ -1405,13 +1386,13 @@ async function sendInvoiceWhatsApp(order) {
       `💰 Total: ₹${total.toFixed(2)}  |  ✅ Paid\n` +
       `📅 Date: ${order.date || new Date().toISOString().slice(0, 10)}\n\n` +
       `📄 *Download Invoice PDF:*\n${pdfUrl}\n\n` +
-      `For any queries: *+91 70923 77092*`;
+      `For any queries: *+91 70923 77092*\n\n` +
+      `💚 Save our number: wa.me/917092377092`;
 
     const ok = await gaSendText(phone, message);
     if (!ok) { console.error('sendInvoiceWhatsApp: Green API send failed'); return; }
 
-    // Send Sathvam contact card so customer can save our number with one tap
-    await gaSendContact(phone, '917092377092', 'Sathvam', 'Natural Oils', 'Sathvam Natural Products');
+    // Contact card removed — consolidated into message above to reduce spam score
 
     await supabase.from('whatsapp_messages').insert({
       phone, contact_name: `${cust.name || ''} | ${order.order_no}`,

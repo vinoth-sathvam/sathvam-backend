@@ -24,6 +24,7 @@ const fs             = require('fs');
 const os             = require('os');
 const path           = require('path');
 const supabase       = require('../config/supabase');
+const { uploadFile } = require('../config/storage');
 const { auth }       = require('../middleware/auth');
 const { decrypt }    = require('../config/crypto');
 const { sendText: gaSendText, sendFile: gaSendFile, isAutomationDisabled } = require('../lib/greenapi');
@@ -825,12 +826,8 @@ async function renderCardJpeg(html) {
 
 async function uploadCardImage(buf, prefix) {
   const fileName = `broadcast-${prefix}-${Date.now()}.jpg`;
-  const { error } = await supabase.storage
-    .from('cards')
-    .upload(fileName, buf, { contentType: 'image/jpeg', upsert: true });
-  if (error) throw new Error(`Card upload failed: ${error.message}`);
-  const { data } = supabase.storage.from('cards').getPublicUrl(fileName);
-  return data.publicUrl;
+  const url = await uploadFile('cards', fileName, buf, 'image/jpeg');
+  return url;
 }
 
 // ── WhatsApp send (text only OR image+caption) ───────────────────────────────
@@ -884,7 +881,7 @@ async function broadcastToAllCustomers(message, imageUrl = null, broadcastMeta =
       if (ok) { sent++; logs.push({ broadcast_id: broadcastId, customer_id: cust.id, customer_name: cust.name || null, phone, status: 'sent', sent_at: sentAt, ...broadcastMeta }); }
       else     { failed++; logs.push({ broadcast_id: broadcastId, customer_id: cust.id, customer_name: cust.name || null, phone, status: 'failed', reason: 'send_error', sent_at: sentAt, ...broadcastMeta }); }
       broadcastProgress.set(broadcastId, { sent, failed, skipped, total, done: false });
-      await new Promise(r => setTimeout(r, 333)); // 3/sec throttle
+      await new Promise(r => setTimeout(r, 5000)); // 1 per 5s — anti-spam
     } catch(e) {
       failed++;
       logs.push({ broadcast_id: broadcastId, customer_id: cust.id, customer_name: cust.name || null, phone: null, status: 'failed', reason: String(e.message || 'unknown'), sent_at: sentAt, ...broadcastMeta });
