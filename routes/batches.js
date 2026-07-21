@@ -18,6 +18,8 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
     oil_output: b.oilOutput || b.oil_output,
     cake_output: b.cakeOutput || b.cake_output,
     sugarcane_kg: b.sugarcaneKg || null,
+    filtered_oil_kg: b.filteredOilKg != null ? parseFloat(b.filteredOilKg) : null,
+    settled_cake_kg: b.settledCakeKg != null ? parseFloat(b.settledCakeKg) : null,
     notes: b.notes || '', logged_by: req.user.name
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
@@ -26,14 +28,17 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
 
 router.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const b = req.body;
-  const { data, error } = await supabase.from('batches').update({
+  const u = {
     date: b.date, oil_type: b.oilType || b.oil_type,
     input_kg: b.inputKg || b.input_kg,
     raw_price_per_kg: b.rawPricePerKg || b.raw_price_per_kg,
     oil_output: b.oilOutput || b.oil_output,
     cake_output: b.cakeOutput || b.cake_output,
     notes: b.notes
-  }).eq('id', req.params.id).select().single();
+  };
+  if (b.filteredOilKg !== undefined) u.filtered_oil_kg = b.filteredOilKg != null ? parseFloat(b.filteredOilKg) : null;
+  if (b.settledCakeKg !== undefined) u.settled_cake_kg = b.settledCakeKg != null ? parseFloat(b.settledCakeKg) : null;
+  const { data, error } = await supabase.from('batches').update(u).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
 });

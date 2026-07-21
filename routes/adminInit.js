@@ -6,7 +6,7 @@
 const express  = require('express');
 const supabase = require('../config/supabase');
 const { auth } = require('../middleware/auth');
-const { decryptCustomer } = require('../config/crypto');
+const { decrypt, decryptCustomer } = require('../config/crypto');
 const router   = express.Router();
 
 router.get('/', auth, async (req, res) => {
@@ -41,9 +41,9 @@ router.get('/', auth, async (req, res) => {
       { data: b2bPaymentsRow },
     ] = await Promise.all([
       supabase.from('products').select('*').eq('active', true).order('name'),
-      supabase.from('batches').select('*').order('date', { ascending: false }).limit(300),
-      supabase.from('procurements').select('*').order('date', { ascending: false }).limit(300),
-      supabase.from('sales').select('*').order('date', { ascending: false }).limit(300),
+      supabase.from('batches').select('*').order('date', { ascending: false }).limit(1000),
+      supabase.from('procurements').select('*').order('date', { ascending: false }).limit(1000),
+      supabase.from('sales').select('*, sale_items(*)').order('date', { ascending: false }).limit(300),
       supabase.from('vendors').select('*').order('display_name'),
       supabase.from('b2b_customers').select('id,company_name,contact_name,email,country,currency,address,phone,active,registered_date'),
       supabase.from('b2b_orders').select('*, b2b_order_items(*), b2b_order_stages(*)').order('created_at', { ascending: false }).limit(300),
@@ -106,7 +106,7 @@ router.get('/', auth, async (req, res) => {
       products:      products      || [],
       batches:       batches       || [],
       procurement:   procurement   || [],
-      sales:         sales         || [],
+      sales:         (sales || []).map(s => ({ ...s, customer_name: decrypt(s.customer_name) || s.customer_name, customer_phone: decrypt(s.customer_phone) || s.customer_phone, customer_email: decrypt(s.customer_email) || s.customer_email })),
       vendors:       vendors       || [],
       b2bCustomers:  b2bCustomers  || [],
       b2bOrders:     b2bOrders     || [],

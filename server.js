@@ -144,6 +144,7 @@ app.use('/api/expenses',   require('./routes/expenses'));
 app.use('/api/tts',              require('./routes/tts'));
 app.use('/api/packing-inventory', require('./routes/packingInventory'));
 app.use('/api/packing-procurement', require('./routes/packingProcurement'));
+app.use('/api/seed-lots',          require('./routes/seedLots'));
 app.use('/api/raw-stock',         require('./routes/rawStock'));
 app.use('/api/finished-goods',    require('./routes/finishedGoods'));
 app.use('/api/maintenance',       require('./routes/maintenance'));
@@ -162,6 +163,7 @@ app.use('/api/quality',           require('./routes/quality'));
 app.use('/api/stock-counts',      require('./routes/stockCounts'));
 app.use('/api/tasks',             require('./routes/tasks'));
 app.use('/api/ai-command',        require('./routes/aiCommand'));
+app.use('/api/ai-ops',            require('./routes/aiOps'));
 app.use('/api/compliance',        require('./routes/compliance'));
 app.use('/api/payouts',           require('./routes/payouts'));
 app.use('/api/campaigns',         require('./routes/campaigns'));
@@ -173,6 +175,7 @@ app.use('/api/guest-call', rateLimit({ windowMs: 60*1000, max: 60, standardHeade
 app.use('/api/blog',              require('./routes/blog'));
 app.use('/api/notifications',     require('./routes/notifications'));
 app.use('/api/whatsapp',          require('./routes/whatsapp'));      // WhatsApp Business API (Meta direct)
+app.use('/api/wa-catalog',        require('./routes/waCatalog'));     // WhatsApp Business Catalog (Meta Commerce API)
 app.use('/api/botsailor',         require('./routes/botsailor'));     // BotSailor WhatsApp middleware
 app.use('/api/cart-reminder',     require('./routes/cartReminder'));   // Cart reminder PNG generator + WA sender
 app.use('/api/aisensy',           require('./routes/aisensy'));       // AiSensy WhatsApp integration (testing)
