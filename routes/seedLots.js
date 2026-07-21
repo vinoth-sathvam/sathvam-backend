@@ -43,7 +43,7 @@ async function recalcTotals(procId) {
 
 // ── POST /:procId/entries — Add cleaning entry ────────────────────────────────
 router.post('/:procId/entries', auth, requireRole('admin', 'manager'), async (req, res) => {
-  const procId = parseInt(req.params.procId);
+  const procId = req.params.procId;
   const { date, inputKg, cleanedKg, wasteReason, notes } = req.body;
   if (!date || !inputKg || cleanedKg == null) return res.status(400).json({ error: 'date, inputKg, cleanedKg required' });
   if (toNum(cleanedKg) > toNum(inputKg)) return res.status(400).json({ error: 'cleanedKg cannot exceed inputKg' });
@@ -90,7 +90,7 @@ router.put('/:procId/entries/:id', auth, requireRole('admin', 'manager'), async 
     .update(u).eq('id', req.params.id).eq('procurement_id', req.params.procId).select().single();
   if (error) return res.status(400).json({ error: error.message });
 
-  const totals = await recalcTotals(parseInt(req.params.procId));
+  const totals = await recalcTotals(req.params.procId);
   res.json({ entry: data, totals });
 });
 
@@ -99,13 +99,13 @@ router.delete('/:procId/entries/:id', auth, requireRole('admin', 'manager'), asy
   const { error } = await supabase.from('seed_cleaning_entries')
     .delete().eq('id', req.params.id).eq('procurement_id', req.params.procId);
   if (error) return res.status(400).json({ error: error.message });
-  const totals = await recalcTotals(parseInt(req.params.procId));
+  const totals = await recalcTotals(req.params.procId);
   res.json({ success: true, totals });
 });
 
 // ── POST /:procId/finalize — Mark lot as fully cleaned ────────────────────────
 router.post('/:procId/finalize', auth, requireRole('admin', 'manager'), async (req, res) => {
-  const procId = parseInt(req.params.procId);
+  const procId = req.params.procId;
   const { data: proc } = await supabase.from('procurements')
     .select('received_qty,total_cleaned_kg,total_waste_kg').eq('id', procId).single();
   if (!proc) return res.status(404).json({ error: 'Not found' });
@@ -143,7 +143,7 @@ router.post('/:procId/reopen', auth, requireRole('admin'), async (req, res) => {
 
 // ── GET /:procId/predict — AI prediction for lot ──────────────────────────────
 router.get('/:procId/predict', auth, async (req, res) => {
-  const procId = parseInt(req.params.procId);
+  const procId = req.params.procId;
   const { data: proc } = await supabase.from('procurements')
     .select('*').eq('id', procId).single();
   if (!proc) return res.status(404).json({ error: 'Not found' });
