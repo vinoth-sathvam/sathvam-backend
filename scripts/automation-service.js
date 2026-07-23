@@ -634,7 +634,7 @@ async function runCartFollowUps() {
         updated = true;
       }
 
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 5000));
     }
 
     // Persist updated follow-up state
@@ -926,6 +926,228 @@ cron.schedule('45 11 * * *', async () => {
   } catch (e) { console.error('[EOD-REMINDER] Error:', e.message); }
 });
 
+// ── End-of-Day Consolidated Summary — 9:30 PM IST (4:00 PM UTC) ──────────────
+
+cron.schedule('0 16 * * *', async () => {
+  try {
+    const now   = new Date();
+    const today = now.toISOString().slice(0, 10);
+    const dayLabel = now.toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Asia/Kolkata' });
+
+    // ── Gather all data in parallel ──────────────────────────────────────────
+    const [
+      salesRes, webRes, pendDispatch,
+      lowPackRes, fgRes,
+      overdueRes,
+      batchRes, flourRes,
+      expRes,
+      b2bRes,
+      procRes,
+    ] = await Promise.all([
+      supabase.from('sales').select('order_no,customer_name,final_amount,channel,status,payment_method,amount_paid').eq('date', today),
+      supabase.from('webstore_orders').select('order_no,total,status,customer,payment_status').gte('date', today),
+      supabase.from('webstore_orders').select('order_no,total,customer,status').in('status', ['new', 'confirmed', 'packed']),
+      supabase.from('packing_materials').select('name,current_stock,min_stock').eq('active', true),
+      supabase.from('finished_goods').select('product_name,qty,type'),
+      supabase.from('vendor_bills').select('vendor_name,bill_no,amount,due_date,paid_amount,status').in('status', ['unpaid', 'partial']).lt('due_date', today).not('due_date', 'is', null),
+      supabase.from('batches').select('oil_type,raw_input_kg,oil_output').eq('date', today),
+      supabase.from('flour_batches').select('commodity,input_kg,flour_received_kg').eq('date', today),
+      supabase.from('company_expenses').select('category,amount').eq('date', today).is('deleted_at', null),
+      supabase.from('b2b_orders').select('order_no,customer_name,total_value,stage').gte('created_at', today + 'T00:00:00'),
+      supabase.from('procurements').select('commodity_name,ordered_qty,rate,status').eq('date', today),
+    ]);
+
+    // ── 1. Sales & Revenue ───────────────────────────────────────────────────
+    const posOrders = salesRes.data || [];
+    const webOrders = webRes.data || [];
+    const posRev    = posOrders.reduce((s, r) => s + (parseFloat(r.final_amount) || 0), 0);
+    const webRev    = webOrders.reduce((s, r) => s + (parseFloat(r.total) || 0), 0);
+    const totalRev  = posRev + webRev;
+    const totalOrders = posOrders.length + webOrders.length;
+
+    // Credit sales outstanding
+    const creditOrders = posOrders.filter(o => o.payment_method === 'credit');
+    const creditOutstanding = creditOrders.reduce((s, o) => s + ((parseFloat(o.final_amount) || 0) - (parseFloat(o.amount_paid) || 0)), 0);
+
+    // Pending dispatch
+    const pendCount = (pendDispatch.data || []).length;
+    const pendNew   = (pendDispatch.data || []).filter(o => o.status === 'new').length;
+
+    // ── 2. Inventory Alerts ──────────────────────────────────────────────────
+    const lowPack = (lowPackRes.data || []).filter(m => (m.current_stock || 0) < (m.min_stock || 50));
+    const fgBalance = {};
+    for (const r of (fgRes.data || [])) {
+      if (!fgBalance[r.product_name]) fgBalance[r.product_name] = 0;
+      fgBalance[r.product_name] += r.type === 'out' ? -(parseFloat(r.qty) || 0) : (parseFloat(r.qty) || 0);
+    }
+    const lowFG = Object.entries(fgBalance).filter(([, bal]) => bal < 10).length;
+
+    // ── 3. Overdue Payments ──────────────────────────────────────────────────
+    const overdueBills = overdueRes.data || [];
+    const overdueTotal = overdueBills.reduce((s, b) => s + ((b.amount || 0) - (b.paid_amount || 0)), 0);
+
+    // ── 4. Production ────────────────────────────────────────────────────────
+    const batches = batchRes.data || [];
+    const flourBatches = flourRes.data || [];
+    const totalOilInput  = batches.reduce((s, b) => s + (parseFloat(b.raw_input_kg) || 0), 0);
+    const totalOilOutput = batches.reduce((s, b) => s + (parseFloat(b.oil_output) || 0), 0);
+    const totalFlourInput  = flourBatches.reduce((s, b) => s + (parseFloat(b.input_kg) || 0), 0);
+    const totalFlourOutput = flourBatches.reduce((s, b) => s + (parseFloat(b.flour_received_kg) || 0), 0);
+
+    // ── 5. Expenses ──────────────────────────────────────────────────────────
+    const expenses = expRes.data || [];
+    const totalExp = expenses.reduce((s, e) => s + (parseFloat(e.amount) || 0), 0);
+
+    // ── 6. B2B Orders ────────────────────────────────────────────────────────
+    const b2bOrders = b2bRes.data || [];
+    const b2bTotal  = b2bOrders.reduce((s, o) => s + (parseFloat(o.total_value) || 0), 0);
+
+    // ── 7. Procurement ───────────────────────────────────────────────────────
+    const procs = procRes.data || [];
+    const procTotal = procs.reduce((s, p) => s + ((parseFloat(p.ordered_qty) || 0) * (parseFloat(p.rate) || 0)), 0);
+
+    // ── Build KPI cards ──────────────────────────────────────────────────────
+    const kpiCard = (label, value, color, icon) =>
+      `<div style="flex:1;min-width:130px;background:${color};border-radius:10px;padding:14px 16px;text-align:center">
+        <div style="font-size:11px;color:#6b7280;text-transform:uppercase;letter-spacing:.5px">${icon} ${label}</div>
+        <div style="font-size:22px;font-weight:800;color:#1e293b;margin-top:4px">${value}</div>
+      </div>`;
+
+    // ── Build sections ───────────────────────────────────────────────────────
+    let sections = '';
+
+    // Revenue KPIs
+    sections += `<div style="display:flex;gap:10px;margin-bottom:20px;flex-wrap:wrap">
+      ${kpiCard('Revenue', `₹${Math.round(totalRev).toLocaleString('en-IN')}`, '#f0fdf4', '💰')}
+      ${kpiCard('Orders', totalOrders, '#ecfeff', '🛒')}
+      ${kpiCard('Pending Dispatch', pendCount, pendCount > 0 ? '#fffbeb' : '#f0fdf4', pendCount > 0 ? '⚠️' : '✅')}
+      ${kpiCard('Expenses', totalExp > 0 ? `₹${Math.round(totalExp).toLocaleString('en-IN')}` : '₹0', '#fef2f2', '💸')}
+    </div>`;
+
+    // Revenue breakdown
+    sections += `<div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:16px;margin-bottom:16px">
+      <h4 style="margin:0 0 10px;color:#374151;font-size:14px">💰 Revenue Breakdown</h4>
+      <table style="width:100%;border-collapse:collapse;font-size:13px">
+        <tr><td style="padding:5px 0;color:#6b7280">POS / In-store</td><td style="text-align:right;font-weight:700">₹${Math.round(posRev).toLocaleString('en-IN')}</td><td style="text-align:right;color:#6b7280;padding-left:8px">${posOrders.length} orders</td></tr>
+        <tr><td style="padding:5px 0;color:#6b7280">Webstore</td><td style="text-align:right;font-weight:700">₹${Math.round(webRev).toLocaleString('en-IN')}</td><td style="text-align:right;color:#6b7280;padding-left:8px">${webOrders.length} orders</td></tr>
+        ${b2bOrders.length ? `<tr><td style="padding:5px 0;color:#6b7280">B2B Orders</td><td style="text-align:right;font-weight:700">₹${Math.round(b2bTotal).toLocaleString('en-IN')}</td><td style="text-align:right;color:#6b7280;padding-left:8px">${b2bOrders.length} orders</td></tr>` : ''}
+        ${creditOrders.length ? `<tr style="color:#d97706"><td style="padding:5px 0">Credit Outstanding</td><td style="text-align:right;font-weight:700">₹${Math.round(creditOutstanding).toLocaleString('en-IN')}</td><td style="text-align:right;padding-left:8px">${creditOrders.length} orders</td></tr>` : ''}
+      </table>
+    </div>`;
+
+    // Pending dispatch details
+    if (pendCount > 0) {
+      const pendRows = (pendDispatch.data || []).slice(0, 10).map(o => {
+        const cust = typeof o.customer === 'object' ? (o.customer?.name || '—') : (o.customer || '—');
+        return `<tr><td style="padding:4px 8px;font-size:12px">${o.order_no || '—'}</td><td style="padding:4px 8px;font-size:12px">${cust}</td><td style="padding:4px 8px;text-align:right;font-size:12px">₹${Math.round(o.total || 0).toLocaleString('en-IN')}</td><td style="padding:4px 8px;font-size:12px"><span style="background:${o.status==='new'?'#fef2f2':'#fffbeb'};color:${o.status==='new'?'#dc2626':'#d97706'};padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600">${o.status}</span></td></tr>`;
+      }).join('');
+      sections += `<div style="background:#fffbeb;border:1px solid #fde68a;border-radius:10px;padding:16px;margin-bottom:16px">
+        <h4 style="margin:0 0 10px;color:#92400e;font-size:14px">📦 Pending Dispatch (${pendCount} orders${pendNew > 0 ? `, ${pendNew} new` : ''})</h4>
+        <table style="width:100%;border-collapse:collapse"><thead><tr style="background:rgba(0,0,0,0.04)"><th style="padding:5px 8px;text-align:left;font-size:11px;color:#6b7280">Order</th><th style="padding:5px 8px;text-align:left;font-size:11px;color:#6b7280">Customer</th><th style="padding:5px 8px;text-align:right;font-size:11px;color:#6b7280">Amount</th><th style="padding:5px 8px;font-size:11px;color:#6b7280">Status</th></tr></thead><tbody>${pendRows}</tbody></table>
+        ${pendCount > 10 ? `<div style="font-size:11px;color:#92400e;margin-top:6px">+${pendCount - 10} more — see admin panel</div>` : ''}
+      </div>`;
+    }
+
+    // Production
+    if (batches.length || flourBatches.length) {
+      let prodRows = '';
+      if (batches.length) {
+        const oilSummary = {};
+        for (const b of batches) {
+          if (!oilSummary[b.oil_type]) oilSummary[b.oil_type] = { input: 0, output: 0 };
+          oilSummary[b.oil_type].input += parseFloat(b.raw_input_kg) || 0;
+          oilSummary[b.oil_type].output += parseFloat(b.oil_output) || 0;
+        }
+        prodRows += Object.entries(oilSummary).map(([type, v]) =>
+          `<tr><td style="padding:4px 8px;font-size:13px">🫙 ${type}</td><td style="padding:4px 8px;text-align:right;font-size:13px">${v.input.toFixed(1)} kg</td><td style="padding:4px 8px;text-align:right;font-size:13px">${v.output.toFixed(1)} L</td></tr>`
+        ).join('');
+      }
+      if (flourBatches.length) {
+        const flourSummary = {};
+        for (const b of flourBatches) {
+          if (!flourSummary[b.commodity]) flourSummary[b.commodity] = { input: 0, output: 0 };
+          flourSummary[b.commodity].input += parseFloat(b.input_kg) || 0;
+          flourSummary[b.commodity].output += parseFloat(b.flour_received_kg) || 0;
+        }
+        prodRows += Object.entries(flourSummary).map(([type, v]) =>
+          `<tr><td style="padding:4px 8px;font-size:13px">🌾 ${type}</td><td style="padding:4px 8px;text-align:right;font-size:13px">${v.input.toFixed(1)} kg</td><td style="padding:4px 8px;text-align:right;font-size:13px">${v.output.toFixed(1)} kg</td></tr>`
+        ).join('');
+      }
+      sections += `<div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:10px;padding:16px;margin-bottom:16px">
+        <h4 style="margin:0 0 10px;color:#166534;font-size:14px">🏭 Production Today</h4>
+        <table style="width:100%;border-collapse:collapse"><thead><tr><th style="padding:4px 8px;text-align:left;font-size:11px;color:#6b7280">Product</th><th style="padding:4px 8px;text-align:right;font-size:11px;color:#6b7280">Input</th><th style="padding:4px 8px;text-align:right;font-size:11px;color:#6b7280">Output</th></tr></thead><tbody>${prodRows}</tbody></table>
+      </div>`;
+    }
+
+    // Procurement
+    if (procs.length) {
+      const procRows = procs.map(p =>
+        `<tr><td style="padding:4px 8px;font-size:13px">${p.commodity_name}</td><td style="padding:4px 8px;text-align:right;font-size:13px">${parseFloat(p.ordered_qty || 0).toFixed(0)} kg</td><td style="padding:4px 8px;text-align:right;font-size:13px">₹${parseFloat(p.rate || 0).toFixed(0)}/kg</td><td style="padding:4px 8px;font-size:13px"><span style="background:#ecfdf5;color:#059669;padding:2px 6px;border-radius:8px;font-size:11px">${p.status}</span></td></tr>`
+      ).join('');
+      sections += `<div style="background:#ecfeff;border:1px solid #a5f3fc;border-radius:10px;padding:16px;margin-bottom:16px">
+        <h4 style="margin:0 0 10px;color:#0e7490;font-size:14px">🚛 Procurement Today — ₹${Math.round(procTotal).toLocaleString('en-IN')}</h4>
+        <table style="width:100%;border-collapse:collapse"><thead><tr><th style="padding:4px 8px;text-align:left;font-size:11px;color:#6b7280">Commodity</th><th style="padding:4px 8px;text-align:right;font-size:11px;color:#6b7280">Qty</th><th style="padding:4px 8px;text-align:right;font-size:11px;color:#6b7280">Rate</th><th style="padding:4px 8px;font-size:11px;color:#6b7280">Status</th></tr></thead><tbody>${procRows}</tbody></table>
+      </div>`;
+    }
+
+    // Inventory alerts
+    if (lowPack.length || lowFG > 0) {
+      sections += `<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:10px;padding:16px;margin-bottom:16px">
+        <h4 style="margin:0 0 8px;color:#dc2626;font-size:14px">⚠️ Inventory Alerts</h4>
+        <div style="font-size:13px;color:#7f1d1d">
+          ${lowPack.length ? `<div>📦 ${lowPack.length} packing material${lowPack.length !== 1 ? 's' : ''} below minimum stock</div>` : ''}
+          ${lowFG > 0 ? `<div>🏷️ ${lowFG} finished good${lowFG !== 1 ? 's' : ''} below 10 units</div>` : ''}
+        </div>
+      </div>`;
+    }
+
+    // Overdue payments
+    if (overdueBills.length) {
+      sections += `<div style="background:#faf5ff;border:1px solid #e9d5ff;border-radius:10px;padding:16px;margin-bottom:16px">
+        <h4 style="margin:0 0 8px;color:#7c3aed;font-size:14px">💳 Overdue Vendor Bills — ${overdueBills.length} bills | ₹${Math.round(overdueTotal).toLocaleString('en-IN')}</h4>
+        <div style="font-size:13px;color:#5b21b6">
+          ${overdueBills.slice(0, 5).map(b => `<div style="padding:2px 0">${b.vendor_name} — ${b.bill_no || 'N/A'} — ₹${((b.amount || 0) - (b.paid_amount || 0)).toLocaleString('en-IN')}</div>`).join('')}
+          ${overdueBills.length > 5 ? `<div style="color:#9ca3af;margin-top:4px">+${overdueBills.length - 5} more</div>` : ''}
+        </div>
+      </div>`;
+    }
+
+    // Expenses
+    if (expenses.length) {
+      const expByCat = {};
+      for (const e of expenses) expByCat[e.category || 'Other'] = (expByCat[e.category || 'Other'] || 0) + (parseFloat(e.amount) || 0);
+      const expLines = Object.entries(expByCat).sort((a, b) => b[1] - a[1])
+        .map(([cat, amt]) => `<div style="display:flex;justify-content:space-between;padding:3px 0;font-size:13px"><span>${cat}</span><span style="font-weight:600">₹${Math.round(amt).toLocaleString('en-IN')}</span></div>`).join('');
+      sections += `<div style="background:#fff7ed;border:1px solid #fed7aa;border-radius:10px;padding:16px;margin-bottom:16px">
+        <h4 style="margin:0 0 10px;color:#c2410c;font-size:14px">💸 Expenses Today — ₹${Math.round(totalExp).toLocaleString('en-IN')}</h4>
+        ${expLines}
+      </div>`;
+    }
+
+    // ── Build final email ────────────────────────────────────────────────────
+    const html = `<div style="font-family:'Segoe UI',Arial,sans-serif;max-width:600px;margin:0 auto;background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.08)">
+      <div style="background:linear-gradient(135deg,#0a1f10,#1a5c2a);color:#fff;padding:22px 28px">
+        <h2 style="margin:0;font-size:18px;font-weight:800">📊 End-of-Day Summary</h2>
+        <div style="font-size:13px;opacity:.7;margin-top:4px">${dayLabel}</div>
+      </div>
+      <div style="padding:22px 28px">
+        ${sections}
+        <div style="text-align:center;margin-top:20px">
+          <a href="https://admin.sathvam.in" style="background:linear-gradient(135deg,#0a1f10,#1a5c2a);color:#fff;text-decoration:none;padding:10px 28px;border-radius:8px;font-size:14px;font-weight:600;display:inline-block">Open Admin Panel →</a>
+        </div>
+      </div>
+      <div style="padding:14px 28px;background:#f8fafc;font-size:11px;color:#94a3b8;border-top:1px solid #e2e8f0;text-align:center">
+        Sathvam Natural Products Pvt. Ltd. · Automated End-of-Day Summary
+      </div>
+    </div>`;
+
+    const to = await getAdminEmails();
+    const subjectLine = `📊 Sathvam EOD — ${today} | ₹${Math.round(totalRev).toLocaleString('en-IN')} revenue | ${totalOrders} orders${pendCount > 0 ? ` | ${pendCount} pending` : ''}`;
+    await sendMail(to, subjectLine, html);
+    console.log(`[${today}] EOD summary email sent — ₹${Math.round(totalRev)}, ${totalOrders} orders`);
+  } catch (e) { console.error('[AUTO] EOD summary email failed:', e.message); }
+});
+
 // Export for use by backend manual trigger
 module.exports.runCartFollowUps = runCartFollowUps;
 module.exports.runFailedPaymentFollowUps = runFailedPaymentFollowUps;
@@ -944,3 +1166,4 @@ console.log('  • Monthly 1st      — P&L snapshot email');
 console.log('  • Monthly last day — Payroll auto-generation');
 console.log('  • Every 2 hours    — AI abandoned cart follow-up (3-touch sequence)');
 console.log('  • Daily 5:15 PM IST — EOD cash closing reminder to admin/managers');
+console.log('  • Daily 9:30 PM IST — End-of-Day consolidated summary email');
