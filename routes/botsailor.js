@@ -294,11 +294,47 @@ async function keywordReply(text, phone) {
       `📞 +91 70923 77092`;
   }
 
+  // COUPON validation — detect coupon codes like SPIN10, SPIN5, WA5-xxx, etc.
+  const couponMatch = t.match(/^(?:coupon\s+)?([A-Za-z0-9_-]{3,20})$/i);
+  if (couponMatch && /^(spin|wa5|ref|back|flash|welcome|free)/i.test(couponMatch[1])) {
+    const code = couponMatch[1].toUpperCase().trim();
+    try {
+      const { data: coupon } = await supabase.from('coupons')
+        .select('code,type,value,min_order,max_uses,uses_count,expires_at,active,description')
+        .eq('code', code).maybeSingle();
+      if (!coupon || !coupon.active) {
+        return `❌ Coupon *${code}* is not valid or has expired.\n\n` +
+          `💡 Reply *HI SATHVAM* to get a fresh 5% discount code!\n` +
+          `🛒 Shop: https://sathvam.in`;
+      }
+      if (coupon.expires_at && new Date(coupon.expires_at) < new Date()) {
+        return `⏰ Coupon *${code}* has expired.\n\n` +
+          `💡 Reply *HI SATHVAM* to get a new coupon!\n🛒 https://sathvam.in`;
+      }
+      if (coupon.max_uses && coupon.uses_count >= coupon.max_uses) {
+        return `📛 Coupon *${code}* has reached its usage limit.\n\n` +
+          `💡 Reply *HI SATHVAM* for a new coupon!\n🛒 https://sathvam.in`;
+      }
+      const discStr = coupon.type === 'percent' ? `${coupon.value}% OFF` : `₹${coupon.value} OFF`;
+      const minStr = coupon.min_order ? `\n📋 Min order: ₹${coupon.min_order}` : '';
+      return `✅ Coupon *${code}* is valid! 🎉\n\n` +
+        `🏷️ Discount: *${discStr}*${minStr}\n\n` +
+        `📋 *How to use:*\n` +
+        `1. Go to sathvam.in → add items to cart\n` +
+        `2. At checkout, enter *${code}* in the coupon box\n` +
+        `3. Click Apply → discount will be applied\n\n` +
+        `🛒 Shop now: https://sathvam.in`;
+    } catch (e) {
+      console.error('WA coupon validate error:', e.message);
+    }
+  }
+
   // HELP or MENU — command list
   if (/^(?:help|menu)$/i.test(t)) {
     return `📋 *Sathvam WhatsApp Menu*\n\n` +
       `Reply with any of these commands:\n\n` +
       `👋 *HI SATHVAM* — Get a welcome coupon\n` +
+      `🏷️ *SPIN10* — Check if a coupon code is valid\n` +
       `⭐ *POINTS* — Check loyalty points balance\n` +
       `🚚 *TRACK <order no>* — Track your order\n` +
       `📋 *ORDER <order no>* — Order status\n` +
@@ -647,6 +683,14 @@ Keep replies SHORT (3-4 lines max) — this is WhatsApp, not email.
 Use simple language. Support English and Tamil.
 Never make up prices or availability — use only what's listed below.
 If asked about order tracking, tell them to reply with: TRACK <order number>
+
+COUPON CODES:
+- Customers can get coupons from the spin wheel on sathvam.in (SPIN5, SPIN8, SPIN10, SPIN15, SPINSHIP)
+- If a customer says their coupon isn't working, ask them to type the exact code at checkout and click Apply
+- If they need a new coupon, tell them to reply HI SATHVAM to get a fresh 5% discount code
+- NEVER say "we don't have active coupon codes" — we always have spin wheel coupons active
+- If they mention a specific code, tell them to type just the code (e.g. SPIN10) in this chat to verify it
+
 Store: https://sathvam.in
 
 CURRENT PRODUCTS:
