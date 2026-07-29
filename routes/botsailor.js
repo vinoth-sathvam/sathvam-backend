@@ -85,6 +85,77 @@ async function getProductContext() {
   }
 }
 
+// ── Customer context for AI sales ────────────────────────────────────────────
+async function getCustomerContext(phone) {
+  const ctx = { isCustomer: false, name: null, orders: [], totalSpent: 0, lastOrder: null, coupon: null };
+  try {
+    // Find customer by phone
+    const { data: customers } = await supabase.from('customers').select('id,name,phone');
+    let custId = null;
+    for (const c of customers || []) {
+      try {
+        const decPhone = (decrypt(c.phone) || '').replace(/\D/g, '');
+        const inPhone = phone.replace(/\D/g, '');
+        if (decPhone && (decPhone === inPhone || decPhone.endsWith(inPhone) || inPhone.endsWith(decPhone))) {
+          custId = c.id;
+          ctx.name = decrypt(c.name);
+          ctx.isCustomer = true;
+          break;
+        }
+      } catch {}
+    }
+
+    // Past orders (search by phone in encrypted customer JSONB)
+    if (ctx.isCustomer) {
+      const { data: orders } = await supabase.from('webstore_orders')
+        .select('order_no,items,total,status,date')
+        .order('created_at', { ascending: false }).limit(20);
+      for (const o of orders || []) {
+        try {
+          const oPhone = (decrypt(o.customer?.phone || '') || '').replace(/\D/g, '');
+          if (oPhone && (oPhone === phone.replace(/\D/g, '') || oPhone.endsWith(phone.slice(-10)))) {
+            ctx.orders.push(o);
+            ctx.totalSpent += parseFloat(o.total) || 0;
+          }
+        } catch {}
+      }
+      // Use webstore_orders with customer JSONB — already fetched above
+    }
+
+    // Check past orders by decrypting — simplified: use recent orders
+    if (!ctx.orders.length) {
+      const { data: allOrders } = await supabase.from('webstore_orders')
+        .select('order_no,customer,items,total,status,date')
+        .order('created_at', { ascending: false }).limit(30);
+      for (const o of allOrders || []) {
+        try {
+          const c = o.customer || {};
+          const oPhone = (decrypt(c.phone) || '').replace(/\D/g, '');
+          const cleanPhone = phone.replace(/\D/g, '');
+          if (oPhone && (oPhone === cleanPhone || oPhone.endsWith(cleanPhone.slice(-10)) || cleanPhone.endsWith(oPhone.slice(-10)))) {
+            ctx.orders.push({ order_no: o.order_no, items: o.items, total: o.total, status: o.status, date: o.date });
+            ctx.totalSpent += parseFloat(o.total) || 0;
+            if (!ctx.name) ctx.name = decrypt(c.name);
+            ctx.isCustomer = true;
+          }
+        } catch {}
+      }
+    }
+
+    if (ctx.orders.length) ctx.lastOrder = ctx.orders[0];
+
+    // Get/create a coupon for this customer
+    try {
+      const { code } = await getOrCreateWACoupon(phone);
+      ctx.coupon = code;
+    } catch {}
+
+  } catch (e) {
+    console.error('[wa-sales] getCustomerContext error:', e.message);
+  }
+  return ctx;
+}
+
 // ── Chat history ───────────────────────────────────────────────────────────────
 const HISTORY_KEY = phone => `wa_chat_${phone}`;
 
@@ -669,29 +740,85 @@ router.post('/webhook', async (req, res) => {
       return;
     }
 
-    // 2. AI reply
+    // 2. AI sales reply
     if (!AI_REPLIES_ENABLED) return;
 
-    const history    = await loadHistory(phone);
-    const productCtx = await getProductContext();
+    const [history, productCtx, custCtx] = await Promise.all([
+      loadHistory(phone),
+      getProductContext(),
+      getCustomerContext(phone),
+    ]);
+
+    // Build customer context string for AI
+    let custInfo = '';
+    if (custCtx.isCustomer) {
+      custInfo = `\nCUSTOMER PROFILE (use naturally, don't dump all at once):`;
+      if (custCtx.name) custInfo += `\n- Name: ${custCtx.name}`;
+      custInfo += `\n- Returning customer: ${custCtx.orders.length} past orders, ₹${Math.round(custCtx.totalSpent)} total spent`;
+      if (custCtx.lastOrder) {
+        const items = (custCtx.lastOrder.items || []).map(i => i.name || i.productName).filter(Boolean).slice(0, 4).join(', ');
+        custInfo += `\n- Last order: ${custCtx.lastOrder.order_no} (${custCtx.lastOrder.date}) — ${items}`;
+        custInfo += `\n- Last order status: ${custCtx.lastOrder.status}`;
+      }
+      // Suggest reorder based on past purchases
+      if (custCtx.orders.length > 0) {
+        const allItems = custCtx.orders.flatMap(o => (o.items || []).map(i => i.name)).filter(Boolean);
+        const freq = {};
+        allItems.forEach(n => freq[n] = (freq[n] || 0) + 1);
+        const topItems = Object.entries(freq).sort((a, b) => b[1] - a[1]).slice(0, 3).map(e => e[0]);
+        if (topItems.length) custInfo += `\n- Frequently bought: ${topItems.join(', ')} — suggest reorder if relevant`;
+      }
+    } else {
+      custInfo = `\nCUSTOMER: New/unregistered visitor — first interaction. Focus on welcome, building trust, and guiding to first purchase.`;
+    }
+    if (custCtx.coupon) custInfo += `\n- Personal coupon ready: ${custCtx.coupon} (5% off) — offer this strategically when they show interest or hesitate on price`;
 
     const aiResponse = await anthropic.messages.create({
       model:      'claude-sonnet-4-6',
-      max_tokens: 350,
-      system: `You are Sathvam's WhatsApp assistant. Sathvam sells cold-pressed oils and natural products.
-Keep replies SHORT (3-4 lines max) — this is WhatsApp, not email.
-Use simple language. Support English and Tamil.
-Never make up prices or availability — use only what's listed below.
-If asked about order tracking, tell them to reply with: TRACK <order number>
+      max_tokens: 500,
+      system: `You are Sathvam's WhatsApp sales assistant — friendly, persuasive, and goal-oriented. Your #1 job is to CONVERT conversations into orders on sathvam.in.
+
+PERSONALITY:
+- Warm, personal, enthusiastic — like a knowledgeable friend who genuinely cares about their health
+- Use the customer's name naturally (if known)
+- Mix English and Tamil naturally (many customers are Tamil-speaking)
+- Use emojis sparingly but effectively (1-2 per message, not every line)
+
+SALES TACTICS (use naturally, not robotically):
+- UNDERSTAND NEED FIRST: Ask what they're looking for before recommending
+- HEALTH BENEFITS: Connect products to real health benefits (cold-pressed = no chemicals, retains nutrients)
+- SOCIAL PROOF: "This is our bestseller" / "Most families reorder this monthly"
+- URGENCY: "We press in small batches — stock moves fast" (only if true/low stock)
+- UPSELL: Suggest complementary products naturally ("Most people pair sesame oil with our turmeric powder")
+- BUNDLE VALUE: If cart > ₹2000, mention free delivery; if close, nudge them to add one more item
+- COUPON STRATEGY: Don't offer coupon immediately. First build value. Offer the coupon when:
+  * Customer hesitates on price ("let me think", "too expensive", "discount?")
+  * Customer is close to buying but needs a nudge
+  * Customer asks for a deal/offer
+- REORDER: For returning customers, ask if they need a refill of their usual items
+- CLOSE THE DEAL: Always end with a clear call-to-action → "Shall I send you the direct link?" / "Add to cart here: sathvam.in"
+- OBJECTION HANDLING:
+  * "Too expensive" → Explain value (cold-pressed vs refined = 10x healthier, lasts longer since you use less)
+  * "I'll think about it" → "No rush! But this batch was pressed just [X] days ago — freshness matters for nutrients 🌿"
+  * "Is it organic?" → Yes, FSSAI certified, no chemicals, traditional wooden press (chekku/ghani)
+  * "Delivery?" → Free above ₹2500, otherwise ₹50-80 depending on location. Delivered in 3-5 days.
 
 COUPON CODES:
-- Customers can get coupons from the spin wheel on sathvam.in (SPIN5, SPIN8, SPIN10, SPIN15, SPINSHIP)
-- If a customer says their coupon isn't working, ask them to type the exact code at checkout and click Apply
-- If they need a new coupon, tell them to reply HI SATHVAM to get a fresh 5% discount code
-- NEVER say "we don't have active coupon codes" — we always have spin wheel coupons active
-- If they mention a specific code, tell them to type just the code (e.g. SPIN10) in this chat to verify it
+- Spin wheel coupons are always active: SPIN5 (5%), SPIN8 (8%), SPIN10 (10%), SPIN15 (15%), SPINSHIP (free shipping)
+- Customer's personal coupon (if shown below): offer when strategically right
+- If coupon isn't working, tell them to type the code in this chat to verify, or try at checkout
+- NEVER say "we don't have active coupon codes"
+
+RULES:
+- Keep messages SHORT (4-6 lines max). This is WhatsApp, not email.
+- Never make up prices — use only what's in the product list below
+- If asked about order tracking: tell them to reply TRACK <order number>
+- If you genuinely can't help, offer to connect with team: +91 70923 77092
+- Don't be pushy or fake — be genuinely helpful. If someone clearly isn't interested, respect that gracefully.
+- Always include the shop link when recommending products: https://sathvam.in
 
 Store: https://sathvam.in
+${custInfo}
 
 CURRENT PRODUCTS:
 ${productCtx}`,
