@@ -174,7 +174,7 @@ const razorpay = new Razorpay({
 // Frontend calls this to create a Razorpay order before showing checkout modal
 router.post('/create-order', async (req, res) => {
   try {
-    const { amount, orderNo } = req.body;
+    const { amount, orderNo, orderData } = req.body;
     if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid amount' });
 
     const rzpOrder = await razorpay.orders.create({
@@ -183,6 +183,14 @@ router.post('/create-order', async (req, res) => {
       receipt:  orderNo || `SW-${Date.now()}`,
       notes:    { source: 'sathvam.in' },
     });
+
+    // Stash order data so webhook can recover if /verify never fires
+    if (orderData) {
+      supabase.from('settings').upsert({
+        key:   `pending_order_${rzpOrder.id}`,
+        value: { ...orderData, stashed_at: new Date().toISOString() },
+      }).then(() => {}).catch(e => console.error('Stash pending order error:', e.message));
+    }
 
     res.json({ orderId: rzpOrder.id, amount: rzpOrder.amount, currency: rzpOrder.currency });
   } catch (err) {
@@ -354,6 +362,10 @@ router.post('/verify', async (req, res) => {
         console.error('Finished goods webstore deduction error:', fgErr.message);
       }
     });
+
+    // Clean up stashed pending order data
+    supabase.from('settings').delete().eq('key', `pending_order_${razorpay_order_id}`)
+      .then(() => {}).catch(() => {});
 
     res.json({ success: true, paymentId: razorpay_payment_id, orderNo: generatedOrderNo });
   } catch (err) {
@@ -612,8 +624,142 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
     const event = JSON.parse(body);
     if (event.event === 'payment.captured') {
       const payment = event.payload.payment.entity;
-      console.log(`Razorpay payment captured: ${payment.id} ₹${payment.amount / 100}`);
-      // Order is already saved via /verify — this is just a backup log
+      console.log(`[webhook] payment.captured: ${payment.id} ₹${payment.amount / 100}`);
+
+      // Check if order was already saved by /verify
+      const { data: existing } = await supabase.from('webstore_orders')
+        .select('id')
+        .or(`notes.ilike.%${payment.id}%,payment_id.eq.${payment.id}`)
+        .limit(1).maybeSingle();
+
+      if (!existing) {
+        // /verify never fired — recover from stashed pending order data
+        console.log(`[webhook] No order found for payment ${payment.id} — attempting recovery`);
+        const rzpOrderId = payment.order_id;
+        const { data: stashed } = await supabase.from('settings')
+          .select('value').eq('key', `pending_order_${rzpOrderId}`).maybeSingle();
+
+        if (stashed?.value) {
+          const o = stashed.value;
+          const rawCustomer = o.customer || {};
+          const encCustomer = encryptCustomer(rawCustomer);
+          const custEmailHash = hmac(rawCustomer.email || '');
+          const dbId = crypto.randomUUID();
+          const generatedOrderNo = await generateOrderNo();
+          const { error: wsErr } = await supabase.from('webstore_orders').upsert({
+            id:                  dbId,
+            order_no:            generatedOrderNo,
+            date:                o.date || new Date().toISOString().slice(0, 10),
+            customer:            encCustomer,
+            customer_email_hash: custEmailHash,
+            items:               o.items || [],
+            subtotal:            parseFloat(o.subtotal) || 0,
+            gst:                 parseFloat(o.gst) || 0,
+            shipping:            parseFloat(o.shipping) || 0,
+            total:               parseFloat(o.total) || 0,
+            status:              'confirmed',
+            payment_status:      'paid',
+            channel:             'website',
+            notes:               `Razorpay: ${payment.id} (webhook-recovered)`,
+          }, { onConflict: 'id' });
+
+          if (!wsErr) {
+            console.log(`[webhook] ✅ Order ${generatedOrderNo} recovered for payment ${payment.id}`);
+
+            // Sales record
+            const customer = rawCustomer;
+            const addrNote = `${customer.address || ''}, ${customer.city || ''}, ${customer.state || ''} - ${customer.pincode || ''}`;
+            const { data: sale } = await supabase.from('sales').insert({
+              order_no:       generatedOrderNo,
+              date:           o.date || new Date().toISOString().slice(0, 10),
+              channel:        'website',
+              status:         'pending',
+              customer_name:  encrypt(customer.name  || ''),
+              customer_phone: encrypt(customer.phone || ''),
+              total_amount:   parseFloat(o.subtotal) || 0,
+              discount:       0,
+              final_amount:   parseFloat(o.total) || 0,
+              amount_paid:    parseFloat(o.total) || 0,
+              payment_method: 'online',
+              notes:          encrypt(`${addrNote} | Razorpay: ${payment.id} (webhook-recovered)`),
+            }).select().single();
+
+            if (sale && Array.isArray(o.items) && o.items.length > 0) {
+              await supabase.from('sale_items').insert(o.items.map(i => ({
+                sale_id:      sale.id,
+                product_id:   i.id || null,
+                product_name: i.name || '',
+                qty:          i.qty || 1,
+                rate:         i.price || 0,
+                total:        (i.qty || 1) * (i.price || 0),
+                unit:         'pcs',
+              })));
+            }
+
+            // Ledger entry
+            insertLedger({
+              txn_date:     o.date || new Date().toISOString().slice(0, 10),
+              direction:    'in',
+              amount:       parseFloat(o.total) || 0,
+              category:     'sales',
+              subcategory:  'webstore',
+              party:        rawCustomer.name || 'Webstore Customer',
+              party_type:   'customer',
+              payment_mode: 'online',
+              narration:    `Webstore order ${generatedOrderNo} (webhook-recovered)`,
+              reference_no: payment.id,
+              source_table: 'webstore_orders',
+              source_id:    dbId,
+              created_by:   'system',
+            }).catch(() => {});
+
+            // Non-blocking: send all notifications
+            setImmediate(async () => {
+              await sendWhatsAppAlert({ ...o, paymentId: payment.id, orderNo: generatedOrderNo });
+              await sendOrderEmail({ ...o, orderNo: generatedOrderNo }, payment.id);
+              await sendCustomerOrderWhatsApp({ ...o, orderNo: generatedOrderNo });
+              await sendCustomerInvoice({ ...o, orderNo: generatedOrderNo }, payment.id);
+              await sendInvoiceWhatsApp({ ...o, order_no: generatedOrderNo });
+              try {
+                const invoice = await createInvoice(o);
+                if (invoice?.invoice_id) await recordPayment(invoice, o.total, 'online', payment.id);
+              } catch (ze) { console.error('[webhook-recovery] Zoho error:', ze.message); }
+              try {
+                const fgItems = (o.items || []).filter(i => parseFloat(i.qty) > 0);
+                if (fgItems.length) {
+                  await supabase.from('finished_goods').insert(fgItems.map(i => ({
+                    product_name: i.name || '', category: 'other', unit: 'pcs',
+                    qty: parseFloat(i.qty), type: 'out',
+                    date: o.date || new Date().toISOString().slice(0, 10),
+                    notes: `Auto: Webstore order ${generatedOrderNo} (webhook)`,
+                    batch_ref: generatedOrderNo, created_by: 'system',
+                    created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+                  })));
+                }
+              } catch (fgErr) { console.error('[webhook-recovery] FG deduction error:', fgErr.message); }
+            });
+
+            // Clean up stashed data
+            await supabase.from('settings').delete().eq('key', `pending_order_${rzpOrderId}`);
+          } else {
+            console.error(`[webhook] Order recovery failed:`, wsErr.message);
+          }
+        } else {
+          // No stashed data — send admin alert about orphaned payment
+          console.error(`[webhook] ⚠️ Payment ${payment.id} captured but no pending order data found`);
+          const adminNumbers = [process.env.WA_ADMIN_PHONE1, process.env.WA_NOTIFY_TO]
+            .filter(Boolean).map(n => n.replace(/\D/g, '')).filter((v, i, a) => v && a.indexOf(v) === i);
+          const msg = `⚠️ *Payment Without Order*\n\n` +
+            `💳 ₹${(payment.amount / 100).toLocaleString('en-IN')} captured\n` +
+            `📧 ${payment.email || '—'}\n📞 ${payment.contact || '—'}\n` +
+            `🔑 ${payment.id}\n\n` +
+            `Order was NOT saved — /verify never called and no pending data found.\n` +
+            `➡️ Create order manually in admin panel.`;
+          for (const phone of adminNumbers) {
+            try { await gaSendText(phone, msg); } catch(e) {}
+          }
+        }
+      }
     }
 
     if (event.event === 'payment_link.paid' || event.event === 'payment_link.completed') {
