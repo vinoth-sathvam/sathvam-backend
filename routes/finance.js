@@ -1134,6 +1134,19 @@ const DEFAULT_COA = [
   { code:'6900', name:'Interest Expense',       type:'Expense',   subtype:'Finance Cost',   normal:'debit' },
   { code:'7000', name:'Taxes & Duties',         type:'Expense',   subtype:'Operating Expense', normal:'debit' },
   { code:'7100', name:'Miscellaneous Expense',  type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+  // GST split accounts (for double-entry)
+  { code:'1210', name:'GST Input Credit (CGST)',  type:'Asset',     subtype:'Current Asset',     normal:'debit' },
+  { code:'1211', name:'GST Input Credit (SGST)',  type:'Asset',     subtype:'Current Asset',     normal:'debit' },
+  { code:'1212', name:'GST Input Credit (IGST)',  type:'Asset',     subtype:'Current Asset',     normal:'debit' },
+  { code:'2101', name:'GST Payable (CGST)',        type:'Liability', subtype:'Current Liability', normal:'credit' },
+  { code:'2102', name:'GST Payable (SGST)',        type:'Liability', subtype:'Current Liability', normal:'credit' },
+  { code:'2103', name:'GST Payable (IGST)',        type:'Liability', subtype:'Current Liability', normal:'credit' },
+  // Additional operational accounts
+  { code:'4200', name:'Discount Allowed',          type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+  { code:'5300', name:'Packing Material Cost',     type:'Expense',   subtype:'COGS',              normal:'debit' },
+  { code:'6350', name:'Courier & Shipping',        type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+  { code:'7200', name:'Round-off',                 type:'Expense',   subtype:'Operating Expense', normal:'debit' },
+  { code:'4300', name:'Cake & Byproduct Sales',    type:'Revenue',   subtype:'Other Income',      normal:'credit' },
 ];
 
 router.get('/coa', auth, async (req, res) => {
@@ -1196,16 +1209,140 @@ router.get('/trial-balance', auth, async (req, res) => {
       accounts[k].credit += round2(l.credit || 0);
     }
 
-    const rows = Object.values(accounts).map(a => ({
-      ...a,
-      net: round2(a.debit - a.credit),
-    })).sort((a,b) => (a.code||'').localeCompare(b.code||''));
+    // Merge with all COA accounts so zero-balance accounts still appear
+    const { data: coaAccounts } = await supabase.from('chart_of_accounts').select('code,name,type,subtype,normal').eq('active', true).order('code');
+    const rows = (coaAccounts || []).map(coa => {
+      const a = accounts[coa.code] || { code: coa.code, name: coa.name, debit: 0, credit: 0 };
+      return {
+        code: coa.code,
+        name: coa.name,
+        type: coa.type,
+        subtype: coa.subtype,
+        normal: coa.normal,
+        debit: round2(a.debit),
+        credit: round2(a.credit),
+        net: round2(a.debit - a.credit),
+        balance: coa.normal === 'debit' ? round2(a.debit - a.credit) : round2(a.credit - a.debit),
+      };
+    });
+
+    // Group by type for subtotals
+    const groups = {};
+    for (const r of rows) {
+      if (!groups[r.type]) groups[r.type] = { type: r.type, accounts: [], totalDebit: 0, totalCredit: 0 };
+      groups[r.type].accounts.push(r);
+      groups[r.type].totalDebit  += r.debit;
+      groups[r.type].totalCredit += r.credit;
+    }
+    const typeOrder = ['Asset','Liability','Equity','Revenue','Expense'];
+    const groupedRows = typeOrder.map(t => groups[t] || { type: t, accounts: [], totalDebit: 0, totalCredit: 0 });
 
     const totalDebit  = round2(rows.reduce((s,r) => s + r.debit, 0));
     const totalCredit = round2(rows.reduce((s,r) => s + r.credit, 0));
 
-    res.json({ as_of: cutoff, rows, totalDebit, totalCredit, balanced: Math.abs(totalDebit - totalCredit) < 0.01 });
+    res.json({ as_of: cutoff, rows, groups: groupedRows, totalDebit, totalCredit, balanced: Math.abs(totalDebit - totalCredit) < 0.01 });
   } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// GENERAL LEDGER — per-account transaction history with running balance
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/general-ledger', auth, async (req, res) => {
+  try {
+    const { account_code, from, to } = req.query;
+    if (!account_code) return res.status(400).json({ error: 'account_code is required' });
+
+    // Get account info from COA
+    const { data: acct } = await supabase.from('chart_of_accounts')
+      .select('code,name,type,subtype,normal').eq('code', account_code).maybeSingle();
+    if (!acct) return res.status(404).json({ error: 'Account not found in COA' });
+
+    // Get all journal lines for this account
+    const { data: lines } = await supabase.from('journal_lines')
+      .select('journal_id,debit,credit,description')
+      .eq('account_code', account_code);
+
+    if (!lines || !lines.length) {
+      return res.json({ account: acct, entries: [], opening_balance: 0, closing_balance: 0, total_debit: 0, total_credit: 0 });
+    }
+
+    // Fetch all related journal entries
+    const jeIds = [...new Set(lines.map(l => l.journal_id))];
+    const { data: jes } = await supabase.from('journal_entries')
+      .select('id,date,ref_no,description').in('id', jeIds).order('date', { ascending: true });
+
+    const jeMap = {};
+    for (const je of jes || []) jeMap[je.id] = je;
+
+    // Build entries with running balance
+    let entries = lines.map(l => {
+      const je = jeMap[l.journal_id] || {};
+      return {
+        date: je.date,
+        ref_no: je.ref_no || '',
+        description: je.description || l.description || '',
+        debit: round2(l.debit || 0),
+        credit: round2(l.credit || 0),
+      };
+    }).sort((a, b) => (a.date || '').localeCompare(b.date || '') || 0);
+
+    // Apply date filters
+    if (from) entries = entries.filter(e => e.date >= from);
+    if (to) entries = entries.filter(e => e.date <= to);
+
+    // Compute running balance
+    const isDebitNormal = acct.normal === 'debit';
+    let balance = 0;
+    for (const e of entries) {
+      balance += isDebitNormal ? (e.debit - e.credit) : (e.credit - e.debit);
+      e.running_balance = round2(balance);
+    }
+
+    const totalDebit = round2(entries.reduce((s, e) => s + e.debit, 0));
+    const totalCredit = round2(entries.reduce((s, e) => s + e.credit, 0));
+
+    res.json({
+      account: acct,
+      entries,
+      opening_balance: 0,
+      closing_balance: round2(balance),
+      total_debit: totalDebit,
+      total_credit: totalCredit,
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JOURNAL BACKFILL — convert money_ledger entries to journal entries
+// ═══════════════════════════════════════════════════════════════════════════════
+router.post('/journal/backfill', auth, async (req, res) => {
+  try {
+    const { insertJournal } = require('../utils/journalPoster');
+    const { data: ledgerRows } = await supabase.from('money_ledger')
+      .select('*').order('txn_date', { ascending: true });
+
+    let posted = 0, skipped = 0, errors = 0;
+    for (const row of ledgerRows || []) {
+      try {
+        // Check if already posted
+        const refNo = (row.source_table && row.source_id)
+          ? `${row.source_table}-${row.source_id}`
+          : null;
+        if (refNo) {
+          const { data: existing } = await supabase.from('journal_entries')
+            .select('id').eq('ref_no', refNo).maybeSingle();
+          if (existing) { skipped++; continue; }
+        }
+        await insertJournal(row);
+        posted++;
+      } catch (e) {
+        errors++;
+        console.error('[BACKFILL] Error for row', row.id, e.message);
+      }
+    }
+
+    res.json({ total: (ledgerRows || []).length, posted, skipped, errors });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════

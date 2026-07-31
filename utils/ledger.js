@@ -4,6 +4,7 @@
  * Swallows errors so it never breaks the calling transaction.
  */
 const supabase = require('../config/supabase');
+const { insertJournal } = require('./journalPoster');
 
 /**
  * @param {Object} data
@@ -42,6 +43,10 @@ async function insertLedger(data) {
       tds_amount:   parseFloat(data.tds_amount)  || 0,
       created_by:   data.created_by   || '',
     });
+
+    // Auto-post double-entry journal entry (fire-and-forget)
+    insertJournal(data).catch(e => console.error('[JOURNAL] auto-post error:', e.message));
+
   } catch (e) {
     console.error('[LEDGER] insert error:', e.message);
   }
