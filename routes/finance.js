@@ -1452,6 +1452,313 @@ router.get('/balance-sheet', auth, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// JOURNAL-BASED P&L STATEMENT
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/pnl-journal', auth, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const today = new Date();
+    const periodEnd   = to   || today.toISOString().slice(0, 10);
+    const periodStart = from || `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-01`;
+
+    // Fetch all journal entries in period
+    const { data: jes } = await supabase.from('journal_entries').select('id').gte('date', periodStart).lte('date', periodEnd);
+    const jeIds = (jes||[]).map(r=>r.id);
+
+    // Fetch COA for account classification
+    const { data: coa } = await supabase.from('chart_of_accounts').select('code,name,type,subtype').eq('active', true);
+    const coaMap = {};
+    for (const a of coa||[]) coaMap[a.code] = a;
+
+    if (!jeIds.length) {
+      return res.json({
+        period: { from: periodStart, to: periodEnd },
+        revenue: { items: [], total: 0 },
+        cogs: { items: [], total: 0 },
+        gross_profit: 0, gross_margin_pct: 0,
+        opex: { items: [], total: 0 },
+        net_profit: 0, net_margin_pct: 0,
+      });
+    }
+
+    // Aggregate journal lines by account
+    const { data: lines } = await supabase.from('journal_lines').select('account_code,account_name,debit,credit').in('journal_id', jeIds);
+
+    const accounts = {};
+    for (const l of lines||[]) {
+      const k = l.account_code || l.account_name;
+      if (!accounts[k]) accounts[k] = { code: l.account_code, name: l.account_name, debit: 0, credit: 0 };
+      accounts[k].debit  += round2(l.debit || 0);
+      accounts[k].credit += round2(l.credit || 0);
+    }
+
+    // Classify accounts
+    const revenue = [], cogs = [], opex = [];
+    for (const [code, a] of Object.entries(accounts)) {
+      const meta = coaMap[code];
+      const balance = round2(a.credit - a.debit); // Revenue is credit-normal
+      if (!meta) continue;
+      if (meta.type === 'Revenue') {
+        revenue.push({ code, name: a.name || meta.name, amount: balance });
+      } else if (meta.type === 'Expense') {
+        const amt = round2(a.debit - a.credit); // Expense is debit-normal
+        if (meta.subtype === 'COGS') {
+          cogs.push({ code, name: a.name || meta.name, amount: amt });
+        } else {
+          opex.push({ code, name: a.name || meta.name, amount: amt });
+        }
+      }
+    }
+
+    const totalRevenue = round2(revenue.reduce((s,r) => s + r.amount, 0));
+    const totalCOGS    = round2(cogs.reduce((s,r) => s + r.amount, 0));
+    const grossProfit  = round2(totalRevenue - totalCOGS);
+    const totalOpex    = round2(opex.reduce((s,r) => s + r.amount, 0));
+    const netProfit    = round2(grossProfit - totalOpex);
+
+    // Previous period comparison
+    const daysInPeriod = Math.max(1, Math.round((new Date(periodEnd) - new Date(periodStart)) / 86400000));
+    const prevEnd   = new Date(new Date(periodStart).getTime() - 86400000).toISOString().slice(0,10);
+    const prevStart = new Date(new Date(periodStart).getTime() - daysInPeriod * 86400000).toISOString().slice(0,10);
+    const { data: prevJes } = await supabase.from('journal_entries').select('id').gte('date', prevStart).lte('date', prevEnd);
+    let prevRevenue = 0, prevNetProfit = 0;
+    if (prevJes?.length) {
+      const { data: prevLines } = await supabase.from('journal_lines').select('account_code,debit,credit').in('journal_id', prevJes.map(r=>r.id));
+      for (const l of prevLines||[]) {
+        const meta = coaMap[l.account_code];
+        if (!meta) continue;
+        if (meta.type === 'Revenue') prevRevenue += round2((l.credit||0) - (l.debit||0));
+        else if (meta.type === 'Expense') prevNetProfit -= round2((l.debit||0) - (l.credit||0));
+      }
+      prevNetProfit += prevRevenue;
+    }
+
+    res.json({
+      period: { from: periodStart, to: periodEnd },
+      revenue: { items: revenue.filter(r=>r.amount!==0).sort((a,b)=>b.amount-a.amount), total: totalRevenue },
+      cogs: { items: cogs.filter(r=>r.amount!==0).sort((a,b)=>b.amount-a.amount), total: totalCOGS },
+      gross_profit: grossProfit,
+      gross_margin_pct: totalRevenue > 0 ? round2((grossProfit/totalRevenue)*100) : 0,
+      opex: { items: opex.filter(r=>r.amount!==0).sort((a,b)=>b.amount-a.amount), total: totalOpex },
+      net_profit: netProfit,
+      net_margin_pct: totalRevenue > 0 ? round2((netProfit/totalRevenue)*100) : 0,
+      comparison: {
+        prev_period: { from: prevStart, to: prevEnd },
+        prev_revenue: round2(prevRevenue),
+        prev_net_profit: round2(prevNetProfit),
+        revenue_change_pct: prevRevenue > 0 ? round2(((totalRevenue - prevRevenue)/prevRevenue)*100) : null,
+        profit_change_pct: prevNetProfit !== 0 ? round2(((netProfit - prevNetProfit)/Math.abs(prevNetProfit))*100) : null,
+      },
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JOURNAL-BASED BALANCE SHEET
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/balance-sheet-journal', auth, async (req, res) => {
+  try {
+    const { as_of } = req.query;
+    const cutoff = as_of || new Date().toISOString().slice(0, 10);
+
+    // All journal entries up to cutoff
+    const { data: jes } = await supabase.from('journal_entries').select('id').lte('date', cutoff);
+    const jeIds = (jes||[]).map(r=>r.id);
+
+    const { data: coa } = await supabase.from('chart_of_accounts').select('code,name,type,subtype,normal').eq('active', true).order('code');
+    const coaMap = {};
+    for (const a of coa||[]) coaMap[a.code] = a;
+
+    // Aggregate all journal lines
+    let lineAgg = {};
+    if (jeIds.length) {
+      const { data: lines } = await supabase.from('journal_lines').select('account_code,debit,credit').in('journal_id', jeIds);
+      for (const l of lines||[]) {
+        if (!lineAgg[l.account_code]) lineAgg[l.account_code] = { debit: 0, credit: 0 };
+        lineAgg[l.account_code].debit  += round2(l.debit || 0);
+        lineAgg[l.account_code].credit += round2(l.credit || 0);
+      }
+    }
+
+    // Build sections
+    const sections = {
+      current_assets: [], fixed_assets: [], contra_assets: [],
+      current_liabilities: [], long_term_liabilities: [],
+      equity: [],
+    };
+    let totalRevenue = 0, totalExpenses = 0;
+
+    for (const acct of coa||[]) {
+      const agg = lineAgg[acct.code] || { debit: 0, credit: 0 };
+      const balance = acct.normal === 'debit' ? round2(agg.debit - agg.credit) : round2(agg.credit - agg.debit);
+      if (balance === 0 && acct.type !== 'Equity') continue; // skip zero-balance except equity
+
+      const item = { code: acct.code, name: acct.name, balance };
+
+      if (acct.type === 'Asset') {
+        if (acct.subtype === 'Fixed Asset') sections.fixed_assets.push(item);
+        else if (acct.subtype === 'Contra Asset') sections.contra_assets.push(item);
+        else sections.current_assets.push(item);
+      } else if (acct.type === 'Liability') {
+        if (acct.subtype === 'Long-term Liability') sections.long_term_liabilities.push(item);
+        else sections.current_liabilities.push(item);
+      } else if (acct.type === 'Equity') {
+        sections.equity.push(item);
+      } else if (acct.type === 'Revenue') {
+        totalRevenue += balance;
+      } else if (acct.type === 'Expense') {
+        totalExpenses += balance;
+      }
+    }
+
+    // Retained earnings = cumulative Revenue - Expenses
+    const retainedEarnings = round2(totalRevenue - totalExpenses);
+    // Find or add retained earnings
+    const reIdx = sections.equity.findIndex(e => e.code === '3100');
+    if (reIdx >= 0) sections.equity[reIdx].balance = round2(sections.equity[reIdx].balance + retainedEarnings);
+    else sections.equity.push({ code: '3100', name: 'Retained Earnings', balance: retainedEarnings });
+
+    const sumBal = arr => round2(arr.reduce((s,a) => s + a.balance, 0));
+    const totalCurrentAssets = sumBal(sections.current_assets);
+    const totalFixedAssets   = sumBal(sections.fixed_assets);
+    const totalContraAssets  = sumBal(sections.contra_assets);
+    const totalAssets        = round2(totalCurrentAssets + totalFixedAssets - totalContraAssets);
+    const totalCurrentLiab   = sumBal(sections.current_liabilities);
+    const totalLongTermLiab  = sumBal(sections.long_term_liabilities);
+    const totalLiabilities   = round2(totalCurrentLiab + totalLongTermLiab);
+    const totalEquity        = sumBal(sections.equity);
+    const totalLiabEquity    = round2(totalLiabilities + totalEquity);
+
+    res.json({
+      as_of: cutoff,
+      assets: {
+        current: { items: sections.current_assets, total: totalCurrentAssets },
+        fixed: { items: sections.fixed_assets, total: totalFixedAssets },
+        contra: { items: sections.contra_assets, total: totalContraAssets },
+        total: totalAssets,
+      },
+      liabilities: {
+        current: { items: sections.current_liabilities, total: totalCurrentLiab },
+        long_term: { items: sections.long_term_liabilities, total: totalLongTermLiab },
+        total: totalLiabilities,
+      },
+      equity: { items: sections.equity, total: totalEquity },
+      total_liabilities_equity: totalLiabEquity,
+      balanced: Math.abs(totalAssets - totalLiabEquity) < 1,
+      retained_earnings: retainedEarnings,
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CASH FLOW STATEMENT (from journal entries on cash/bank accounts)
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/cash-flow-statement', auth, async (req, res) => {
+  try {
+    const { from, to } = req.query;
+    const today = new Date();
+    const periodEnd   = to   || today.toISOString().slice(0, 10);
+    const periodStart = from || `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-01`;
+
+    // Cash/bank account codes
+    const cashCodes = ['1000','1010','1100','1110'];
+
+    // Fetch COA for classification
+    const { data: coa } = await supabase.from('chart_of_accounts').select('code,name,type,subtype').eq('active', true);
+    const coaMap = {};
+    for (const a of coa||[]) coaMap[a.code] = a;
+
+    // Journal entries in period
+    const { data: jes } = await supabase.from('journal_entries').select('id,date,description').gte('date', periodStart).lte('date', periodEnd);
+    const jeIds = (jes||[]).map(r=>r.id);
+
+    // Opening balance: all cash/bank movements before period start
+    const { data: preJes } = await supabase.from('journal_entries').select('id').lt('date', periodStart);
+    let openingBalance = 0;
+    if (preJes?.length) {
+      const { data: preLines } = await supabase.from('journal_lines').select('account_code,debit,credit').in('journal_id', preJes.map(r=>r.id));
+      for (const l of preLines||[]) {
+        if (cashCodes.includes(l.account_code)) openingBalance += round2((l.debit||0) - (l.credit||0));
+      }
+    }
+
+    if (!jeIds.length) {
+      return res.json({
+        period: { from: periodStart, to: periodEnd },
+        opening_balance: round2(openingBalance),
+        operating: { items: [], total: 0 },
+        investing: { items: [], total: 0 },
+        financing: { items: [], total: 0 },
+        net_change: 0,
+        closing_balance: round2(openingBalance),
+      });
+    }
+
+    // Get all lines for period
+    const { data: allLines } = await supabase.from('journal_lines').select('journal_id,account_code,debit,credit').in('journal_id', jeIds);
+
+    // Group lines by journal entry
+    const jeLines = {};
+    for (const l of allLines||[]) {
+      if (!jeLines[l.journal_id]) jeLines[l.journal_id] = [];
+      jeLines[l.journal_id].push(l);
+    }
+
+    // For each journal entry that touches cash/bank, classify the contra account
+    const operating = {}, investing = {}, financing = {};
+    let opTotal = 0, invTotal = 0, finTotal = 0;
+
+    for (const je of jes||[]) {
+      const jLines = jeLines[je.id] || [];
+      // Find cash/bank lines
+      const cashLines = jLines.filter(l => cashCodes.includes(l.account_code));
+      const contraLines = jLines.filter(l => !cashCodes.includes(l.account_code));
+      if (!cashLines.length) continue;
+
+      const cashFlow = round2(cashLines.reduce((s,l) => s + (l.debit||0) - (l.credit||0), 0));
+      if (cashFlow === 0) continue;
+
+      // Classify by contra account
+      const contra = contraLines[0];
+      const contraMeta = contra ? coaMap[contra.account_code] : null;
+      const label = contra?.account_code ? `${contra.account_code} ${contraMeta?.name||''}`.trim() : je.description;
+
+      if (contraMeta) {
+        if (['1500','1510','1520','1590'].includes(contra.account_code) || contraMeta.subtype === 'Fixed Asset' || contraMeta.subtype === 'Contra Asset') {
+          // Investing
+          investing[label] = round2((investing[label]||0) + cashFlow);
+          invTotal += cashFlow;
+        } else if (['2300','2400','3000','3200','6900'].includes(contra.account_code) || contraMeta.subtype === 'Long-term Liability' || contraMeta.type === 'Equity') {
+          // Financing
+          financing[label] = round2((financing[label]||0) + cashFlow);
+          finTotal += cashFlow;
+        } else {
+          // Operating
+          operating[label] = round2((operating[label]||0) + cashFlow);
+          opTotal += cashFlow;
+        }
+      } else {
+        operating[label || 'Other'] = round2((operating[label||'Other']||0) + cashFlow);
+        opTotal += cashFlow;
+      }
+    }
+
+    const toItems = obj => Object.entries(obj).map(([name, amount]) => ({ name, amount: round2(amount) })).filter(i=>i.amount!==0).sort((a,b)=>Math.abs(b.amount)-Math.abs(a.amount));
+    const netChange = round2(opTotal + invTotal + finTotal);
+
+    res.json({
+      period: { from: periodStart, to: periodEnd },
+      opening_balance: round2(openingBalance),
+      operating: { items: toItems(operating), total: round2(opTotal) },
+      investing: { items: toItems(investing), total: round2(invTotal) },
+      financing: { items: toItems(financing), total: round2(finTotal) },
+      net_change: netChange,
+      closing_balance: round2(openingBalance + netChange),
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // FIXED ASSETS & DEPRECIATION
 // ═══════════════════════════════════════════════════════════════════════════════
 router.get('/fixed-assets', auth, async (req, res) => {
