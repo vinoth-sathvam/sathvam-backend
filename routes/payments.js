@@ -610,18 +610,21 @@ router.get('/refund-status/:orderId', async (req, res) => {
   }
 });
 
-// POST /api/webhooks/razorpay
-// Razorpay webhook — backup for payment.captured events
-router.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+// Razorpay webhook handler — shared by both /webhook and / routes
+async function handleRazorpayWebhook(req, res) {
   try {
     const signature = req.headers['x-razorpay-signature'];
-    const body      = req.body;
+    // Use rawBody (Buffer) stored by express.json verify callback for HMAC verification
+    const rawBody   = req.rawBody || Buffer.from(JSON.stringify(req.body));
     const expected  = crypto.createHmac('sha256', process.env.RAZORPAY_WEBHOOK_SECRET)
-                            .update(body).digest('hex');
+                            .update(rawBody).digest('hex');
 
-    if (expected !== signature) return res.status(400).json({ error: 'Invalid signature' });
+    if (expected !== signature) {
+      console.error('[webhook] Signature mismatch — expected:', expected, 'got:', signature);
+      return res.status(400).json({ error: 'Invalid signature' });
+    }
 
-    const event = JSON.parse(body);
+    const event = typeof req.body === 'object' ? req.body : JSON.parse(rawBody);
     if (event.event === 'payment.captured') {
       const payment = event.payload.payment.entity;
       console.log(`[webhook] payment.captured: ${payment.id} ₹${payment.amount / 100}`);
@@ -765,12 +768,61 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
     if (event.event === 'payment_link.paid' || event.event === 'payment_link.completed') {
       const paymentLinkId = event.payload?.payment_link?.entity?.id;
       const paymentId     = event.payload?.payment?.entity?.id;
+      const linkNotes     = event.payload?.payment_link?.entity?.notes || {};
+
       if (paymentLinkId && paymentId) {
-        try {
-          const { handlePaymentLinkPaid } = require('./waOrdering');
-          await handlePaymentLinkPaid(paymentLinkId, paymentId);
-        } catch (e) {
-          console.error('[wa-order-webhook]', e.message);
+        // Check if this is a POS sale payment link
+        if (linkNotes.source === 'pos_sale' && linkNotes.sale_id) {
+          try {
+            const paidAmount = (event.payload?.payment_link?.entity?.amount_paid || event.payload?.payment?.entity?.amount || 0) / 100;
+            console.log(`[webhook] POS payment link paid: ${paymentLinkId} ₹${paidAmount} for sale ${linkNotes.sale_id}`);
+
+            // Update sale record
+            await supabase.from('sales').update({
+              amount_paid: paidAmount,
+              payment_method: 'upi',
+              payment_id: paymentId,
+              payment_status: 'paid',
+            }).eq('id', linkNotes.sale_id);
+
+            // Clean up stashed data
+            await supabase.from('settings').delete().eq('key', `pos_payment_link_${paymentLinkId}`).catch(() => {});
+
+            // Notify admin
+            const adminPhones = [process.env.WA_ADMIN_PHONE1, process.env.WA_NOTIFY_TO].filter(Boolean);
+            const msg = `✅ *POS Payment Received*\n\n` +
+              `📋 Order: ${linkNotes.order_no || '—'}\n` +
+              `💰 Amount: ₹${paidAmount.toLocaleString('en-IN')}\n` +
+              `💳 Via: Payment Link\n` +
+              `🔑 ${paymentId}\n\n` +
+              `🕐 ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })} IST`;
+            for (const phone of adminPhones) {
+              try { await gaSendText(phone, msg); } catch(e) {}
+            }
+
+            // Send receipt to customer
+            const { data: stashed } = await supabase.from('settings').select('value').eq('key', `pos_payment_link_${paymentLinkId}`).maybeSingle();
+            const custPhone = stashed?.value?.customerPhone || linkNotes.wa_phone;
+            if (custPhone) {
+              try {
+                await gaSendText(custPhone,
+                  `✅ *Payment Received — Sathvam*\n\n` +
+                  `Thank you! Your payment of ₹${paidAmount.toLocaleString('en-IN')} for order ${linkNotes.order_no || ''} has been received.\n\n` +
+                  `— Team Sathvam 🌿`
+                );
+              } catch(e) {}
+            }
+          } catch (e) {
+            console.error('[webhook] POS payment link processing error:', e.message);
+          }
+        } else {
+          // WhatsApp ordering flow payment link
+          try {
+            const { handlePaymentLinkPaid } = require('./waOrdering');
+            await handlePaymentLinkPaid(paymentLinkId, paymentId);
+          } catch (e) {
+            console.error('[wa-order-webhook]', e.message);
+          }
         }
       }
     }
@@ -818,7 +870,12 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
     console.error('Webhook error:', err.message);
     res.status(500).json({ error: 'Webhook processing error' });
   }
-});
+}
+
+// Mount webhook handler on both /webhook and / so it works whether
+// Razorpay is configured to POST to /api/webhooks or /api/webhooks/webhook
+router.post('/webhook', handleRazorpayWebhook);
+router.post('/', handleRazorpayWebhook);
 
 // POST /api/payments/place-cod
 // Place a Cash on Delivery order (no Razorpay)
@@ -904,6 +961,144 @@ router.post('/place-cod', async (req, res) => {
     res.json({ success: true, orderNo: generatedOrderNo, orderId: dbId });
   } catch (err) {
     console.error('COD order error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── POS Payment Link + QR ─────────────────────────────────────────────────────
+// POST /api/payments/create-payment-link
+// Creates a Razorpay payment link for POS sales, sends via WhatsApp + SMS
+router.post('/create-payment-link', auth, async (req, res) => {
+  try {
+    const { saleId, amount, customerName, customerPhone, orderNo, items } = req.body;
+    if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid amount' });
+    if (!customerPhone) return res.status(400).json({ error: 'Customer phone required' });
+
+    const keyId     = process.env.RAZORPAY_KEY_ID;
+    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    const authHeader = Buffer.from(`${keyId}:${keySecret}`).toString('base64');
+
+    const digits  = (customerPhone || '').replace(/\D/g, '');
+    const contact = digits.length === 10 ? `+91${digits}` : `+${digits}`;
+    const expireBy = Math.floor(Date.now() / 1000) + 48 * 60 * 60; // 48hr expiry
+
+    // Build item description
+    const itemDesc = (items || []).slice(0, 3).map(i =>
+      `${i.productName || i.name || 'Item'} × ${i.qty || 1}`
+    ).join(', ');
+    const desc = `${orderNo || 'Sathvam Order'} — ${itemDesc}`.slice(0, 250);
+
+    // Create Razorpay payment link
+    const linkRes = await fetch('https://api.razorpay.com/v1/payment_links', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Basic ${authHeader}` },
+      body: JSON.stringify({
+        amount:          Math.round(parseFloat(amount) * 100), // paise
+        currency:        'INR',
+        description:     desc,
+        customer:        { name: customerName || 'Customer', contact },
+        notify:          { sms: true, email: false },
+        reminder_enable: true,
+        expire_by:       expireBy,
+        upi_link:        true,   // generates a UPI deep-link for GPay/PhonePe
+        notes: {
+          source:     'pos_sale',
+          sale_id:    saleId || '',
+          order_no:   orderNo || '',
+        },
+      }),
+    });
+    const linkData = await linkRes.json();
+
+    if (!linkData.id) {
+      console.error('[payment-link] Razorpay error:', JSON.stringify(linkData));
+      return res.status(500).json({ error: linkData.error?.description || 'Failed to create payment link' });
+    }
+
+    const paymentUrl = linkData.short_url;
+    const paymentLinkId = linkData.id;
+
+    // Store payment link reference in sales record (if saleId provided)
+    if (saleId) {
+      try {
+        await supabase.from('sales').update({
+          payment_link_id: paymentLinkId,
+          payment_link_url: paymentUrl,
+        }).eq('id', saleId);
+      } catch (e) { console.warn('[payment-link] Update sale error:', e.message); }
+    }
+
+    // Also stash in settings for webhook recovery
+    try {
+      await supabase.from('settings').upsert({
+        key: `pos_payment_link_${paymentLinkId}`,
+        value: { saleId, orderNo, amount, customerName, customerPhone, created_at: new Date().toISOString() },
+        updated_at: new Date().toISOString(),
+      });
+    } catch (e) { console.warn('[payment-link] Stash error:', e.message); }
+
+    // Send via WhatsApp
+    if (!await isAutomationDisabled('payment_link')) {
+      const waMsg =
+        `🛒 *Payment Request — Sathvam*\n\n` +
+        `Hi ${(customerName || 'Customer').split(' ')[0]}!\n\n` +
+        `📋 Order: *${orderNo || 'Sathvam Purchase'}*\n` +
+        `💰 Amount: *₹${parseFloat(amount).toLocaleString('en-IN')}*\n\n` +
+        `Pay securely via UPI, card, or netbanking:\n` +
+        `🔗 ${paymentUrl}\n\n` +
+        `Link valid for 48 hours.\n` +
+        `— Team Sathvam 🌿`;
+
+      try {
+        await gaSendText(customerPhone, waMsg);
+        // Send QR code image via WhatsApp
+        const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&format=png&data=${encodeURIComponent(paymentUrl)}`;
+        await gaSendFile(customerPhone, qrImageUrl, 'payment-qr.png',
+          `📱 Scan this QR to pay ₹${parseFloat(amount).toLocaleString('en-IN')} for order ${orderNo || 'Sathvam'}`
+        );
+      } catch (e) {
+        console.error('[payment-link] WhatsApp send failed:', e.message);
+      }
+    }
+
+    // Send via SMS (Razorpay does this via notify.sms=true above, but also manual backup)
+    // Razorpay already sends SMS if notify.sms=true, so we skip manual SMS
+
+    console.log(`[payment-link] Created: ${paymentLinkId} for ${orderNo} ₹${amount} → ${paymentUrl}`);
+
+    res.json({
+      success: true,
+      paymentLinkId,
+      paymentUrl,
+      amount: parseFloat(amount),
+      expiresAt: new Date(expireBy * 1000).toISOString(),
+    });
+  } catch (err) {
+    console.error('[payment-link] Error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/payments/payment-link-status/:linkId
+// Check payment link status (polling from frontend for real-time updates)
+router.get('/payment-link-status/:linkId', auth, async (req, res) => {
+  try {
+    const keyId     = process.env.RAZORPAY_KEY_ID;
+    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    const authHeader = Buffer.from(`${keyId}:${keySecret}`).toString('base64');
+
+    const r = await fetch(`https://api.razorpay.com/v1/payment_links/${req.params.linkId}`, {
+      headers: { Authorization: `Basic ${authHeader}` },
+    });
+    const data = await r.json();
+    res.json({
+      id: data.id,
+      status: data.status,              // created | paid | expired | cancelled
+      amount: (data.amount || 0) / 100,
+      amountPaid: (data.amount_paid || 0) / 100,
+      shortUrl: data.short_url,
+    });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });

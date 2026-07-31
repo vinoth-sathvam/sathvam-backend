@@ -76,7 +76,11 @@ const referralLimiter = rateLimit({
 });
 
 app.use(cookieParser());
-app.use(express.json({ limit: '2mb' }));
+// Store raw body for webhook signature verification, then parse JSON
+app.use(express.json({
+  limit: '2mb',
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
 app.use(morgan('combined'));
 app.use(require('./middleware/auditLog'));
 
@@ -90,6 +94,8 @@ const webstoreOrders = require('./routes/webstoreOrders');
 
 app.get('/health', (req, res) => res.json({ status: 'ok', version: '1.2.0', time: new Date().toISOString() }));
 app.use('/api/public', publicLimiter, require('./routes/public'));
+// WebAuthn routes — mounted BEFORE /api/auth so they get their own limiter (not the 10 req/15min auth limiter)
+app.use('/api/auth/webauthn', rateLimit({ windowMs: 15*60*1000, max: 30, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests, please try again later' }, ...rateLimitOpts }), require('./routes/webauthn'));
 app.use('/api/auth',          authLimiter, require('./routes/auth'));
 app.use('/api/batches',       require('./routes/batches'));
 app.use('/api/products',      products);
@@ -184,6 +190,7 @@ app.use('/api/broadcasts',        require('./routes/broadcasts'));          // A
 app.use('/api/wa-marketing',      require('./routes/waMarketing'));          // WhatsApp Marketing (broadcast, schedule, templates, drip)
 app.use('/api/competitor-prices', require('./routes/competitorPrices'));
 app.use('/api/security',         require('./routes/security'));
+app.use('/api/database',         require('./routes/database'));
 app.use('/api/restock-reminders', require('./routes/restockReminder'));
 app.use('/api/checkout-recovery', require('./routes/checkoutRecovery')); // Abandoned checkout WA recovery
 app.use('/api/ca-agent',          require('./routes/caAgent'));
