@@ -170,8 +170,8 @@ async function uploadCardImage(buf, prefix) {
 }
 
 async function sendViaBotSailor(phone, message, imageUrl = null) {
-  if (imageUrl) return gaSendFile(phone, imageUrl, 'sathvam.jpg', message);
-  return gaSendText(phone, message);
+  if (imageUrl) return gaSendFile(phone, imageUrl, 'sathvam.jpg', message, { priority: true });
+  return gaSendText(phone, message, { priority: true });
 }
 
 // Decrypt the customer JSONB field of a single order
@@ -420,7 +420,7 @@ router.post('/:id/send-whatsapp-invoice', auth, async (req, res) => {
 
     const message = caption;
     const { sendFile } = require('../lib/greenapi');
-    const ok = await sendFile(phone, pdfUrl, `Invoice-${o.order_no}.pdf`, caption);
+    const ok = await sendFile(phone, pdfUrl, `Invoice-${o.order_no}.pdf`, caption, { priority: true });
     if (!ok) return res.status(500).json({ error: 'Green API send failed — check GREENAPI_INSTANCE_ID and GREENAPI_API_TOKEN' });
 
     // ── 4. Log the sent message ──────────────────────────────────────────────

@@ -72,8 +72,8 @@ async function sendOrderEmail(order, paymentId) {
 const SATHVAM_LOGO_URL = 'https://sathvam.in/logo.jpg';
 
 async function sendViaBotSailor(phone, message, imageUrl = SATHVAM_LOGO_URL) {
-  if (imageUrl) return gaSendFile(phone, imageUrl, 'sathvam.jpg', message);
-  return gaSendText(phone, message);
+  if (imageUrl) return gaSendFile(phone, imageUrl, 'sathvam.jpg', message, { priority: true });
+  return gaSendText(phone, message, { priority: true });
 }
 
 // ── WhatsApp order alert (to admin) ──────────────────────────────────────────
