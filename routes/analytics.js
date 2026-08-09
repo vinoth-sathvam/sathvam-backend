@@ -8,6 +8,14 @@ const router = express.Router();
 
 const TODAY = () => new Date().toISOString().slice(0, 10);
 
+// Bot / crawler detection — skip tracking for known bots
+const BOT_UA_RE = /bot|crawl|spider|slurp|mediapartners|facebookexternalhit|bingpreview|googlebot|applebot|yandex|baidu|duckduckbot|semrush|ahrefs|mj12bot|dotbot|petalbot|bytespider|gptbot|chatgpt|claudebot|anthropic|ccbot|ia_archiver|archive\.org|wget|curl|python-requests|go-http-client|java\/|libwww|scrapy|phantomjs|headless|prerender|lighthouse|pagespeed|gtmetrix|pingdom|uptimerobot|statuspage|monitor|health.?check|nagios|zabbix/i;
+function isBot(req) {
+  const ua = req.headers['user-agent'] || '';
+  if (!ua || ua.length < 10) return true; // no UA or suspiciously short
+  return BOT_UA_RE.test(ua);
+}
+
 // IP geolocation using ip-api.com (free tier — HTTP only, no key needed)
 const geoCache = new Map();
 async function geoIP(ip) {
@@ -43,6 +51,9 @@ async function updateAnalytics(key, updater, def = {}) {
 // POST /api/analytics/track  (public — called from website, no auth)
 router.post('/track', async (req, res) => {
   try {
+    // Skip bots/crawlers — don't pollute analytics
+    if (isBot(req)) return res.json({ ok: true });
+
     const { type, path, title, product_id, product_name,
             session_id, items, customer_name, customer_phone, customer_email,
             cart_total, order_no } = req.body;
@@ -761,12 +772,13 @@ router.get('/segments', auth, async (req, res) => {
 
     for (const o of orders) {
       const cust  = o.customer || {};
-      const email = cust.email || '__unknown__';
+      const rawEmail = cust.email || '__unknown__';
+      const email = decrypt(rawEmail) || rawEmail;
       if (!map.has(email)) {
         map.set(email, {
           email,
-          name:             cust.name  || '',
-          phone:            cust.phone || '',
+          name:             decrypt(cust.name) || cust.name || '',
+          phone:            decrypt(cust.phone) || cust.phone || '',
           total_spend:      0,
           order_count:      0,
           last_order_date:  null,
@@ -1076,7 +1088,8 @@ router.get('/segments/summary', auth, async (req, res) => {
 
     for (const o of orders) {
       const cust  = o.customer || {};
-      const email = cust.email || '__unknown__';
+      const rawEmail = cust.email || '__unknown__';
+      const email = decrypt(rawEmail) || rawEmail;
       if (!map.has(email)) {
         map.set(email, { total_spend: 0, order_count: 0, last_order_date: null, first_order_date: null });
       }

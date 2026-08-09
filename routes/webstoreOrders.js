@@ -404,22 +404,23 @@ router.post('/:id/send-whatsapp-invoice', auth, async (req, res) => {
     const fileName = `invoice-${o.order_no}-${Date.now()}.pdf`;
     const pdfUrl = await uploadFile('invoices', fileName, pdfBuf, 'application/pdf');
 
-    // ── 3. Send text message + PDF link via Green API ───────────────────────
+    // ── 3. Send PDF as file attachment via Green API ────────────────────────
     const subtotal = parseFloat(o.subtotal || 0);
     const gst      = parseFloat(o.gst_amount || o.gst || 0);
     const shipping = parseFloat(o.shipping || 0);
     const total    = parseFloat(o.total || (subtotal + gst + shipping));
     const payMode  = (cust.payment || o.payment_mode || 'online').replace(/upi/i,'UPI').replace(/cod/i,'Cash on Delivery');
 
-    const message =
+    const caption =
       `🧾 *Tax Invoice — ${o.order_no}*\n\n` +
       `Hi ${cust.name || 'there'}, your invoice from *Sathvam Natural Products* is ready 🌿\n\n` +
       `💰 Total: ₹${total.toFixed(2)}  |  ✅ ${payMode}\n` +
       `📅 Date: ${o.date || ''}\n\n` +
-      `📄 *Download Invoice PDF:*\n${pdfUrl}\n\n` +
       `For any queries: *+91 70923 77092*`;
 
-    const ok = await gaSendText(phone, message);
+    const message = caption;
+    const { sendFile } = require('../lib/greenapi');
+    const ok = await sendFile(phone, pdfUrl, `Invoice-${o.order_no}.pdf`, caption);
     if (!ok) return res.status(500).json({ error: 'Green API send failed — check GREENAPI_INSTANCE_ID and GREENAPI_API_TOKEN' });
 
     // ── 4. Log the sent message ──────────────────────────────────────────────
@@ -866,15 +867,25 @@ async function sendStatusWhatsApp(order, newStatus, cancelReason) {
 
 // Admin: update order status + dispatch info
 async function updateOrder(req, res) {
-  const { status, notes, courier, awb_number, dispatch_date, delivered_date, cancel_reason } = req.body;
+  const { status, notes, courier, awb_number, dispatch_date, delivered_date, cancel_reason,
+          carton_box_id, carton_box_name, carton_box_cost, carton_box_qty, carton_box_unit_cost, carton_box_deducted,
+          actual_courier_cost, courier_provider } = req.body;
   const updates = {};
-  if (status         !== undefined) updates.status         = status;
-  if (notes          !== undefined) updates.notes          = notes;
-  if (courier        !== undefined) updates.courier        = courier;
-  if (awb_number     !== undefined) updates.awb_number     = awb_number;
-  if (dispatch_date  !== undefined) updates.dispatch_date  = dispatch_date;
-  if (delivered_date !== undefined) updates.delivered_date = delivered_date;
-  if (cancel_reason  !== undefined) updates.cancel_reason  = cancel_reason;
+  if (status               !== undefined) updates.status               = status;
+  if (notes                !== undefined) updates.notes                = notes;
+  if (courier              !== undefined) updates.courier              = courier;
+  if (awb_number           !== undefined) updates.awb_number           = awb_number;
+  if (dispatch_date        !== undefined) updates.dispatch_date        = dispatch_date;
+  if (delivered_date       !== undefined) updates.delivered_date       = delivered_date;
+  if (cancel_reason        !== undefined) updates.cancel_reason        = cancel_reason;
+  if (carton_box_id        !== undefined) updates.carton_box_id        = carton_box_id;
+  if (carton_box_name      !== undefined) updates.carton_box_name      = carton_box_name;
+  if (carton_box_cost      !== undefined) updates.carton_box_cost      = carton_box_cost;
+  if (carton_box_qty       !== undefined) updates.carton_box_qty       = carton_box_qty;
+  if (carton_box_unit_cost !== undefined) updates.carton_box_unit_cost = carton_box_unit_cost;
+  if (carton_box_deducted  !== undefined) updates.carton_box_deducted  = carton_box_deducted;
+  if (actual_courier_cost  !== undefined) updates.actual_courier_cost  = actual_courier_cost;
+  if (courier_provider     !== undefined) updates.courier_provider     = courier_provider;
   const { data, error } = await supabase
     .from('webstore_orders')
     .update(updates)

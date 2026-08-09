@@ -4,6 +4,14 @@ const supabase   = require('../config/supabase');
 const nodemailer = require('nodemailer');
 const router     = express.Router();
 
+// Bot / crawler detection — skip tracking for known bots
+const BOT_UA_RE = /bot|crawl|spider|slurp|mediapartners|facebookexternalhit|bingpreview|googlebot|applebot|yandex|baidu|duckduckbot|semrush|ahrefs|mj12bot|dotbot|petalbot|bytespider|gptbot|chatgpt|claudebot|anthropic|ccbot|ia_archiver|archive\.org|wget|curl|python-requests|go-http-client|java\/|libwww|scrapy|phantomjs|headless|prerender|lighthouse|pagespeed|gtmetrix|pingdom|uptimerobot|statuspage|monitor|health.?check|nagios|zabbix/i;
+function isBot(req) {
+  const ua = req.headers['user-agent'] || '';
+  if (!ua || ua.length < 10) return true;
+  return BOT_UA_RE.test(ua);
+}
+
 // IP geolocation (shared with analytics.js — free ip-api.com, no key needed)
 const _geoCache = new Map();
 function geoIP(ip) {
@@ -102,11 +110,13 @@ router.get('/stock', async (req, res) => {
       { data: batches },
       { data: products },
       { data: procurements },
+      { data: rawMaterials },
     ] = await Promise.all([
       supabase.from('stock_ledger').select('product_id,type,qty,channel'),
       supabase.from('batches').select('oil_type,oil_output'),
-      supabase.from('products').select('id,oil_type_key,pack_size,pack_unit').eq('active', true),
+      supabase.from('products').select('id,name,oil_type_key,raw_mat_key,pack_size,pack_unit,cat').eq('active', true),
       supabase.from('procurements').select('commodity_name,cleaned_qty,received_qty,ordered_qty,notes,status'),
+      supabase.from('raw_materials').select('id,name,current_stock,category').eq('active', true),
     ]);
 
     // Step 1: aggregate ledger by product (in - out)
@@ -185,6 +195,51 @@ router.get('/stock', async (req, res) => {
         const packUnit = (prod.pack_unit || 'ML').toUpperCase();
         const packL = (parseFloat(prod.pack_size) || 0) / (packUnit === 'L' ? 1 : 1000);
         stock[prod.id] = packL > 0 ? Math.floor(available / packL) : (available > 0 ? 999 : 0);
+      }
+    }
+
+    // Step 6: For non-oil products with no ledger stock, estimate from raw_materials.current_stock
+    // This covers pack-on-demand products (dals, flours, spices, millets) where bulk kg is in raw_materials
+    const rmNameMatch = (prodName, rmName) => {
+      const pn = (prodName || '').toLowerCase().replace(/\s*\d+\s*(g|gm|kg|ml|l)$/i, '').trim();
+      const rn = (rmName || '').toLowerCase().trim();
+      if (rn === pn || rn.startsWith(pn) || pn.startsWith(rn)) return true;
+      const pw = pn.split(/\s+/).filter(w => w.length > 2);
+      const rw = rn.split(/\s+/).filter(w => w.length > 2);
+      if (pw.length >= 2 && rw.length >= 2) {
+        const overlap = pw.filter(w => rw.some(r => r.includes(w) || w.includes(r)));
+        if (overlap.length >= 2) return true;
+      }
+      return false;
+    };
+
+    for (const prod of (products || [])) {
+      if (stock[prod.id] > 0) continue; // already has stock from ledger/oil
+      if (prod.oil_type_key) continue;  // oil products handled above
+
+      // Find matching raw material
+      const key = prod.raw_mat_key || '';
+      let rm = null;
+      if (key) {
+        rm = (rawMaterials || []).find(m => rmNameMatch(key, m.name));
+      }
+      if (!rm) {
+        rm = (rawMaterials || []).find(m => rmNameMatch(prod.name, m.name));
+      }
+      if (!rm || !(rm.current_stock > 0)) continue;
+
+      // Convert raw material kg to product packs
+      const ps = parseFloat(prod.pack_size) || 0;
+      const pu = (prod.pack_unit || '').toLowerCase();
+      let packKg = 0;
+      if (pu === 'kg') packKg = ps;
+      else if (pu === 'g' || pu === 'gm' || pu === 'gms') packKg = ps / 1000;
+      else if (pu === 'l' || pu === 'ltr') packKg = ps; // 1L ≈ 1kg
+      else if (pu === 'ml') packKg = ps / 1000;
+      else packKg = ps / 1000; // default assume grams
+
+      if (packKg > 0) {
+        stock[prod.id] = Math.floor(rm.current_stock / packKg);
       }
     }
 
@@ -362,6 +417,7 @@ router.post('/track/visit', async (req, res) => {
 // POST /api/public/track/pageview  { path, title? }
 router.post('/track/pageview', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
+  if (isBot(req)) return res.json({ ok: true });
   try {
     const { path, title = '' } = req.body || {};
     if (!path) return res.status(400).json({ error: 'path required' });
@@ -377,6 +433,7 @@ router.post('/track/pageview', async (req, res) => {
 // POST /api/public/track/product-view  { productId, productName? }
 router.post('/track/product-view', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
+  if (isBot(req)) return res.json({ ok: true });
   try {
     const { productId, productName = '' } = req.body || {};
     if (!productId) return res.status(400).json({ error: 'productId required' });
@@ -541,7 +598,7 @@ router.post('/coupons/validate', async (req, res) => {
   try {
     const { data, error } = await supabase
       .from('coupons')
-      .select('code,type,value,min_order,max_uses,used_count,expires_at,description')
+      .select('code,type,value,min_order,max_uses,uses_count,expires_at,description')
       .ilike('code', code.trim())
       .eq('active', true)
       .single();
@@ -549,7 +606,7 @@ router.post('/coupons/validate', async (req, res) => {
     if (error || !data) return res.status(404).json({ error: 'Invalid coupon code' });
     if (data.expires_at && new Date(data.expires_at) < new Date())
       return res.status(400).json({ error: 'This coupon has expired' });
-    if (data.max_uses && data.used_count >= data.max_uses)
+    if (data.max_uses && data.uses_count >= data.max_uses)
       return res.status(400).json({ error: 'This coupon has reached its usage limit' });
     if (data.min_order && cart_total < data.min_order)
       return res.status(400).json({ error: `Minimum order ₹${data.min_order} required for this coupon` });
@@ -675,6 +732,7 @@ router.post('/live-viewers', async (req, res) => {
 // POST /api/public/heartbeat — store frontend pings every 30s to signal active session
 router.post('/heartbeat', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
+  if (isBot(req)) return res.json({ ok: true, count: 0 });
   const { session_id, page, referrer, utm_source, cart_value, is_new } = req.body;
   if (!session_id) return res.json({ ok: false });
   try {
