@@ -227,7 +227,7 @@ products.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const raw = {
     name:p.name, sku:p.sku, cat:p.cat, unit:p.unit,
     pack_size:p.packSize, pack_unit:p.packUnit, pcs_per_box:p.pcsPerBox,
-    oil_type_key:p.oilTypeKey,
+    oil_type_key:p.oilTypeKey, raw_mat_key:p.rawMatKey,
     cake_type_key:p.cakeTypeKey, reorder:p.reorder, gst:p.gst, price:p.price,
     retail_price:p.retailPrice, website_price:p.websitePrice,
     intl_price:p.intlPrice, retail_profit_pct:p.retailProfitPct,
@@ -1040,23 +1040,59 @@ procurement.post('/bulk', auth, requireRole('admin','manager'), async (req, res)
 });
 
 // ── POST /procurement/:id/attach-bill — attach vendor invoice (bill no + optional scan) ──
+// Supports multiple invoices per PO — appends to the `invoices` JSONB array
 procurement.post('/:id/attach-bill', auth, requireRole('admin','manager'), procUpload.single('bill_scan'), async (req, res) => {
   try {
     const { vendor_bill_no } = req.body;
-    const updates = {};
-
-    if (vendor_bill_no !== undefined) updates.vendor_bill_no = vendor_bill_no.trim();
+    const billNo = (vendor_bill_no || '').trim();
+    let scanUrl = '';
 
     if (req.file) {
       const ext = INVOICE_MIME[req.file.mimetype];
       if (!ext) return res.status(400).json({ error: 'Invalid file type. Allowed: jpg, png, webp, pdf' });
       const fileName = `proc-${req.params.id}-${Date.now()}.${ext}`;
-      updates.bill_scan_url = await uploadFile('po-bills', fileName, req.file.buffer, req.file.mimetype);
+      scanUrl = await uploadFile('po-bills', fileName, req.file.buffer, req.file.mimetype);
     }
+
+    // Fetch current invoices array
+    const { data: current } = await supabase.from('procurements').select('invoices, vendor_bill_no, bill_scan_url').eq('id', req.params.id).single();
+    const invoices = Array.isArray(current?.invoices) ? [...current.invoices] : [];
+
+    // Add new invoice entry
+    const entry = { bill_no: billNo, scan_url: scanUrl, uploaded_at: new Date().toISOString() };
+    invoices.push(entry);
+
+    // Also keep vendor_bill_no / bill_scan_url updated with the latest for backward compat
+    const updates = {
+      invoices,
+      vendor_bill_no: billNo || current?.vendor_bill_no || '',
+      bill_scan_url: scanUrl || current?.bill_scan_url || '',
+    };
 
     const { data, error } = await supabase.from('procurements').update(updates).eq('id', req.params.id).select().single();
     if (error) return res.status(400).json({ error: error.message });
-    res.json({ ok: true, vendor_bill_no: data.vendor_bill_no, bill_scan_url: data.bill_scan_url });
+    res.json({ ok: true, vendor_bill_no: data.vendor_bill_no, bill_scan_url: data.bill_scan_url, invoices: data.invoices });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── DELETE /procurement/:id/invoice/:idx — remove a specific invoice from the array ──
+procurement.delete('/:id/invoice/:idx', auth, requireRole('admin','manager'), async (req, res) => {
+  try {
+    const idx = parseInt(req.params.idx);
+    const { data: current } = await supabase.from('procurements').select('invoices').eq('id', req.params.id).single();
+    const invoices = Array.isArray(current?.invoices) ? [...current.invoices] : [];
+    if (idx < 0 || idx >= invoices.length) return res.status(404).json({ error: 'Invoice not found' });
+    invoices.splice(idx, 1);
+    // Update vendor_bill_no/bill_scan_url to latest remaining (or clear)
+    const last = invoices[invoices.length - 1];
+    const updates = {
+      invoices,
+      vendor_bill_no: last?.bill_no || '',
+      bill_scan_url: last?.scan_url || '',
+    };
+    const { error } = await supabase.from('procurements').update(updates).eq('id', req.params.id);
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ ok: true, invoices });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1255,7 +1291,10 @@ vendors.post('/', auth, requireRole('admin','manager'), async (req, res) => {
     category:v.category, billing_city:v.billingCity,
     billing_state:v.billingState, billing_pincode:v.billingPincode,
     bank_name:v.bankName, bank_account:v.bankAccount, bank_ifsc:v.bankIfsc,
-    notes:v.notes
+    notes:v.notes,
+    website:v.website||null, opening_balance:parseFloat(v.openingBalance)||0,
+    credit_limit:parseFloat(v.creditLimit)||0, tds_applicable:!!v.tdsApplicable,
+    tds_section:v.tdsSection||null, tds_rate:parseFloat(v.tdsRate)||0
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.status(201).json(data);
@@ -1265,7 +1304,10 @@ vendors.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const { data, error } = await supabase.from('vendors').update({
     display_name:v.displayName, company_name:v.companyName,
     email:v.email, mobile:v.mobile, gstin:v.gstin,
-    payment_terms:v.paymentTerms, category:v.category, notes:v.notes
+    payment_terms:v.paymentTerms, category:v.category, notes:v.notes,
+    website:v.website||null, opening_balance:parseFloat(v.openingBalance)||0,
+    credit_limit:parseFloat(v.creditLimit)||0, tds_applicable:!!v.tdsApplicable,
+    tds_section:v.tdsSection||null, tds_rate:parseFloat(v.tdsRate)||0
   }).eq('id', req.params.id).select().single();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);

@@ -117,6 +117,22 @@ b2bCustomers.post('/', auth, requireRole('admin'), async (req, res) => {
 });
 
 const b2bOrders = express.Router();
+
+// GET /api/b2b/orders/next-invoice-no — returns next sequential B2B invoice number
+b2bOrders.get('/next-invoice-no', auth, async (req, res) => {
+  try {
+    const now = new Date();
+    const fy = now.getMonth() >= 3 ? `${now.getFullYear()}-${String(now.getFullYear()+1).slice(2)}` : `${now.getFullYear()-1}-${String(now.getFullYear()).slice(2)}`;
+    const { data } = await supabase.from('settings').select('value').eq('key','b2b_invoice_counter').single();
+    const counter = (data?.value?.counter || 0) + 1;
+    const invoiceNo = `SAT/B2B/${fy}/${String(counter).padStart(3,'0')}`;
+    await supabase.from('settings').upsert({ key: 'b2b_invoice_counter', value: { counter, fy }, updated_at: new Date().toISOString() });
+    res.json({ invoice_no: invoiceNo, counter });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 b2bOrders.get('/', auth, async (req, res) => {
   // B2B customers can only see their own orders
   let query = supabase.from('b2b_orders')

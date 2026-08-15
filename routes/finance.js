@@ -252,6 +252,18 @@ router.post('/receivables/:id/record-payment', auth, async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// POST /receivables/:id/send-reminder — send payment reminder (placeholder)
+router.post('/receivables/:id/send-reminder', auth, async (req, res) => {
+  try {
+    // This is a placeholder — actual sending would go through WhatsApp/email
+    const id = req.params.id;
+    const { customer_name, amount, phone, email } = req.body;
+    // Log the reminder attempt
+    auditLog(req, 'send_reminder', 'receivable', id, { customer_name, amount, phone, email });
+    res.json({ ok: true, message: `Reminder logged for ${customer_name || id}. Send manually via WhatsApp/email.` });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // PAYABLES (AP)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -450,8 +462,19 @@ router.get('/bank/transactions', auth, async (req, res) => {
     if (error) return res.status(500).json({ error: error.message });
 
     const txns = data || [];
-    const total_credit = txns.filter(t=>t.type==='credit').reduce((s,t)=>s+t.amount,0);
-    const total_debit  = txns.filter(t=>t.type==='debit').reduce((s,t)=>s+t.amount,0);
+
+    // Compute totals from ALL transactions for the account (not just paginated results)
+    let total_credit = 0, total_debit = 0;
+    if (account_id) {
+      const { data: allTxns } = await supabase.from('bank_transactions').select('type,amount').eq('bank_account_id', account_id);
+      if (allTxns) {
+        total_credit = allTxns.filter(t=>t.type==='credit').reduce((s,t)=>s+(parseFloat(t.amount)||0),0);
+        total_debit  = allTxns.filter(t=>t.type==='debit').reduce((s,t)=>s+(parseFloat(t.amount)||0),0);
+      }
+    } else {
+      total_credit = txns.filter(t=>t.type==='credit').reduce((s,t)=>s+t.amount,0);
+      total_debit  = txns.filter(t=>t.type==='debit').reduce((s,t)=>s+t.amount,0);
+    }
     res.json({ transactions: txns, total_credit:round2(total_credit), total_debit:round2(total_debit), count:txns.length });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -461,7 +484,17 @@ router.post('/bank/transactions', auth, async (req, res) => {
     const { bank_account_id, date, type, amount, description, reference, category } = req.body;
     if (!bank_account_id || !type || !amount) return res.status(400).json({ error: 'bank_account_id, type, amount required' });
     const amt = round2(amount);
-    const { data, error } = await supabase.from('bank_transactions').insert({ bank_account_id, date: date||new Date().toISOString().slice(0,10), type, amount:amt, description:description||'', reference:reference||'', category:category||'', created_by:req.user?.email||'' }).select().single();
+    const txnDate = date||new Date().toISOString().slice(0,10);
+
+    // Duplicate check: same account + date + type + amount (within ₹0.50)
+    const { data: existing } = await supabase.from('bank_transactions')
+      .select('id').eq('bank_account_id', bank_account_id).eq('date', txnDate).eq('type', type)
+      .gte('amount', amt - 0.5).lte('amount', amt + 0.5).limit(1);
+    if (existing && existing.length > 0) {
+      return res.status(409).json({ error: 'Duplicate transaction — same date, type and amount already exists', duplicate: true });
+    }
+
+    const { data, error } = await supabase.from('bank_transactions').insert({ bank_account_id, date: txnDate, type, amount:amt, description:description||'', reference:reference||'', category:category||'', created_by:req.user?.email||'' }).select().single();
     if (error) return res.status(400).json({ error: error.message });
     await adjustBalance(bank_account_id, type === 'credit' ? amt : -amt);
 
@@ -2087,6 +2120,235 @@ router.get('/ap-aging-detail', auth, async (req, res) => {
     for (const r of rows) buckets[r.bucket] = round2((buckets[r.bucket]||0) + r.outstanding);
 
     res.json({ rows: rows.sort((a,b)=>b.days_overdue-a.days_overdue), byVendor: Object.values(byVendor).sort((a,b)=>b.total-a.total), buckets, total: round2(rows.reduce((s,r)=>s+r.outstanding,0)) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CREDIT NOTES
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/credit-notes', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('credit_notes').select('*').order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/credit-notes', auth, async (req, res) => {
+  try {
+    const { date, customer_name, invoice_no, invoice_id, source, reason, items, subtotal, gst_amount, total, refund_mode, notes } = req.body;
+    if (!date || !total) return res.status(400).json({ error: 'date and total required' });
+    // Generate CN number
+    const yr = new Date(date).getFullYear();
+    const { data: lastCn } = await supabase.from('credit_notes').select('cn_no').ilike('cn_no', `CN-${yr}%`).order('cn_no', { ascending: false }).limit(1);
+    const seq = lastCn?.length ? parseInt((lastCn[0].cn_no||'').split('-').pop()||'0') + 1 : 1;
+    const cn_no = `CN-${yr}-${String(seq).padStart(4,'0')}`;
+
+    const { data, error } = await supabase.from('credit_notes').insert({
+      cn_no, date, customer_name, invoice_no, invoice_id, source: source||'webstore',
+      reason, items: items||[], subtotal: subtotal||0, gst_amount: gst_amount||0,
+      total, status: 'confirmed', refund_mode, notes, created_by: req.user?.name||'admin',
+    }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+
+    // Post journal entry: Debit Sales Revenue, Credit AR/Bank
+    const { insertJournal } = require('../utils/journalPoster');
+    insertJournal({
+      txn_date: date, direction: 'out', amount: total, category: 'credit_note', subcategory: 'sales_return',
+      party: customer_name, party_type: 'customer', payment_mode: refund_mode||'bank_transfer',
+      narration: `Credit Note ${cn_no} — ${reason||'Sales return'}`, source_table: 'credit_notes', source_id: data.id,
+      gst_amount: gst_amount||0, created_by: req.user?.name||'admin',
+    }).catch(e => console.error('[CN JOURNAL]', e.message));
+
+    res.status(201).json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.put('/credit-notes/:id', auth, async (req, res) => {
+  try {
+    const { status, refund_mode, refund_ref, notes } = req.body;
+    const updates = {};
+    if (status !== undefined) updates.status = status;
+    if (refund_mode !== undefined) updates.refund_mode = refund_mode;
+    if (refund_ref !== undefined) updates.refund_ref = refund_ref;
+    if (notes !== undefined) updates.notes = notes;
+    const { data, error } = await supabase.from('credit_notes').update(updates).eq('id', req.params.id).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEBIT NOTES
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/debit-notes', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('debit_notes').select('*').order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/debit-notes', auth, async (req, res) => {
+  try {
+    const { date, vendor_name, bill_no, bill_id, reason, items, subtotal, gst_amount, total, adjustment_mode, notes } = req.body;
+    if (!date || !total) return res.status(400).json({ error: 'date and total required' });
+    const yr = new Date(date).getFullYear();
+    const { data: lastDn } = await supabase.from('debit_notes').select('dn_no').ilike('dn_no', `DN-${yr}%`).order('dn_no', { ascending: false }).limit(1);
+    const seq = lastDn?.length ? parseInt((lastDn[0].dn_no||'').split('-').pop()||'0') + 1 : 1;
+    const dn_no = `DN-${yr}-${String(seq).padStart(4,'0')}`;
+
+    const { data, error } = await supabase.from('debit_notes').insert({
+      dn_no, date, vendor_name, bill_no, bill_id, reason, items: items||[],
+      subtotal: subtotal||0, gst_amount: gst_amount||0, total,
+      status: 'confirmed', adjustment_mode, notes, created_by: req.user?.name||'admin',
+    }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+
+    // Journal: Debit AP, Credit Expense/Inventory (reduces vendor liability)
+    const { insertJournal } = require('../utils/journalPoster');
+    insertJournal({
+      txn_date: date, direction: 'in', amount: total, category: 'debit_note', subcategory: 'purchase_return',
+      party: vendor_name, party_type: 'vendor', payment_mode: adjustment_mode||'adjustment',
+      narration: `Debit Note ${dn_no} — ${reason||'Purchase return'}`, source_table: 'debit_notes', source_id: data.id,
+      gst_amount: gst_amount||0, created_by: req.user?.name||'admin',
+    }).catch(e => console.error('[DN JOURNAL]', e.message));
+
+    // If linked to a bill, reduce the bill amount
+    if (bill_id) {
+      const { data: bill } = await supabase.from('vendor_bills').select('amount,paid_amount').eq('id', bill_id).single();
+      if (bill) {
+        const newAmount = round2((bill.amount||0) - (total||0));
+        await supabase.from('vendor_bills').update({ amount: Math.max(0, newAmount) }).eq('id', bill_id);
+      }
+    }
+
+    res.status(201).json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PAYMENT ALLOCATION
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/payment-allocations', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('payment_allocations').select('*').order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/payment-allocations', auth, async (req, res) => {
+  try {
+    const { payment_date, payment_amount, payment_mode, bank_account_id, reference, party_name, party_type, allocations, notes } = req.body;
+    if (!payment_date || !payment_amount || !allocations?.length) return res.status(400).json({ error: 'payment_date, payment_amount, allocations required' });
+
+    const { data, error } = await supabase.from('payment_allocations').insert({
+      payment_date, payment_amount, payment_mode, bank_account_id, reference,
+      party_name, party_type: party_type||'customer', allocations, notes,
+      created_by: req.user?.name||'admin',
+    }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+
+    // Apply allocations: update each invoice/bill's paid_amount
+    for (const alloc of allocations) {
+      if (alloc.type === 'invoice' || alloc.type === 'webstore') {
+        // AR allocation — update webstore order or B2B order
+        if (alloc.order_id) {
+          const { data: order } = await supabase.from('webstore_orders').select('total').eq('id', alloc.order_id).maybeSingle();
+          if (order) await supabase.from('webstore_orders').update({ payment_status: 'paid' }).eq('id', alloc.order_id);
+        }
+      } else if (alloc.type === 'bill') {
+        // AP allocation — update vendor bill
+        if (alloc.bill_id) {
+          const { data: bill } = await supabase.from('vendor_bills').select('paid_amount').eq('id', alloc.bill_id).single();
+          if (bill) {
+            const newPaid = round2((bill.paid_amount||0) + (alloc.amount||0));
+            const { data: updated } = await supabase.from('vendor_bills').select('amount,gst_amount').eq('id', alloc.bill_id).single();
+            const billTotal = (updated?.amount||0) + (updated?.gst_amount||0);
+            const newStatus = newPaid >= billTotal ? 'paid' : newPaid > 0 ? 'partial' : 'unpaid';
+            await supabase.from('vendor_bills').update({ paid_amount: newPaid, status: newStatus }).eq('id', alloc.bill_id);
+          }
+        }
+      }
+    }
+
+    res.status(201).json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RECURRING INVOICES
+// ═══════════════════════════════════════════════════════════════════════════════
+router.get('/recurring-invoices', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('recurring_invoices').select('*').order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+    res.json(data || []);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.post('/recurring-invoices', auth, async (req, res) => {
+  try {
+    const { template_name, customer_name, customer_id, frequency, start_date, end_date, items, subtotal, gst_amount, total, payment_terms, notes } = req.body;
+    if (!template_name || !start_date || !total) return res.status(400).json({ error: 'template_name, start_date, total required' });
+    const nextRun = start_date;
+    const { data, error } = await supabase.from('recurring_invoices').insert({
+      template_name, customer_name, customer_id, frequency: frequency||'monthly',
+      start_date, next_run: nextRun, end_date, items: items||[],
+      subtotal: subtotal||0, gst_amount: gst_amount||0, total,
+      payment_terms, notes, active: true, created_by: req.user?.name||'admin',
+    }).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.status(201).json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+router.put('/recurring-invoices/:id', auth, async (req, res) => {
+  try {
+    const allowed = ['template_name','customer_name','frequency','end_date','items','subtotal','gst_amount','total','payment_terms','notes','active','next_run'];
+    const updates = {};
+    for (const k of allowed) if (req.body[k] !== undefined) updates[k] = req.body[k];
+    const { data, error } = await supabase.from('recurring_invoices').update(updates).eq('id', req.params.id).select().single();
+    if (error) return res.status(400).json({ error: error.message });
+    res.json(data);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Generate invoice from recurring template
+router.post('/recurring-invoices/:id/generate', auth, async (req, res) => {
+  try {
+    const { data: tmpl } = await supabase.from('recurring_invoices').select('*').eq('id', req.params.id).single();
+    if (!tmpl) return res.status(404).json({ error: 'Template not found' });
+
+    // Create AR entry
+    const invDate = tmpl.next_run || new Date().toISOString().slice(0,10);
+    const invNo = `RI-${tmpl.template_name.slice(0,8).toUpperCase()}-${invDate.replace(/-/g,'')}`;
+
+    // Post to money ledger
+    const { insertLedger } = require('../utils/ledger');
+    await insertLedger({
+      txn_date: invDate, direction: 'in', amount: tmpl.total, category: 'sales',
+      subcategory: 'recurring', party: tmpl.customer_name, party_type: 'customer',
+      payment_mode: 'bank_transfer', narration: `Recurring Invoice ${invNo} — ${tmpl.template_name}`,
+      source_table: 'recurring_invoices', source_id: tmpl.id,
+      gst_amount: tmpl.gst_amount||0, created_by: req.user?.name||'system',
+    });
+
+    // Calculate next run date
+    const nextDate = new Date(tmpl.next_run || invDate);
+    if (tmpl.frequency === 'monthly') nextDate.setMonth(nextDate.getMonth() + 1);
+    else if (tmpl.frequency === 'quarterly') nextDate.setMonth(nextDate.getMonth() + 3);
+    else if (tmpl.frequency === 'yearly') nextDate.setFullYear(nextDate.getFullYear() + 1);
+    else if (tmpl.frequency === 'weekly') nextDate.setDate(nextDate.getDate() + 7);
+
+    await supabase.from('recurring_invoices').update({
+      next_run: nextDate.toISOString().slice(0,10),
+      last_generated: invDate,
+      invoices_generated: (tmpl.invoices_generated||0) + 1,
+    }).eq('id', tmpl.id);
+
+    res.json({ invoice_no: invNo, date: invDate, amount: tmpl.total, next_run: nextDate.toISOString().slice(0,10) });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
