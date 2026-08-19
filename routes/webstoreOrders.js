@@ -886,13 +886,14 @@ async function updateOrder(req, res) {
   if (carton_box_deducted  !== undefined) updates.carton_box_deducted  = carton_box_deducted;
   if (actual_courier_cost  !== undefined) updates.actual_courier_cost  = actual_courier_cost;
   if (courier_provider     !== undefined) updates.courier_provider     = courier_provider;
-  const { data, error } = await supabase
+  const { data: rows, error } = await supabase
     .from('webstore_orders')
     .update(updates)
     .eq('id', req.params.id)
-    .select()
-    .single();
+    .select();
   if (error) return res.status(400).json({ error: error.message });
+  if (!rows || rows.length === 0) return res.status(404).json({ error: 'Order not found' });
+  const data = rows[0];
 
   const decrypted = decryptOrder(data);
 
