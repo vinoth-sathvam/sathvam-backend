@@ -695,6 +695,27 @@ router.post('/webhook', async (req, res) => {
         await sendText(phone, `⏭️ Broadcast skipped.`);
         return;
       }
+
+      // ── Blog WA share approval ──
+      if (/^(approve|approved)$/i.test(msgLower)) {
+        console.log('[blog-approve-wa] Admin sent approval, checking pending blogs...');
+        try {
+          const { data: apRow, error: apErr } = await supabase.from('settings').select('value').eq('key', 'blog_wa_approvals').single();
+          if (apErr) console.error('[blog-approve-wa] DB error:', apErr.message);
+          const approvals = apRow?.value || {};
+          const pending = Object.entries(approvals).filter(([, v]) => v === 'pending');
+          console.log('[blog-approve-wa] pending:', pending.length, 'approvals:', JSON.stringify(approvals));
+          if (pending.length) {
+            for (const [blogId] of pending) approvals[blogId] = 'approved';
+            await supabase.from('settings').upsert({ key: 'blog_wa_approvals', value: approvals, updated_at: new Date().toISOString() });
+            await sendText(phone, `✅ ${pending.length} blog(s) approved for WhatsApp sharing! Sending starts within 15 minutes.`);
+            return;
+          } else {
+            await sendText(phone, `ℹ️ No pending blog approvals right now.`);
+            return;
+          }
+        } catch (e) { console.error('[blog-approve-wa] error:', e.message); }
+      }
     }
 
     // Store inbound message

@@ -4,6 +4,10 @@ const { auth, requireRole } = require('../middleware/auth');
 const supabase = require('../config/supabase');
 const { insertLedger } = require('../utils/ledger');
 
+// Zoho Books sync — gracefully unavailable if env vars not set
+let zohoApi = null;
+try { zohoApi = require('../config/zoho').zoho; } catch(e) {}
+
 const DEFAULT_CATEGORIES = [
   { name:'Raw Materials',  icon:'🌾', color:'#d97706' },
   { name:'Utilities',      icon:'⚡', color:'#0891b2' },
@@ -115,6 +119,28 @@ router.post('/', auth, requireRole('admin', 'manager'), async (req, res) => {
     updated_at:   new Date().toISOString(),
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
+
+  // Zoho Books: create expense
+  if (zohoApi && process.env.ZOHO_ORG_ID) {
+    try {
+      const expPayload = {
+        date,
+        amount:       parsed,
+        description:  description.trim(),
+        account_name: category || 'Miscellaneous Expense',
+        paid_through_account_name: payment_mode === 'cash' ? 'Petty Cash' : 'Bank',
+        reference_number: reference_no || '',
+        vendor_name:  vendor_name || undefined,
+      };
+      const result = await zohoApi('post', '/expenses', expPayload);
+      if (result?.expense?.expense_id) {
+        await supabase.from('company_expenses').update({ zoho_expense_id: result.expense.expense_id }).eq('id', data.id);
+        console.log(`[Zoho] Expense created: ${result.expense.expense_id} for expense #${data.id}`);
+      }
+    } catch (ze) {
+      console.error('[Zoho] Expense sync error:', ze.response?.data?.message || ze.message);
+    }
+  }
 
   // Auto-feed money_ledger + CCO check for large amounts
   insertLedger({

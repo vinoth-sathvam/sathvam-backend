@@ -80,22 +80,42 @@ async function runGenerator(data, type) {
 // ── POST /api/cart-reminder/send ──────────────────────────────────────────────
 router.post('/send', auth, async (req, res) => {
   if (await isAutomationDisabled('checkout_recovery')) return res.status(403).json({ error: 'checkout_recovery automation is disabled' });
-  const { phone, name, items, cart_value } = req.body;
+  const { phone, name, items, cart_value, type } = req.body;
 
   if (!phone)                           return res.status(400).json({ error: 'phone required' });
   if (!name)                            return res.status(400).json({ error: 'name required' });
-  if (!Array.isArray(items) || !items.length)
+
+  const isNudge = type === 'nudge';
+
+  // items required for checkout reminders, optional for nudge
+  if (!isNudge && (!Array.isArray(items) || !items.length))
                                         return res.status(400).json({ error: 'items must be a non-empty array' });
 
   try {
-    // 1. Generate PNG via host microservice
-    const pngPath = await runGenerator({ name, items, cart_value: cart_value || 0 }, 'cart');
+    const caption = isNudge
+      ? `🌿 *SATHVAM*\n_Pure. Cold-Pressed. Honest._\n\nHi *${name}*! 👋\n\nWe noticed you're exploring our store — great taste! 🌾\n\nNeed help choosing the right oil or have any questions? Just reply here, we'd love to help.\n\n👉 *Continue shopping:*\nhttps://www.sathvam.in/products\n\n🙏 Team Sathvam`
+      : `🌿 *SATHVAM*\n_Pure. Cold-Pressed. Honest._\n\nDear *${name}*, your cart is saved and waiting for you 🛒\n\n👉 *Complete your order:*\nhttps://www.sathvam.in/cart\n\nReply here anytime — we're happy to help! 🙏`;
 
-    // 2. Send via Green API
-    const caption = `🌿 *SATHVAM*\n_Pure. Cold-Pressed. Honest._\n\nDear *${name}*, your cart is saved and waiting for you 🛒\n\n👉 *Complete your order:*\nhttps://www.sathvam.in/cart\n\nReply here anytime — we're happy to help! 🙏`;
-    const msgId   = await sendPngViaGreenApi(phone, pngPath, caption);
+    if (!isNudge || (Array.isArray(items) && items.length)) {
+      // Generate branded PNG + send with image
+      const pngPath = await runGenerator({ name, items: items || [], cart_value: cart_value || 0 }, 'cart');
+      const msgId   = await sendPngViaGreenApi(phone, pngPath, caption);
+      return res.json({ ok: true, idMessage: msgId });
+    }
 
-    res.json({ ok: true, idMessage: msgId });
+    // Nudge with no items — send text-only via Green API
+    const instanceId = process.env.GREENAPI_INSTANCE_ID;
+    const token      = process.env.GREENAPI_API_TOKEN;
+    const chatId     = toChatId(phone);
+    if (!chatId) throw new Error(`Invalid phone number: ${phone}`);
+    const msgRes = await fetch(
+      `${GREENAPI_BASE}/waInstance${instanceId}/sendMessage/${token}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chatId, message: caption }) }
+    );
+    const msgData = await msgRes.json();
+    if (!msgData.idMessage) throw new Error(`Green API error: ${JSON.stringify(msgData)}`);
+    res.json({ ok: true, idMessage: msgData.idMessage });
   } catch (err) {
     console.error('[cart-reminder]', err.message);
     res.status(500).json({ error: err.message });

@@ -5,6 +5,9 @@ require('dotenv').config();
   if (!process.env[k]) { console.error(`FATAL: ${k} env var is not set`); process.exit(1); }
 });
 
+// ── Auto-run pending SQL migrations ──────────────────────────────────────────
+require('./config/migrate')().catch(err => console.error('[migrate] Unexpected:', err.message));
+
 const express     = require('express');
 const cors        = require('cors');
 const helmet      = require('helmet');
@@ -30,10 +33,10 @@ const allowedOrigins = [
 ];
 app.use(cors({ origin: allowedOrigins, credentials: true }));
 
-const rateLimitOpts = { validate: { xForwardedForHeader: false } };
+const rateLimitOpts = {};
 
-// General rate limit — 1200 req/15min per IP (admin panel has polling + bulk init calls)
-app.use(rateLimit({ windowMs: 15*60*1000, max: 1200, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests, please try again later' }, ...rateLimitOpts }));
+// General rate limit — 3000 req/15min per IP (admin panel has ~270 polling calls/15min per tab + user actions + auto-saves)
+app.use(rateLimit({ windowMs: 15*60*1000, max: 3000, standardHeaders: true, legacyHeaders: false, message: { error: 'Too many requests, please try again later' }, ...rateLimitOpts }));
 
 // Auth limiter — 10 attempts/15min per IP (brute force protection)
 const authLimiter = rateLimit({
@@ -159,6 +162,7 @@ app.use('/api/inventory-valuation',  require('./routes/inventoryValuation'));
 app.use('/api/recurring-expenses',   require('./routes/recurringExpenses'));
 app.use('/api/compliance',           require('./routes/compliance'));
 app.use('/api/finance',           require('./routes/finance'));
+app.use('/api/icici',            require('./routes/iciciBank'));
 app.use('/api/leave',             require('./routes/leave'));
 app.use('/api/kiosk',            require('./routes/kiosk'));
 app.use('/api/returns',           require('./routes/returns'));
@@ -200,6 +204,7 @@ app.use('/api/manager-daily',     require('./routes/managerDaily'));
 app.use('/api/engagement',        require('./routes/engagement'));    // Customer re-engagement broadcasts
 app.use('/api/flash-offer',       require('./routes/flashOffer'));    // Daily flash offer WhatsApp (4-5 PM / 9-11 PM)
 app.use('/api/customer-delight',  require('./routes/customerDelight')); // Customer delight hub (batch-notify, followup, birthday)
+app.use('/api/eway-bill',         require('./routes/ewayBill'));          // E-Way Bill generation via Zoho Books
 
 // ── Finance Intelligence — Universal Ledger + CFO + CCO ───────────────────────
 app.use('/api/ledger',            require('./routes/ledger'));

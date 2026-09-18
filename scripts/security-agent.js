@@ -30,7 +30,7 @@ const tls            = require('tls');
 const { execSync }   = require('child_process');
 const nodemailer     = require('nodemailer');
 const Anthropic      = require('@anthropic-ai/sdk');
-const { createClient } = require('@supabase/supabase-js');
+const supabase       = require('../config/supabase');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -261,7 +261,6 @@ function checkPM2() {
 }
 
 async function checkDBEncryption(table, field) {
-  const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
   try {
     const { data, error } = await supabase.from(table).select(field).limit(20);
     if (error) return warn(`DB Encryption: ${table}`, `Query failed: ${error.message}`);

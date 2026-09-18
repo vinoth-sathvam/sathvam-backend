@@ -18,11 +18,9 @@
  */
 
 require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
-const { createClient } = require('@supabase/supabase-js');
+const supabase = require('../config/supabase');
 const { sendText, isAutomationDisabled } = require('../lib/greenapi');
 const { decryptCustomer } = require('../config/crypto');
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 const COOLDOWN_DAYS = 7;   // min days between flash offers to same customer
 const DAILY_LIMIT   = 10;  // max customers per run (random pick)

@@ -5,6 +5,9 @@ const { execSync } = require('child_process');
 const fs           = require('fs');
 const os           = require('os');
 const path         = require('path');
+const crypto       = require('crypto');
+const jwt          = require('jsonwebtoken');
+const Razorpay     = require('razorpay');
 const supabase     = require('../config/supabase');
 const { uploadFile } = require('../config/storage');
 const { auth }     = require('../middleware/auth');
@@ -1416,6 +1419,400 @@ async function sendInvoiceWhatsApp(order) {
     console.error('sendInvoiceWhatsApp error:', e.message);
   }
 }
+
+/* ─── Add Items to Existing Order ─────────────────────────────────── */
+
+const custAuth = (req, res, next) => {
+  const token = req.cookies?.sathvam_cust || (req.headers.authorization || '').replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Not authenticated' });
+  try { req.customer = jwt.verify(token, process.env.JWT_SECRET); next(); }
+  catch (e) { res.status(401).json({ error: 'Session expired. Please login again.' }); }
+};
+
+const rzp = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
+
+// POST /:id/add-items — customer initiates addon payment
+router.post('/:id/add-items', custAuth, async (req, res) => {
+  try {
+    const { items } = req.body;
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'items array is required' });
+    }
+
+    // Fetch the order
+    const { data: order, error: fetchErr } = await supabase
+      .from('webstore_orders').select('*').eq('id', req.params.id).single();
+    if (fetchErr || !order) return res.status(404).json({ error: 'Order not found' });
+
+    // Verify ownership via email hash
+    const emailHash = hmac(req.customer.email);
+    if (order.customer_email_hash !== emailHash) {
+      return res.status(403).json({ error: 'This order does not belong to you' });
+    }
+
+    // Only allow addon on new, confirmed, or packed orders
+    if (!['new', 'confirmed', 'packed'].includes(order.status)) {
+      return res.status(400).json({ error: `Cannot add items to an order with status "${order.status}"` });
+    }
+
+    // Calculate addon amounts (GST-inclusive back-calculation)
+    const addonSubtotal = items.reduce((sum, i) => sum + (i.qty * i.price), 0);
+    const addonGst = items.reduce((sum, i) => {
+      const rate = parseFloat(i.gst) || 0;
+      return sum + (i.qty * i.price * (rate / (100 + rate)));
+    }, 0);
+    const addonTotal = addonSubtotal; // price already includes GST
+
+    // Create Razorpay order
+    const rzpOrder = await rzp.orders.create({
+      amount: Math.round(addonTotal * 100),
+      currency: 'INR',
+      receipt: order.order_no + '-ADDON',
+      notes: { source: 'addon', order_id: req.params.id },
+    });
+
+    // Stash addon data in settings for webhook recovery
+    await supabase.from('settings').upsert({
+      key: 'addon_order_' + rzpOrder.id,
+      value: {
+        orderId: req.params.id,
+        items,
+        addonSubtotal,
+        addonGst,
+        addonTotal,
+        customer_email: req.customer.email,
+        stashed_at: new Date().toISOString(),
+      },
+      updated_at: new Date().toISOString(),
+    });
+
+    res.json({
+      orderId: rzpOrder.id,
+      amount: rzpOrder.amount,
+      currency: 'INR',
+      key: process.env.RAZORPAY_KEY_ID,
+    });
+  } catch (e) {
+    console.error('add-items error:', e.message);
+    res.status(500).json({ error: 'Failed to create addon payment' });
+  }
+});
+
+// POST /:id/verify-addon — customer verifies addon payment
+router.post('/:id/verify-addon', custAuth, async (req, res) => {
+  try {
+    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+      return res.status(400).json({ error: 'Missing payment verification fields' });
+    }
+
+    // Verify Razorpay HMAC-SHA256 signature
+    const expectedSig = crypto
+      .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+      .update(razorpay_order_id + '|' + razorpay_payment_id)
+      .digest('hex');
+    if (expectedSig !== razorpay_signature) {
+      return res.status(400).json({ error: 'Payment signature verification failed' });
+    }
+
+    // Fetch stashed addon data
+    const { data: stashRow, error: stashErr } = await supabase
+      .from('settings').select('value').eq('key', 'addon_order_' + razorpay_order_id).single();
+    if (stashErr || !stashRow) {
+      return res.status(404).json({ error: 'Addon order data not found' });
+    }
+    const stashed = stashRow.value;
+
+    // Verify stashed orderId matches URL param
+    if (stashed.orderId !== req.params.id) {
+      return res.status(400).json({ error: 'Order ID mismatch' });
+    }
+
+    // Fetch the existing order
+    const { data: order, error: orderErr } = await supabase
+      .from('webstore_orders').select('*').eq('id', req.params.id).single();
+    if (orderErr || !order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    // Merge items
+    const existingItems = Array.isArray(order.items) ? order.items : [];
+    const mergedItems = [...existingItems, ...stashed.items.map(i => ({ ...i, addon: true }))];
+
+    // Recalculate totals
+    const existingSubtotal = parseFloat(order.subtotal) || 0;
+    const existingGst = parseFloat(order.gst) || 0;
+    const existingTotal = parseFloat(order.total) || 0;
+    const newSubtotal = existingSubtotal + stashed.addonSubtotal;
+    const newGst = existingGst + stashed.addonGst;
+    const newTotal = existingTotal + stashed.addonTotal;
+
+    // Update the order
+    const existingNotes = order.notes || '';
+    const addonNote = `\nAddon payment: ${razorpay_payment_id}`;
+    const { error: updateErr } = await supabase
+      .from('webstore_orders')
+      .update({
+        items: mergedItems,
+        subtotal: newSubtotal,
+        gst: newGst,
+        total: newTotal,
+        notes: existingNotes + addonNote,
+      })
+      .eq('id', req.params.id);
+    if (updateErr) {
+      console.error('verify-addon update error:', updateErr.message);
+      return res.status(500).json({ error: 'Failed to update order' });
+    }
+
+    // Clean up stashed data
+    await supabase.from('settings').delete().eq('key', 'addon_order_' + razorpay_order_id);
+
+    // Send WhatsApp to customer (non-blocking)
+    const cust = decryptCustomer(order.customer);
+    const phone = (cust.phone || '').replace(/\D/g, '');
+    if (phone.length >= 10) {
+      const itemNames = stashed.items.map(i => `${i.name} ×${i.qty}`).join(', ');
+      gaSendText(phone.length === 10 ? '91' + phone : phone,
+        `✅ *Items Added to Your Order*\n\n` +
+        `📦 Order: *${order.order_no}*\n` +
+        `➕ Added: ${itemNames}\n` +
+        `💰 Addon: ₹${stashed.addonTotal}\n` +
+        `📊 New Total: ₹${newTotal}\n\n` +
+        `Thank you for shopping with Sathvam! 🌿`
+      ).catch(e => console.error('Addon WA error:', e.message));
+    }
+
+    // Send admin WhatsApp notification (non-blocking)
+    const adminPhone = process.env.WA_ADMIN_PHONE1;
+    if (adminPhone) {
+      gaSendText(adminPhone.length === 10 ? '91' + adminPhone : adminPhone,
+        `📦 *Addon Order Received*\n\n` +
+        `Order: ${order.order_no}\n` +
+        `Customer: ${cust.name}\n` +
+        `Added: ${stashed.items.map(i => `${i.name} ×${i.qty}`).join(', ')}\n` +
+        `Addon: ₹${stashed.addonTotal}\n` +
+        `New Total: ₹${newTotal}`
+      ).catch(() => {});
+    }
+
+    res.json({ success: true, order_no: order.order_no, new_total: newTotal });
+  } catch (e) {
+    console.error('verify-addon error:', e.message);
+    res.status(500).json({ error: 'Failed to verify addon payment' });
+  }
+});
+
+/* ─── Admin Add Items to Existing Order + Payment Link ─────────── */
+
+router.post('/:id/admin-add-items', auth, async (req, res) => {
+  try {
+    const { items } = req.body;
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: 'items array is required' });
+    }
+
+    // Fetch the order
+    const { data: order, error: fetchErr } = await supabase
+      .from('webstore_orders').select('*').eq('id', req.params.id).single();
+    if (fetchErr || !order) return res.status(404).json({ error: 'Order not found' });
+
+    // Only allow addon on new, confirmed, or packed orders
+    if (!['new', 'confirmed', 'packed'].includes(order.status)) {
+      return res.status(400).json({ error: `Cannot add items to an order with status "${order.status}"` });
+    }
+
+    // Calculate addon amounts (GST-inclusive back-calculation)
+    const addonSubtotal = items.reduce((sum, i) => sum + (i.qty * i.price), 0);
+    const addonGst = items.reduce((sum, i) => {
+      const rate = parseFloat(i.gst) || 0;
+      return sum + (i.qty * i.price * (rate / (100 + rate)));
+    }, 0);
+    const addonTotal = addonSubtotal; // price already includes GST
+
+    // Recalculate shipping on combined items
+    const existingItems = Array.isArray(order.items) ? order.items : [];
+    const allItems = [...existingItems, ...items.map(i => ({ ...i, addon: true }))];
+    const newShipping = parseFloat(req.body.newShipping) || parseFloat(order.shipping) || 0;
+    const oldShipping = parseFloat(order.shipping) || 0;
+    const shippingDiff = newShipping - oldShipping;
+
+    // Total amount customer needs to pay = addon items + shipping difference
+    const payableAmount = addonTotal + Math.max(0, shippingDiff);
+
+    if (payableAmount <= 0) {
+      return res.status(400).json({ error: 'Nothing to charge — addon total is zero' });
+    }
+
+    // Decrypt customer details
+    const cust = decryptCustomer(order.customer);
+    const phone = (cust.phone || '').replace(/\D/g, '');
+    const custName = cust.name || 'Customer';
+
+    // Create Razorpay payment link
+    const keyId     = process.env.RAZORPAY_KEY_ID;
+    const keySecret = process.env.RAZORPAY_KEY_SECRET;
+    const authHeader = Buffer.from(`${keyId}:${keySecret}`).toString('base64');
+
+    const digits  = phone.length === 10 ? `+91${phone}` : `+${phone}`;
+    const expireBy = Math.floor(Date.now() / 1000) + 48 * 60 * 60;
+
+    const itemDesc = items.slice(0, 3).map(i =>
+      `${i.name || 'Item'} × ${i.qty || 1}`
+    ).join(', ');
+    const desc = `${order.order_no} — Add: ${itemDesc}`.slice(0, 250);
+
+    const linkRes = await fetch('https://api.razorpay.com/v1/payment_links', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Basic ${authHeader}` },
+      body: JSON.stringify({
+        amount:          Math.round(payableAmount * 100),
+        currency:        'INR',
+        description:     desc,
+        customer:        { name: custName, contact: digits },
+        notify:          { sms: true, email: false },
+        reminder_enable: true,
+        expire_by:       expireBy,
+        upi_link:        true,
+        notes: {
+          source:     'addon_order',
+          order_id:   req.params.id,
+          order_no:   order.order_no,
+        },
+      }),
+    });
+    const linkData = await linkRes.json();
+    if (!linkData.id) {
+      console.error('[admin-add-items] Razorpay link error:', JSON.stringify(linkData));
+      return res.status(500).json({ error: linkData.error?.description || 'Failed to create payment link' });
+    }
+
+    const paymentUrl = linkData.short_url;
+    const paymentLinkId = linkData.id;
+
+    // Stash addon data for webhook recovery
+    await supabase.from('settings').upsert({
+      key: 'addon_link_' + paymentLinkId,
+      value: {
+        orderId: req.params.id,
+        orderNo: order.order_no,
+        items,
+        addonSubtotal,
+        addonGst,
+        addonTotal,
+        newShipping,
+        shippingDiff,
+        payableAmount,
+        customerPhone: phone,
+        customerName: custName,
+        addedBy: req.user?.name || req.user?.username || 'admin',
+        stashed_at: new Date().toISOString(),
+      },
+      updated_at: new Date().toISOString(),
+    });
+
+    // Send WhatsApp to customer
+    if (phone.length >= 10 && !await isAutomationDisabled('payment_link')) {
+      const itemList = items.map(i => `• ${i.name} × ${i.qty} — ₹${(i.qty * i.price).toLocaleString('en-IN')}`).join('\n');
+      const waMsg =
+        `📦 *Items Added to Your Order — Sathvam*\n\n` +
+        `Hi ${custName.split(' ')[0]}!\n\n` +
+        `Your order *${order.order_no}* has been updated with additional items:\n\n` +
+        `${itemList}\n` +
+        (shippingDiff > 0 ? `🚚 Revised shipping: +₹${shippingDiff.toFixed(0)}\n` : '') +
+        `\n💰 Additional amount: *₹${payableAmount.toLocaleString('en-IN')}*\n\n` +
+        `Please complete the payment:\n🔗 ${paymentUrl}\n\n` +
+        `Link valid for 48 hours.\n— Team Sathvam 🌿`;
+
+      try {
+        const waPhone = phone.length === 10 ? '91' + phone : phone;
+        await gaSendText(waPhone, waMsg);
+        // Send QR code
+        const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&format=png&data=${encodeURIComponent(paymentUrl)}`;
+        await gaSendFile(waPhone, qrUrl, 'payment-qr.png',
+          `📱 Scan to pay ₹${payableAmount.toLocaleString('en-IN')} for ${order.order_no}`);
+      } catch (e) {
+        console.error('[admin-add-items] WA send failed:', e.message);
+      }
+    }
+
+    console.log(`[admin-add-items] Payment link ${paymentLinkId} created for ${order.order_no} ₹${payableAmount}`);
+
+    res.json({
+      success: true,
+      paymentLinkId,
+      paymentUrl,
+      payableAmount,
+      addonTotal,
+      shippingDiff,
+      expiresAt: new Date(expireBy * 1000).toISOString(),
+    });
+  } catch (e) {
+    console.error('[admin-add-items] Error:', e.message);
+    res.status(500).json({ error: 'Failed to add items: ' + e.message });
+  }
+});
+
+// POST /:id/addon-merge — merge stashed addon items after payment confirmed (called by frontend)
+router.post('/:id/addon-merge', auth, async (req, res) => {
+  try {
+    const { paymentLinkId } = req.body;
+    if (!paymentLinkId) return res.status(400).json({ error: 'paymentLinkId required' });
+
+    // Check if already merged (stash cleaned up)
+    const { data: stashRow } = await supabase.from('settings')
+      .select('value').eq('key', 'addon_link_' + paymentLinkId).maybeSingle();
+    const stashed = stashRow?.value;
+    if (!stashed) {
+      // Already merged or no stash — just return current order
+      const { data: order } = await supabase.from('webstore_orders')
+        .select('*').eq('id', req.params.id).single();
+      return res.json({ success: true, already_merged: true, order });
+    }
+
+    // Fetch the existing order
+    const { data: order } = await supabase.from('webstore_orders')
+      .select('*').eq('id', req.params.id).single();
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+
+    // Merge items
+    const existingItems = Array.isArray(order.items) ? order.items : [];
+    const mergedItems = [...existingItems, ...stashed.items.map(i => ({ ...i, addon: true }))];
+    const existingSubtotal = parseFloat(order.subtotal) || 0;
+    const existingGst = parseFloat(order.gst) || 0;
+    const newShipping = parseFloat(stashed.newShipping) || parseFloat(order.shipping) || 0;
+    const newSubtotal = existingSubtotal + stashed.addonSubtotal;
+    const newGst = existingGst + stashed.addonGst;
+    const newTotal = newSubtotal + newShipping;
+    const existingNotes = order.notes || '';
+    const addonNote = `\nAddon payment (admin-merge): ${paymentLinkId} | Items: ${stashed.items.map(i => `${i.name}×${i.qty}`).join(', ')} | Merged by: ${req.user?.name || 'admin'}`;
+
+    await supabase.from('webstore_orders').update({
+      items: mergedItems,
+      subtotal: newSubtotal,
+      gst: Math.round(newGst),
+      shipping: newShipping,
+      total: newTotal,
+      notes: existingNotes + addonNote,
+    }).eq('id', req.params.id);
+
+    // Clean up stashed data
+    await supabase.from('settings').delete().eq('key', `addon_link_${paymentLinkId}`).catch(() => {});
+
+    console.log(`[addon-merge] Merged addon into order ${order.order_no}, new total ₹${newTotal}`);
+
+    // Return updated order
+    const { data: updated } = await supabase.from('webstore_orders')
+      .select('*').eq('id', req.params.id).single();
+    res.json({ success: true, order: updated });
+  } catch (e) {
+    console.error('[addon-merge] Error:', e.message);
+    res.status(500).json({ error: 'Failed to merge addon: ' + e.message });
+  }
+});
 
 module.exports = router;
 module.exports.sendCustomerInvoice = sendCustomerInvoice;

@@ -25,10 +25,8 @@
 'use strict';
 require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
 
-const { createClient } = require('@supabase/supabase-js');
+const supabase  = require('../config/supabase');
 const Anthropic        = require('@anthropic-ai/sdk');
-
-const supabase  = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY);
 const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
 
 const ADMIN_PHONE = process.env.ADMIN_WHATSAPP_PHONE || process.env.WA_ADMIN_PHONE;

@@ -357,8 +357,8 @@ function startScheduler() {
         `✅ Delivered: ${deliveredCount}\n\n` +
         `_View full report: admin.sathvam.in_`;
 
-      const adminPhones = [process.env.WA_ADMIN_PHONE1, process.env.WA_ADMIN_PHONE2, process.env.WA_NOTIFY_TO]
-        .filter(Boolean).map(p => p.replace(/\D/g, ''));
+      const adminPhones = [...new Set([process.env.WA_ADMIN_PHONE1, process.env.WA_ADMIN_PHONE2, process.env.WA_NOTIFY_TO]
+        .filter(Boolean).map(p => p.replace(/\D/g, '')))];
       for (const p of adminPhones) {
         try { await gaSendText(p, summaryMsg); } catch (e) {}
       }
@@ -547,7 +547,9 @@ function startScheduler() {
     } catch(e) { console.error('[BIRTHDAY] Cron failed:', e.message); }
   });
 
-  // ── Weekly Health Tip: Every Sunday 7:00 AM IST (1:30 AM UTC) ─────────────
+  // ── Weekly Health Tip: DISABLED — bulk customer broadcasts cause Green API spam flag ──
+  // To re-enable, set wa_automations.health_tips = true in settings table
+  /* DISABLED — Green API spam prevention
   const HEALTH_TIPS = [
     '🫒 *Groundnut Oil Health Tip*\nCold-pressed groundnut oil retains Vitamin E and healthy fats. Use for high-heat cooking. Rich in resveratrol — heart-healthy! 🫀',
     '🌿 *Sesame Oil Tip*\nTil (sesame) oil has lignans that support liver health and bone density. Ideal for tadka & traditional cooking.',
@@ -583,13 +585,14 @@ function startScheduler() {
 
           await gaSendText(fullPhone, `🌿 *Sathvam Health Tip of the Week*\n\n${tip}\n\n_From Sathvam Natural Products — sathvam.in_`);
           sent++;
-          // Rate-limit: small delay between sends
-          await new Promise(r => setTimeout(r, 500));
+          // Rate-limit: 5s between sends (Green API anti-spam)
+          await new Promise(r => setTimeout(r, 5000));
         } catch (e) { skipped++; }
       }
       console.log(`[HEALTH-TIP] Sent to ${sent} customers, skipped ${skipped}`);
     } catch (e) { console.error('[HEALTH-TIP] Cron failed:', e.message); }
   });
+  END DISABLED */
 
   // ── Win-Back Campaign: Daily 10:00 AM IST (4:30 AM UTC) ──────────────────
   cron.schedule('30 4 * * *', async () => {
@@ -682,7 +685,7 @@ function startScheduler() {
           await gaSendText(fullPhone, msg);
           await supabase.from('settings').upsert({ key: wbKey, value: { sent_at: new Date().toISOString(), coupon: couponCode } });
           sent++;
-          await new Promise(r => setTimeout(r, 1000));
+          await new Promise(r => setTimeout(r, 5000));
         } catch (e) { console.error('[WINBACK] Customer error:', e.message); }
       }
       console.log(`[WINBACK] Win-back campaign sent to ${sent} customers`);
@@ -747,8 +750,8 @@ function startScheduler() {
         `⚡ Total overdue: ${overdue.length} order(s)\n` +
         `_Check: admin.sathvam.in → B2B Orders_`;
 
-      const adminPhones = [process.env.WA_ADMIN_PHONE1, process.env.WA_NOTIFY_TO]
-        .filter(Boolean).map(p => p.replace(/\D/g, ''));
+      const adminPhones = [...new Set([process.env.WA_ADMIN_PHONE1, process.env.WA_ADMIN_PHONE2, process.env.WA_NOTIFY_TO]
+        .filter(Boolean).map(p => p.replace(/\D/g, '')))];
       for (const p of adminPhones) {
         try { await gaSendText(p, msg); } catch (e) {}
       }
@@ -756,8 +759,9 @@ function startScheduler() {
     } catch (e) { console.error('[B2B-PAYMENT] Cron failed:', e.message); }
   });
 
-  // ── Scheduled WA Broadcast Processor — every 5 minutes ──────────────────
-  cron.schedule('*/5 * * * *', async () => {
+  // ── Scheduled WA Broadcast Processor — every 30 minutes (reduced from 5 min) ─
+  // Anti-spam: max 2 broadcasts per week to avoid WhatsApp ban
+  cron.schedule('*/30 * * * *', async () => {
     if (await isAutomationDisabled('scheduled_broadcasts')) return;
     try {
       const { data } = await supabase.from('settings').select('value').eq('key', 'wa_schedules').maybeSingle();
@@ -766,10 +770,20 @@ function startScheduler() {
       const pending = schedules.filter(s => s.status === 'pending' && new Date(s.scheduledAt) <= now);
       if (!pending.length) return;
 
+      // Anti-spam: max 2 broadcasts per rolling 7 days
+      const MAX_BROADCASTS_PER_WEEK = 2;
+      const weekAgo = new Date(now - 7 * 24 * 60 * 60 * 1000);
+      const recentSent = schedules.filter(s => s.status === 'sent' && s.sentAt && new Date(s.sentAt) > weekAgo).length;
+      if (recentSent >= MAX_BROADCASTS_PER_WEEK) {
+        console.log(`[SCHEDULER] Rate limit: ${recentSent} broadcasts sent this week (max ${MAX_BROADCASTS_PER_WEEK}). Skipping ${pending.length} pending.`);
+        return;
+      }
+      const slotsLeft = MAX_BROADCASTS_PER_WEEK - recentSent;
+
       const { decrypt } = require('../config/crypto');
       const { sendFile: gaSendFile } = require('../lib/greenapi');
 
-      for (const sched of pending) {
+      for (const sched of pending.slice(0, slotsLeft)) {
         try {
           // Fetch all non-opted-out phones
           const { data: rawCustomers } = await supabase.from('customers').select('id,phone').not('phone', 'is', null).limit(5000);
@@ -789,7 +803,7 @@ function startScheduler() {
                 : await gaSendText(phone, sched.message);
               if (ok) sent++; else failed++;
             } catch (e) { failed++; }
-            await new Promise(r => setTimeout(r, 500));
+            await new Promise(r => setTimeout(r, 5000));
           }
 
           // Mark as sent
@@ -811,7 +825,106 @@ function startScheduler() {
     }
   });
 
-  console.log('Scheduler started — weekly report Mon 8 AM, daily reminders 9 AM / 1:30 PM / 7 PM IST, monitor agent 9 AM IST, low-stock 8 AM IST, birthday coupons 9 AM IST, health tips Sun 7 AM IST, win-back 10 AM IST, B2B payment reminder 9 AM IST, WA scheduled broadcasts every 5 min');
+  // ── Zoho Bank Feed Auto-Sync — every 1 hour ─────────────────────────────────
+  // Fetches ICICI transactions from Zoho Books and upserts into local bank_transactions
+  cron.schedule('0 * * * *', async () => {
+    if (!process.env.ZOHO_ORG_ID || !process.env.ZOHO_CLIENT_ID) return;
+    try {
+      const { zoho: zohoApi } = require('../config/zoho');
+      const { data: linkedAccounts } = await supabase
+        .from('bank_accounts')
+        .select('id, zoho_account_id, name')
+        .not('zoho_account_id', 'is', null);
+
+      if (!linkedAccounts || !linkedAccounts.length) return;
+
+      const fromDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      const toDate   = new Date().toISOString().slice(0, 10);
+      const round2   = n => Math.round((parseFloat(n) || 0) * 100) / 100;
+
+      let totalInserted = 0, totalUpdated = 0;
+
+      for (const acct of linkedAccounts) {
+        let page = 1;
+        while (true) {
+          const data = await zohoApi('get', '/banktransactions', null, {
+            organization_id: process.env.ZOHO_ORG_ID,
+            account_id:      acct.zoho_account_id,
+            date_start:      fromDate,
+            date_end:        toDate,
+            page,
+            per_page:        200,
+            sort_column:     'date',
+            sort_order:      'D',
+          });
+
+          const txns = data.banktransactions || [];
+          if (!txns.length) break;
+
+          for (const t of txns) {
+            const amount = round2(Math.abs(parseFloat(t.amount) || 0));
+            if (amount <= 0) continue;
+
+            // Skip Zoho accounting splits (vendor/employee payments) — only sync real bank feed entries
+            const desc = (t.payee || t.description || '').trim();
+            const ref = (t.reference_number || '').trim();
+            const isRealBankTxn = ref.length > 0 || /^(UPI|NEFT|RTGS|INF|MMT|ACH|BIL|MIN|MSI|EZY|Mob alrt)/i.test(desc);
+            if (!isRealBankTxn && t.source !== 'bank_feed') continue;
+
+            const rec = {
+              bank_account_id: acct.id,
+              date:            t.date,
+              type:            t.debit_or_credit === 'debit' ? 'credit' : 'debit',
+              amount,
+              description:     desc || ref || '',
+              reference:       ref || t.transaction_id || '',
+              category:        t.category_name || t.account_name || '',
+              zoho_txn_id:     t.transaction_id,
+              reconciled:      t.status === 'manually_added' || t.status === 'matched' || t.status === 'categorized',
+              created_by:      'zoho-auto-sync',
+            };
+
+            const { data: existing } = await supabase
+              .from('bank_transactions')
+              .select('id')
+              .eq('zoho_txn_id', t.transaction_id)
+              .maybeSingle();
+
+            if (existing) {
+              await supabase.from('bank_transactions')
+                .update({ ...rec, updated_at: new Date().toISOString() })
+                .eq('id', existing.id);
+              totalUpdated++;
+            } else {
+              await supabase.from('bank_transactions').insert(rec);
+              totalInserted++;
+            }
+          }
+
+          if (!data.page_context?.has_more_page) break;
+          page++;
+          if (page > 20) break;
+        }
+
+        // Update balance from Zoho
+        try {
+          const acctData = await zohoApi('get', `/bankaccounts/${acct.zoho_account_id}`, null, { organization_id: process.env.ZOHO_ORG_ID });
+          const zohoBalance = parseFloat(acctData?.bankaccount?.balance);
+          if (!isNaN(zohoBalance)) {
+            await supabase.from('bank_accounts').update({ current_balance: round2(zohoBalance), zoho_synced_at: new Date().toISOString() }).eq('id', acct.id);
+          }
+        } catch (_) {}
+      }
+
+      if (totalInserted + totalUpdated > 0) {
+        console.log(`[SCHEDULER] Zoho bank sync: ${totalInserted} new, ${totalUpdated} updated across ${linkedAccounts.length} accounts`);
+      }
+    } catch (e) {
+      console.error('[SCHEDULER] Zoho bank sync error:', e.message);
+    }
+  });
+
+  console.log('Scheduler started — weekly report Mon 8 AM, daily reminders 9 AM / 1:30 PM / 7 PM IST, monitor agent 9 AM IST, low-stock 8 AM IST, birthday coupons 9 AM IST, health tips Sun 7 AM IST, win-back 10 AM IST, B2B payment reminder 9 AM IST, WA scheduled broadcasts every 30 min, Zoho bank sync hourly');
 }
 
 module.exports = { startScheduler, buildWeeklyReport, checkDailyTasks, sendReminders };

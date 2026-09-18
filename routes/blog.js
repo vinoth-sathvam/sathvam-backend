@@ -79,4 +79,119 @@ router.delete('/:id', auth, async (req, res) => {
   }
 });
 
+// ── Blog WhatsApp Share Report ──
+
+// GET /api/blog/wa-report — summary of all blog WA campaigns
+router.get('/wa-report', auth, async (req, res) => {
+  try {
+    // Get per-blog aggregated stats
+    const { data: sends, error } = await supabase
+      .from('blog_wa_sends')
+      .select('blog_id, blog_title, blog_lang, status, sent_at');
+
+    if (error) throw error;
+
+    // Aggregate by blog
+    const blogMap = {};
+    for (const s of (sends || [])) {
+      if (!blogMap[s.blog_id]) {
+        blogMap[s.blog_id] = {
+          blog_id: s.blog_id,
+          blog_title: s.blog_title,
+          blog_lang: s.blog_lang,
+          sent: 0,
+          failed: 0,
+          last_sent: null,
+        };
+      }
+      const b = blogMap[s.blog_id];
+      if (s.status === 'sent') b.sent++;
+      else b.failed++;
+      if (!b.last_sent || s.sent_at > b.last_sent) b.last_sent = s.sent_at;
+    }
+
+    const blogs = Object.values(blogMap).sort((a, b) =>
+      (b.last_sent || '').localeCompare(a.last_sent || '')
+    );
+
+    // Get run history
+    const { data: runRow } = await supabase.from('settings').select('value').eq('key', 'blog_wa_runs').single();
+    const runs = runRow?.value || [];
+
+    // Get approval statuses
+    const { data: approvalRow } = await supabase.from('settings').select('value').eq('key', 'blog_wa_approvals').single();
+    const approvals = approvalRow?.value || {};
+
+    // Total unique customers reached
+    const uniquePhones = new Set((sends || []).filter(s => s.status === 'sent').map(s => s.customer_phone));
+
+    res.json({
+      blogs,
+      runs: runs.slice(0, 10),
+      approvals,
+      totals: {
+        blogs_shared: blogs.length,
+        total_sent: (sends || []).filter(s => s.status === 'sent').length,
+        total_failed: (sends || []).filter(s => s.status === 'failed').length,
+        unique_customers: uniquePhones.size,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/blog/wa-report/:blogId — per-blog customer-level detail
+router.get('/wa-report/:blogId', auth, async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('blog_wa_sends')
+      .select('id, customer_name, customer_phone, status, error_msg, sent_at, run_id')
+      .eq('blog_id', req.params.blogId)
+      .order('sent_at', { ascending: false });
+
+    if (error) throw error;
+
+    // Mask phone for display (91XXXXXXXX12 → 91XXXX**XX12)
+    const masked = (data || []).map(r => ({
+      ...r,
+      customer_phone_masked: r.customer_phone
+        ? r.customer_phone.slice(0, 4) + '****' + r.customer_phone.slice(-4)
+        : '',
+    }));
+
+    res.json(masked);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/blog/wa-approve/:blogId — admin approves a blog for WA sharing
+router.post('/wa-approve/:blogId', auth, async (req, res) => {
+  try {
+    const { data: row } = await supabase.from('settings').select('value').eq('key', 'blog_wa_approvals').single();
+    const approvals = row?.value || {};
+    approvals[req.params.blogId] = 'approved';
+    await supabase.from('settings').upsert({ key: 'blog_wa_approvals', value: approvals, updated_at: new Date().toISOString() });
+    res.json({ success: true, message: 'Blog approved for WhatsApp sharing' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// POST /api/blog/wa-trigger/all — manually trigger blog share (all new blogs)
+router.post('/wa-trigger/all', auth, async (req, res) => {
+  try {
+    const { exec } = require('child_process');
+    const scriptPath = require('path').resolve(__dirname, '../scripts/blog-wa-share.js');
+    exec(`node ${scriptPath}`, { env: process.env }, (err, stdout, stderr) => {
+      if (err) console.error('[blog-wa-trigger] Script error:', stderr);
+      else console.log('[blog-wa-trigger]', stdout);
+    });
+    res.json({ success: true, message: 'Blog WA share triggered for all new blogs' });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

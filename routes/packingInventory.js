@@ -437,4 +437,125 @@ router.post('/seed', auth, requireRole('admin'), async (req, res) => {
   res.json({ seeded: (data||[]).length });
 });
 
+// ── POST bulk stock count — update stock for multiple items at once ───────────
+router.post('/bulk-stock-count', auth, requireRole('admin','manager'), async (req, res) => {
+  const { items } = req.body; // [{ id, quantity }]
+  if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'items array required' });
+  const today = new Date().toISOString().slice(0, 10);
+  const auditor = req.user?.name || req.user?.email || '';
+  let updated = 0;
+  const errors = [];
+  for (const item of items) {
+    if (!item.id || item.quantity == null) continue;
+    const qty = parseInt(item.quantity);
+    try {
+      const { data: cur } = await supabase.from('packing_materials').select('current_stock').eq('id', item.id).single();
+      const prevQty = cur?.current_stock || 0;
+      if (prevQty === qty) { updated++; continue; } // no change
+      await supabase.from('packing_audit_log').insert({
+        material_id: item.id, audit_date: today, quantity: qty,
+        previous_qty: prevQty, audited_by: auditor,
+        notes: item.notes || 'Bulk stock count',
+      });
+      await supabase.from('packing_materials').update({
+        current_stock: qty, last_audited: today,
+        audited_by: auditor, updated_at: new Date().toISOString(),
+      }).eq('id', item.id);
+      updated++;
+    } catch (e) { errors.push({ id: item.id, error: e.message }); }
+  }
+  res.json({ updated, errors });
+});
+
+// ── GET usage-report — packing material consumption over time periods ─────────
+router.get('/usage-report', auth, async (req, res) => {
+  try {
+    const now = new Date();
+    const istOffset = 5.5 * 3600000;
+    const istNow = new Date(now.getTime() + istOffset);
+    const todayIST = istNow.toISOString().slice(0, 10);
+
+    // Date boundaries
+    const todayStart = todayIST;
+    const weekStart = new Date(istNow.getTime() - 7 * 86400000).toISOString().slice(0, 10);
+    const monthStart = new Date(istNow.getFullYear(), istNow.getMonth(), 1).toISOString().slice(0, 10);
+    const qStart = new Date(istNow.getFullYear(), Math.floor(istNow.getMonth() / 3) * 3, 1).toISOString().slice(0, 10);
+    const yearStart = istNow.getFullYear() + '-01-01';
+
+    // Fetch all audit logs that are auto-deductions (stock went DOWN)
+    const { data: logs, error } = await supabase
+      .from('packing_audit_log')
+      .select('material_id, audit_date, quantity, previous_qty, notes, created_at')
+      .gte('audit_date', yearStart)
+      .order('created_at', { ascending: false });
+    if (error) return res.status(500).json({ error: error.message });
+
+    // Fetch all materials for name/category lookup
+    const { data: mats } = await supabase.from('packing_materials')
+      .select('id, name, category, current_stock, min_stock, unit_price, avg_cost');
+
+    const matMap = {};
+    (mats || []).forEach(m => { matMap[m.id] = m; });
+
+    // Calculate usage per material per period
+    // Usage = previous_qty - quantity (when previous > quantity = stock went down)
+    const usage = {};
+    const periods = { today: todayStart, week: weekStart, month: monthStart, quarter: qStart, year: yearStart };
+
+    (logs || []).forEach(log => {
+      const used = (log.previous_qty || 0) - (log.quantity || 0);
+      if (used <= 0) return; // skip stock additions / audits that increased stock
+
+      const mid = log.material_id;
+      if (!usage[mid]) {
+        const mat = matMap[mid] || {};
+        usage[mid] = {
+          id: mid,
+          name: mat.name || 'Unknown',
+          category: mat.category || '',
+          current_stock: mat.current_stock || 0,
+          min_stock: mat.min_stock || 0,
+          unit_cost: mat.avg_cost || mat.unit_price || 0,
+          today: 0, week: 0, month: 0, quarter: 0, year: 0,
+        };
+      }
+
+      const d = log.audit_date;
+      if (d >= todayStart) usage[mid].today += used;
+      if (d >= weekStart)  usage[mid].week += used;
+      if (d >= monthStart) usage[mid].month += used;
+      if (d >= qStart)     usage[mid].quarter += used;
+      if (d >= yearStart)  usage[mid].year += used;
+    });
+
+    // Include materials with zero usage too
+    (mats || []).forEach(m => {
+      if (!usage[m.id]) {
+        usage[m.id] = {
+          id: m.id, name: m.name, category: m.category || '',
+          current_stock: m.current_stock || 0, min_stock: m.min_stock || 0,
+          unit_cost: m.avg_cost || m.unit_price || 0,
+          today: 0, week: 0, month: 0, quarter: 0, year: 0,
+        };
+      }
+    });
+
+    const items = Object.values(usage).sort((a, b) => b.year - a.year);
+
+    // Summary totals per period
+    const totals = { today: 0, week: 0, month: 0, quarter: 0, year: 0 };
+    const costTotals = { today: 0, week: 0, month: 0, quarter: 0, year: 0 };
+    items.forEach(it => {
+      for (const p of ['today', 'week', 'month', 'quarter', 'year']) {
+        totals[p] += it[p];
+        costTotals[p] += it[p] * it.unit_cost;
+      }
+    });
+
+    res.json({ items, totals, costTotals, periods: { todayStart, weekStart, monthStart, qStart, yearStart } });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

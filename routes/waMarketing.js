@@ -153,7 +153,7 @@ router.post('/broadcast', auth, async (req, res) => {
             : await gaSendText(phone, message);
           if (ok) sent++; else failed++;
         } catch (e) { failed++; }
-        await new Promise(r => setTimeout(r, 500));
+        await new Promise(r => setTimeout(r, 5000));
       }
 
       await supabase.from('settings').upsert({

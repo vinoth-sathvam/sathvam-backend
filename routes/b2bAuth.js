@@ -157,7 +157,7 @@ router.get('/verify', async (req, res) => {
 
     const { data: cust, error } = await supabase
       .from('b2b_customers')
-      .select('id,company_name,contact_name,email,country,currency,address,phone,active,password')
+      .select('id,company_name,contact_name,email,country,currency,address,phone,active,password,show_cost_calculator')
       .eq('email', payload.email)
       .single();
 
@@ -173,6 +173,7 @@ router.get('/verify', async (req, res) => {
       currency: cust.currency,
       address: cust.address,
       phone: cust.phone,
+      showCostCalculator: !!cust.show_cost_calculator,
     };
 
     // No password set — return a short-lived token to set password
@@ -197,6 +198,37 @@ router.get('/verify', async (req, res) => {
     console.error('Verify error:', err.message);
     res.status(500).json({ error: 'Server error' });
   }
+});
+
+// ── GET /b2b/auth/me ─────────────────────────────────────────────────────────
+// Return current B2B customer data (refreshes localStorage on portal load)
+// Uses sathvam_b2b cookie directly (not shared auth middleware) to avoid
+// admin cookie taking precedence when accessed from admin.sathvam.in
+router.get('/me', async (req, res) => {
+  try {
+    const token = req.cookies?.sathvam_b2b;
+    if (!token) return res.status(401).json({ error: 'Not authenticated' });
+    let decoded;
+    try { decoded = jwt.verify(token, process.env.JWT_SECRET); } catch { return res.status(401).json({ error: 'Session expired' }); }
+    if (decoded.type !== 'b2b_customer') return res.status(403).json({ error: 'Not a B2B customer' });
+    const { data: cust, error } = await supabase
+      .from('b2b_customers')
+      .select('id,company_name,contact_name,email,country,currency,address,phone,show_cost_calculator')
+      .eq('id', decoded.id)
+      .single();
+    if (error || !cust) return res.status(404).json({ error: 'Customer not found' });
+    res.json({
+      id: cust.id,
+      companyName: cust.company_name,
+      contactName: cust.contact_name,
+      email: cust.email,
+      country: cust.country,
+      currency: cust.currency,
+      address: cust.address,
+      phone: cust.phone,
+      showCostCalculator: !!cust.show_cost_calculator,
+    });
+  } catch { res.status(500).json({ error: 'Server error' }); }
 });
 
 // ── POST /b2b/auth/set-password ───────────────────────────────────────────────

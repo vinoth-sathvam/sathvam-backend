@@ -3,7 +3,7 @@ const Razorpay     = require('razorpay');
 const crypto       = require('crypto');
 const nodemailer   = require('nodemailer');
 const supabase     = require('../config/supabase');
-const { createInvoice, recordPayment } = require('../config/zoho');
+const { createInvoice, recordPayment, zoho: zohoApi, findOrCreateContact: zohoFindOrCreateContact } = require('../config/zoho');
 const { sendCustomerInvoice, sendInvoiceWhatsApp } = require('./webstoreOrders');
 const { auth, requireRole } = require('../middleware/auth');
 const { encrypt, hmac, encryptCustomer } = require('../config/crypto');
@@ -17,6 +17,87 @@ const transporter = nodemailer.createTransport({
   secure: false,
   auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
 });
+
+// ── Server-side cart price validation ────────────────────────────────────────
+// Fetches current product prices from DB and recalculates order totals.
+// Prevents stale/tampered prices from being accepted.
+async function validateCartPrices(order) {
+  const items = order.items || [];
+  if (!items.length) return order;
+
+  // Fetch current prices for all products in the order
+  const productIds = items.map(i => i.id).filter(Boolean);
+  if (!productIds.length) return order;
+
+  const { data: products } = await supabase
+    .from('products')
+    .select('id, website_price, price, gst, name, offer_price, offer_ends_at')
+    .in('id', productIds);
+
+  if (!products || !products.length) return order; // fail-open if DB unavailable
+
+  const priceMap = {};
+  for (const p of products) priceMap[p.id] = p;
+
+  let priceChanged = false;
+  const correctedItems = items.map(item => {
+    const dbProd = priceMap[item.id];
+    if (!dbProd) return item; // unknown product — keep as-is
+
+    // Determine current price (check active offers first)
+    let currentPrice = dbProd.website_price || dbProd.price || 0;
+    if (dbProd.offer_price && dbProd.offer_ends_at) {
+      const offerEnd = new Date(dbProd.offer_ends_at);
+      if (offerEnd > new Date() && parseFloat(dbProd.offer_price) < currentPrice) {
+        currentPrice = parseFloat(dbProd.offer_price);
+      }
+    }
+
+    const itemPrice = parseFloat(item.price) || 0;
+    if (Math.abs(itemPrice - currentPrice) > 0.5) {
+      priceChanged = true;
+      console.log(`Price correction: ${item.name} ₹${itemPrice} → ₹${currentPrice}`);
+    }
+
+    return {
+      ...item,
+      price: currentPrice,
+      gst: dbProd.gst != null ? dbProd.gst : (item.gst || 0),
+    };
+  });
+
+  // Recalculate totals using corrected prices (GST-inclusive model)
+  const newSubtotal = correctedItems.reduce((s, i) => s + (i.qty || 1) * (i.price || 0), 0);
+  const newGST = correctedItems.reduce((s, i) => {
+    const g = i.gst || 0;
+    return s + (i.qty || 1) * (i.price || 0) * (g / (100 + g));
+  }, 0);
+
+  // Preserve discounts from original order
+  const shipping = parseFloat(order.shipping) || 0;
+  const loyaltyDisc = parseFloat(order.loyalty_discount) || 0;
+  const couponDisc = parseFloat(order.coupon_discount) || 0;
+  const festivalDisc = parseFloat(order.festival_discount) || 0;
+  const puthanduDisc = parseFloat(order.puthandu_discount) || 0;
+  const giftPacking = order.gift_packing ? 49 : 0;
+
+  const newTotal = Math.max(0, Math.round(
+    newSubtotal + shipping - loyaltyDisc - couponDisc - festivalDisc - puthanduDisc + giftPacking
+  ));
+
+  if (priceChanged) {
+    console.log(`Order price corrected: subtotal ₹${order.subtotal} → ₹${newSubtotal}, total ₹${order.total} → ₹${newTotal}`);
+  }
+
+  return {
+    ...order,
+    items: correctedItems,
+    subtotal: newSubtotal,
+    gst: Math.round(newGST),
+    total: newTotal,
+    _pricesCorrected: priceChanged,
+  };
+}
 
 // ── Sequential order number generator ────────────────────────────────────────
 const MONTHS = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
@@ -177,22 +258,36 @@ router.post('/create-order', async (req, res) => {
     const { amount, orderNo, orderData } = req.body;
     if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid amount' });
 
+    // Validate cart prices against current DB prices
+    let validatedOrder = orderData;
+    let chargeAmount = parseFloat(amount);
+    if (orderData) {
+      validatedOrder = await validateCartPrices(orderData);
+      chargeAmount = validatedOrder.total; // use server-validated total
+    }
+
     const rzpOrder = await razorpay.orders.create({
-      amount:   Math.round(parseFloat(amount) * 100), // paise
+      amount:   Math.round(chargeAmount * 100), // paise
       currency: 'INR',
       receipt:  orderNo || `SW-${Date.now()}`,
       notes:    { source: 'sathvam.in' },
     });
 
-    // Stash order data so webhook can recover if /verify never fires
-    if (orderData) {
+    // Stash validated order data so webhook can recover if /verify never fires
+    if (validatedOrder) {
       supabase.from('settings').upsert({
         key:   `pending_order_${rzpOrder.id}`,
-        value: { ...orderData, stashed_at: new Date().toISOString() },
+        value: { ...validatedOrder, stashed_at: new Date().toISOString() },
       }).then(() => {}).catch(e => console.error('Stash pending order error:', e.message));
     }
 
-    res.json({ orderId: rzpOrder.id, amount: rzpOrder.amount, currency: rzpOrder.currency });
+    res.json({
+      orderId: rzpOrder.id,
+      amount: rzpOrder.amount,
+      currency: rzpOrder.currency,
+      correctedTotal: validatedOrder?.total,
+      pricesCorrected: validatedOrder?._pricesCorrected || false,
+    });
   } catch (err) {
     console.error('Razorpay order create error:', err.message);
     res.status(500).json({ error: err.message });
@@ -229,8 +324,8 @@ router.post('/verify', async (req, res) => {
       // Non-blocking: continue if Razorpay API is unavailable — signature already verified
     }
 
-    // Save webstore order — encrypt customer PII before storing
-    const o = order;
+    // Re-validate cart prices against current DB before saving
+    const o = await validateCartPrices(order);
     const rawCustomer = o.customer || {};
     const encCustomer = encryptCustomer(rawCustomer);
     const custEmailHash = hmac(rawCustomer.email || '');
@@ -330,9 +425,10 @@ router.post('/verify', async (req, res) => {
 
       // Zoho Books invoice
       try {
-        const invoice = await createInvoice(o);
+        const invoice = await createInvoice({ ...o, orderNo: generatedOrderNo });
         if (invoice?.invoice_id) {
           await recordPayment(invoice, o.total, 'online', razorpay_payment_id);
+          await supabase.from('webstore_orders').update({ zoho_invoice_id: invoice.invoice_id }).eq('id', dbId);
         }
       } catch (ze) {
         console.error('Zoho invoice error:', ze.message);
@@ -396,6 +492,32 @@ async function executeRefund(order, reason, approvedBy) {
   }).eq('id', order.id);
 
   console.log(`Refund initiated: ${refund.id} for order ${order.order_no} ₹${order.total} by ${approvedBy}`);
+
+  // Zoho Books: create credit note for full refund
+  if (zohoApi && process.env.ZOHO_ORG_ID) {
+    try {
+      const customer = order.customer || {};
+      const contactId = await zohoFindOrCreateContact(customer.name || 'Customer', customer.email, customer.phone);
+      const lineItems = (order.items || []).map(i => ({
+        name:     i.name || 'Product',
+        quantity: parseFloat(i.qty) || 1,
+        rate:     parseFloat(i.price) || 0,
+      }));
+      const cnPayload = {
+        creditnote_number: `CN-${order.order_no}`,
+        date:              new Date().toISOString().slice(0, 10),
+        reference_number:  order.order_no,
+        line_items:        lineItems,
+        notes:             `Full refund for order ${order.order_no}. Reason: ${reason || 'Customer cancellation'}. Razorpay refund: ${refund.id}`,
+        ...(contactId ? { customer_id: contactId } : { customer_name: customer.name || 'Customer' }),
+      };
+      const result = await zohoApi('post', '/creditnotes', cnPayload);
+      console.log(`[Zoho] Credit note created: ${result?.creditnote?.creditnote_id} for order ${order.order_no}`);
+    } catch (ze) {
+      console.error(`[Zoho] Credit note failed for ${order.order_no}:`, ze.response?.data?.message || ze.message);
+    }
+  }
+
   return { refund_id: refund.id, status: refund.status, order_status: orderStatus };
 }
 
@@ -571,6 +693,32 @@ router.post('/partial-refund', auth, async (req, res) => {
     }).eq('id', orderId);
 
     console.log(`Partial refund ${refund.id} ₹${refundAmount} for order ${order.order_no} by ${byName}`);
+
+    // Zoho Books: create credit note for partial refund
+    if (zohoApi && process.env.ZOHO_ORG_ID) {
+      try {
+        const customer = order.customer || {};
+        const contactId = await zohoFindOrCreateContact(customer.name || 'Customer', customer.email, customer.phone);
+        const cnLineItems = cancelItems.map(ci => {
+          const item = items[ci.idx];
+          const cancelQty = Math.min(parseFloat(ci.qty) || parseFloat(item.qty), parseFloat(item.qty));
+          return { name: item.name || 'Product', quantity: cancelQty, rate: parseFloat(item.price || item.rate || 0) };
+        });
+        const cnPayload = {
+          creditnote_number: `CN-PART-${order.order_no}-${Date.now().toString(36)}`,
+          date:              new Date().toISOString().slice(0, 10),
+          reference_number:  order.order_no,
+          line_items:        cnLineItems,
+          notes:             `Partial refund ₹${refundAmount} for order ${order.order_no}. Items: ${cancelItems.map(ci => items[ci.idx]?.name).join(', ')}. Razorpay: ${refund.id}`,
+          ...(contactId ? { customer_id: contactId } : { customer_name: customer.name || 'Customer' }),
+        };
+        const result = await zohoApi('post', '/creditnotes', cnPayload);
+        console.log(`[Zoho] Partial credit note created: ${result?.creditnote?.creditnote_id} for order ${order.order_no}`);
+      } catch (ze) {
+        console.error(`[Zoho] Partial credit note failed for ${order.order_no}:`, ze.response?.data?.message || ze.message);
+      }
+    }
+
     res.json({ success: true, refund_id: refund.id, refund_status: refund.status, refund_amount: refundAmount, order_status: newStatus });
   } catch (err) {
     const msg = err.error?.description || err.message || JSON.stringify(err);
@@ -724,8 +872,11 @@ async function handleRazorpayWebhook(req, res) {
               await sendCustomerInvoice({ ...o, orderNo: generatedOrderNo }, payment.id);
               await sendInvoiceWhatsApp({ ...o, order_no: generatedOrderNo });
               try {
-                const invoice = await createInvoice(o);
-                if (invoice?.invoice_id) await recordPayment(invoice, o.total, 'online', payment.id);
+                const invoice = await createInvoice({ ...o, orderNo: generatedOrderNo });
+                if (invoice?.invoice_id) {
+                  await recordPayment(invoice, o.total, 'online', payment.id);
+                  await supabase.from('webstore_orders').update({ zoho_invoice_id: invoice.invoice_id }).eq('order_no', generatedOrderNo);
+                }
               } catch (ze) { console.error('[webhook-recovery] Zoho error:', ze.message); }
               try {
                 const fgItems = (o.items || []).filter(i => parseFloat(i.qty) > 0);
@@ -815,6 +966,85 @@ async function handleRazorpayWebhook(req, res) {
           } catch (e) {
             console.error('[webhook] POS payment link processing error:', e.message);
           }
+        } else if (linkNotes.source === 'addon_order' && linkNotes.order_id) {
+          // Addon items payment link (admin-initiated)
+          try {
+            const paidAmount = (event.payload?.payment_link?.entity?.amount_paid || event.payload?.payment?.entity?.amount || 0) / 100;
+            console.log(`[webhook] Addon payment link paid: ${paymentLinkId} ₹${paidAmount} for order ${linkNotes.order_no}`);
+
+            // Fetch stashed addon data
+            const { data: stashRow } = await supabase.from('settings')
+              .select('value').eq('key', 'addon_link_' + paymentLinkId).maybeSingle();
+            const stashed = stashRow?.value;
+
+            if (stashed && stashed.orderId) {
+              // Fetch the existing order
+              const { data: order } = await supabase.from('webstore_orders')
+                .select('*').eq('id', stashed.orderId).single();
+
+              if (order) {
+                const existingItems = Array.isArray(order.items) ? order.items : [];
+                const mergedItems = [...existingItems, ...stashed.items];
+                const existingSubtotal = parseFloat(order.subtotal) || 0;
+                const existingGst = parseFloat(order.gst) || 0;
+                const existingTotal = parseFloat(order.total) || 0;
+                const newShipping = parseFloat(stashed.newShipping) || parseFloat(order.shipping) || 0;
+                const newSubtotal = existingSubtotal + stashed.addonSubtotal;
+                const newGst = existingGst + stashed.addonGst;
+                const newTotal = newSubtotal + newShipping;
+                const existingNotes = order.notes || '';
+                const addonNote = `\nAddon payment (admin): ${paymentId} | Items: ${stashed.items.map(i => `${i.name}×${i.qty}`).join(', ')} | Added by: ${stashed.addedBy}`;
+
+                await supabase.from('webstore_orders').update({
+                  items: mergedItems,
+                  subtotal: newSubtotal,
+                  gst: Math.round(newGst),
+                  shipping: newShipping,
+                  total: newTotal,
+                  notes: existingNotes + addonNote,
+                }).eq('id', stashed.orderId);
+
+                // Send confirmation to customer
+                const custPhone = stashed.customerPhone;
+                if (custPhone) {
+                  const waPhone = custPhone.length === 10 ? '91' + custPhone : custPhone;
+                  const itemNames = stashed.items.map(i => `${i.name} ×${i.qty}`).join(', ');
+                  try {
+                    await gaSendText(waPhone,
+                      `✅ *Payment Received — Items Added!*\n\n` +
+                      `📦 Order: *${stashed.orderNo}*\n` +
+                      `➕ Added: ${itemNames}\n` +
+                      `💰 Paid: ₹${paidAmount.toLocaleString('en-IN')}\n` +
+                      `📊 New Total: ₹${newTotal.toLocaleString('en-IN')}\n\n` +
+                      `Thank you for shopping with Sathvam! 🌿`
+                    );
+                  } catch (e) {}
+                }
+
+                // Notify admin
+                const adminPhones = [process.env.WA_ADMIN_PHONE1, process.env.WA_NOTIFY_TO].filter(Boolean);
+                for (const phone of adminPhones) {
+                  try {
+                    await gaSendText(phone.replace(/\D/g, '').length === 10 ? '91' + phone.replace(/\D/g, '') : phone.replace(/\D/g, ''),
+                      `✅ *Addon Payment Received*\n\n` +
+                      `📦 Order: ${stashed.orderNo}\n` +
+                      `👤 Customer: ${stashed.customerName}\n` +
+                      `💰 Amount: ₹${paidAmount.toLocaleString('en-IN')}\n` +
+                      `➕ Items: ${stashed.items.map(i => `${i.name}×${i.qty}`).join(', ')}\n` +
+                      `📊 New Total: ₹${newTotal.toLocaleString('en-IN')}`
+                    );
+                  } catch (e) {}
+                }
+
+                console.log(`[webhook] Addon merged into order ${stashed.orderNo}, new total ₹${newTotal}`);
+              }
+            }
+
+            // Clean up stashed data
+            await supabase.from('settings').delete().eq('key', `addon_link_${paymentLinkId}`).catch(() => {});
+          } catch (e) {
+            console.error('[webhook] Addon payment link processing error:', e.message);
+          }
         } else {
           // WhatsApp ordering flow payment link
           try {
@@ -881,9 +1111,11 @@ router.post('/', handleRazorpayWebhook);
 // Place a Cash on Delivery order (no Razorpay)
 router.post('/place-cod', async (req, res) => {
   try {
-    const { order } = req.body;
-    if (!order) return res.status(400).json({ error: 'order required' });
+    const { order: rawOrder } = req.body;
+    if (!rawOrder) return res.status(400).json({ error: 'order required' });
 
+    // Validate cart prices against current DB before saving
+    const order = await validateCartPrices(rawOrder);
     const rawCustomer = order.customer || {};
     const encCustomer = encryptCustomer(rawCustomer);
     const custEmailHash = hmac(rawCustomer.email || '');

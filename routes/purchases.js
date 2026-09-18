@@ -4,6 +4,10 @@ const { auth } = require('../middleware/auth');
 const { insertLedger } = require('../utils/ledger');
 const router = express.Router();
 
+// Zoho Books sync — gracefully unavailable if env vars not set
+let zohoApi = null;
+try { zohoApi = require('../config/zoho').zoho; } catch(e) {}
+
 router.get('/', auth, async (req, res) => {
   const { data, error } = await supabase
     .from('purchases')
@@ -25,6 +29,26 @@ router.post('/', auth, async (req, res) => {
     notes: p.notes || '',
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
+
+  // Zoho Books: create purchase order
+  if (zohoApi && process.env.ZOHO_ORG_ID && totalCost > 0) {
+    try {
+      const poPayload = {
+        purchaseorder_number: `PO-${data.id}`,
+        date:        p.date || new Date().toISOString().slice(0, 10),
+        vendor_name: p.notes || 'Vendor', // notes field often stores vendor name in purchases
+        line_items:  [{ description: `${p.material || 'Raw Material'} — ${p.qty}kg`, rate: parseFloat(p.pricePerKg) || 0, quantity: parseFloat(p.qty) || 0 }],
+        notes:       `Procurement: ${p.material || 'material'} ${p.qty}kg @ ₹${p.pricePerKg}/kg`,
+      };
+      const result = await zohoApi('post', '/purchaseorders', poPayload);
+      if (result?.purchaseorder?.purchaseorder_id) {
+        await supabase.from('purchases').update({ zoho_po_id: result.purchaseorder.purchaseorder_id }).eq('id', data.id);
+        console.log(`[Zoho] PO created: ${result.purchaseorder.purchaseorder_id} for purchase #${data.id}`);
+      }
+    } catch (ze) {
+      console.error('[Zoho] PO sync error:', ze.response?.data?.message || ze.message);
+    }
+  }
 
   // Auto-feed money_ledger — procurement expense
   if (totalCost > 0) {

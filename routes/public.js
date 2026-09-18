@@ -729,12 +729,49 @@ router.post('/live-viewers', async (req, res) => {
   } catch { res.json({ ok: false, count: 1 }); }
 });
 
+// ── Live Visitor WhatsApp Alert to Admin ──────────────────────────────────────
+// ── Live Visitor WhatsApp Alert to Admin ──────────────────────────────────────
+// Alerts immediately for each NEW visitor (deduped by session_id, 1h cooldown)
+const { sendText: gaSendText } = require('../lib/greenapi');
+const _visitorAlertSent = new Map(); // Map<session_id, timestamp>
+
+async function maybeAlertAdmin(sessionId, sessionData) {
+  // Prune old entries (>1h)
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  for (const [sid, ts] of _visitorAlertSent) {
+    if (ts < cutoff) _visitorAlertSent.delete(sid);
+  }
+
+  // Skip if already alerted for this session
+  if (_visitorAlertSent.has(sessionId)) return;
+  _visitorAlertSent.set(sessionId, Date.now());
+
+  // Send immediately
+  const s = sessionData;
+  const device = s.device === 'mobile' ? '📱' : s.device === 'tablet' ? '📱' : '💻';
+  const loc = s.city || s.country || '';
+  const page = s.page === '/' || s.page === 'home' ? 'Home' : s.page?.replace(/^\//, '') || 'Home';
+  const cart = s.cart_value > 0 ? `\n🛒 Cart: ₹${Math.round(s.cart_value)}` : '';
+  const ref = s.referrer ? `\n🔗 From: ${s.referrer}` : '';
+  const visitor = s.is_new === false ? '🔄 *Returning Visitor*' : '🟢 *New Visitor*';
+  const custName = s.customer_name ? `\n👤 ${s.customer_name}` : '';
+  const msg = `${visitor} on sathvam.in\n\n${device} ${loc || 'Unknown'} → ${page}${custName}${cart}${ref}`;
+
+  const adminPhones = ['918144803555', '919787859555', '917092277092'];
+  for (const phone of adminPhones) {
+    gaSendText(phone, msg, { priority: true }).catch(() => {});
+  }
+}
+
 // POST /api/public/heartbeat — store frontend pings every 30s to signal active session
 router.post('/heartbeat', async (req, res) => {
   res.header('Access-Control-Allow-Origin', '*');
   if (isBot(req)) return res.json({ ok: true, count: 0 });
-  const { session_id, page, referrer, utm_source, cart_value, is_new } = req.body;
+  const { session_id, page, host: bodyHost, referrer, utm_source, cart_value, is_new, customer_phone, customer_name } = req.body;
   if (!session_id) return res.json({ ok: false });
+  // Skip admin panel visitors — only track customer store
+  const originHost = bodyHost || req.headers['origin'] || req.headers['referer'] || '';
+  if (/admin\./i.test(originHost)) return res.json({ ok: true, count: 0, skipped: 'admin' });
   try {
     const now = new Date().toISOString();
     const { data } = await supabase.from('store_analytics').select('data').eq('key', 'live_sessions').maybeSingle();
@@ -761,9 +798,15 @@ router.post('/heartbeat', async (req, res) => {
       country:     needsGeo ? null : existing.country,
       countryCode: needsGeo ? null : existing.countryCode,
       first_seen:  existing.first_seen || now,
+      customer_name:  customer_name  || existing.customer_name  || null,
+      customer_phone: customer_phone || existing.customer_phone || null,
     };
     await supabase.from('store_analytics').upsert({ key: 'live_sessions', data: sessions, updated_at: now }, { onConflict: 'key' });
     res.json({ ok: true, count: Object.keys(sessions).length });
+
+    // Admin WA alert — only when visitor has items in cart
+    const sess = sessions[session_id];
+    if (sess.cart_value > 0 && !(existing.cart_value > 0)) maybeAlertAdmin(session_id, sess).catch(() => {});
 
     // Geo lookup — fire after response
     if (needsGeo) {

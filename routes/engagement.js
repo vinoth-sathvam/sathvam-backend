@@ -146,4 +146,87 @@ router.post('/run', auth, requireRole('admin'), async (req, res) => {
   }
 });
 
+// ── GET /report — follow-up report for both re-engagement and review requests ──
+router.get('/report', auth, async (req, res) => {
+  try {
+    const { from, to, type, page } = req.query;
+    const pageSize = 50;
+    const pageNum  = Math.max(1, parseInt(page) || 1);
+    const offset   = (pageNum - 1) * pageSize;
+
+    let fromDate = from || null;
+    let toDate   = to   || null;
+    if (!fromDate) { const d = new Date(); d.setDate(d.getDate() - 30); fromDate = d.toISOString().slice(0, 10); }
+    if (!toDate)   toDate = new Date().toISOString().slice(0, 10);
+    const startTs = fromDate + 'T00:00:00.000Z';
+    const endTs   = toDate + 'T23:59:59.999Z';
+
+    // Filter by type if specified
+    let query = supabase.from('customer_followup_log')
+      .select('type, phone, name, segment, order_no, days_since, status, ai_personalized, sent_at, run_id')
+      .gte('sent_at', startTs).lte('sent_at', endTs);
+    if (type && (type === 're_engagement' || type === 'review_request')) query = query.eq('type', type);
+
+    const { data: allRows, error: allErr } = await query;
+    if (allErr) throw new Error(allErr.message || JSON.stringify(allErr));
+    const rows = allRows || [];
+
+    // KPIs
+    const reRows = rows.filter(r => r.type === 're_engagement');
+    const revRows = rows.filter(r => r.type === 'review_request');
+
+    const reSent     = reRows.filter(r => r.status === 'sent').length;
+    const reFailed   = reRows.filter(r => r.status === 'failed').length;
+    const reAI       = reRows.filter(r => r.ai_personalized).length;
+    const reAtRisk   = reRows.filter(r => r.segment === 'at_risk' && r.status === 'sent').length;
+    const reLapsing  = reRows.filter(r => r.segment === 'lapsing' && r.status === 'sent').length;
+    const reChurned  = reRows.filter(r => r.segment === 'churned' && r.status === 'sent').length;
+    const reUniquePhones = new Set(reRows.filter(r => r.status === 'sent').map(r => r.phone)).size;
+    const reRuns     = new Set(reRows.map(r => r.run_id).filter(Boolean)).size;
+
+    const revSent    = revRows.filter(r => r.status === 'sent').length;
+    const revFailed  = revRows.filter(r => r.status === 'failed').length;
+    const revUniquePhones = new Set(revRows.filter(r => r.status === 'sent').map(r => r.phone)).size;
+    const revRuns    = new Set(revRows.map(r => r.run_id).filter(Boolean)).size;
+
+    // Daily breakdown
+    const dailyMap = {};
+    for (const r of rows) {
+      const day = String(r.sent_at).slice(0, 10);
+      if (!dailyMap[day]) dailyMap[day] = { date: day, re_sent: 0, re_failed: 0, rev_sent: 0, rev_failed: 0, total: 0 };
+      dailyMap[day].total++;
+      if (r.type === 're_engagement') { r.status === 'sent' ? dailyMap[day].re_sent++ : dailyMap[day].re_failed++; }
+      if (r.type === 'review_request') { r.status === 'sent' ? dailyMap[day].rev_sent++ : dailyMap[day].rev_failed++; }
+    }
+    const daily = Object.values(dailyMap).sort((a, b) => b.date.localeCompare(a.date));
+
+    // Paginated detail list
+    let detailQuery = supabase.from('customer_followup_log')
+      .select('*').gte('sent_at', startTs).lte('sent_at', endTs)
+      .order('sent_at', { ascending: false }).range(offset, offset + pageSize - 1);
+    if (type && (type === 're_engagement' || type === 'review_request')) detailQuery = detailQuery.eq('type', type);
+
+    const { data: detailRows, error: detErr } = await detailQuery;
+    if (detErr) throw new Error(detErr.message || JSON.stringify(detErr));
+
+    res.json({
+      kpi: {
+        re_engagement: { sent: reSent, failed: reFailed, ai_personalized: reAI, unique_customers: reUniquePhones, runs: reRuns, at_risk: reAtRisk, lapsing: reLapsing, churned: reChurned },
+        review_request: { sent: revSent, failed: revFailed, unique_customers: revUniquePhones, runs: revRuns },
+        total_sent: reSent + revSent,
+        total_failed: reFailed + revFailed,
+      },
+      daily,
+      sessions: detailRows || [],
+      page: pageNum,
+      page_size: pageSize,
+      from: fromDate,
+      to: toDate,
+    });
+  } catch (e) {
+    console.error('[engagement] GET /report', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

@@ -780,6 +780,10 @@ router.post('/green-webhook', express.json(), async (req, res) => {
 
       console.log(`[green-webhook] Inbound from ${phone}: ${content.slice(0, 80)}`);
 
+      // SSE: notify admin panel in real-time
+      try { sseNotify({ type: 'new_message', phone, contact_name: contactName, content: content.slice(0, 100), direction: 'inbound', timestamp: new Date().toISOString(), media_type: mediaType }); } catch {}
+
+
       // AI auto-reply for text messages
       if (AI_REPLIES_ENABLED && (msgType === 'textMessage' || msgType === 'extendedTextMessage') && content.trim()) {
         // Check auto-reply schedule — send away message outside business hours
@@ -1042,6 +1046,9 @@ router.post('/send', auth, async (req, res) => {
       timestamp: new Date().toISOString(),
       sent_by:   req.user?.username || req.user?.name || 'admin',
     });
+
+    // SSE: notify other admin panels in real-time
+    try { sseNotify({ type: 'message_sent', phone: to, content: text.trim().slice(0, 100), direction: 'outbound', timestamp: new Date().toISOString(), sent_by: req.user?.username }); } catch {}
 
     res.json({ ok: true });
   } catch (e) {
@@ -1819,5 +1826,431 @@ router.get('/failed-messages', auth, async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE /api/whatsapp/messages/:id — Delete a message (admin only)
+// ─────────────────────────────────────────────────────────────────────────────
+router.delete('/messages/:id', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { forEveryone } = req.body || {};
+    // Soft-delete: mark content as deleted
+    const { error } = await supabase.from('whatsapp_messages')
+      .update({ content: '🚫 This message was deleted', status: 'deleted', delivery_error: `Deleted by ${req.user?.username || 'admin'}${forEveryone ? ' for everyone' : ''}` })
+      .eq('id', id);
+    if (error) throw error;
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/whatsapp/messages/:id/forward — Forward a message to another phone
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/messages/:id/forward', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { toPhone } = req.body;
+    if (!toPhone) return res.status(400).json({ error: 'toPhone required' });
+
+    // Get original message
+    const { data: msg, error: fetchErr } = await supabase.from('whatsapp_messages')
+      .select('content,media_url,media_type').eq('id', id).single();
+    if (fetchErr || !msg) return res.status(404).json({ error: 'Message not found' });
+
+    const to = normalisePhone(toPhone);
+    const fwdText = `↪️ Forwarded:\n${msg.content || ''}`;
+
+    if (msg.media_url && !msg.media_url.startsWith('data:')) {
+      await gaSendFile(to, msg.media_url, 'forwarded_file', msg.content || '');
+    } else {
+      await gaSendText(to, fwdText, { priority: true });
+    }
+
+    await storeMessage({
+      phone: to, direction: 'outbound', type: 'text',
+      content: fwdText, status: 'sent',
+      timestamp: new Date().toISOString(),
+      sent_by: req.user?.username || 'admin',
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/whatsapp/conversations/:phone/transfer — Transfer chat to another user
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/conversations/:phone/transfer', auth, async (req, res) => {
+  try {
+    const { phone } = req.params;
+    const { toUser, note } = req.body;
+    if (!toUser) return res.status(400).json({ error: 'toUser required' });
+
+    const to = normalisePhone(phone);
+
+    // Update assignment
+    const assignKey = `wa_assignments`;
+    const { data: existing } = await supabase.from('settings').select('value').eq('key', assignKey).single();
+    const assignments = existing?.value || {};
+    assignments[to] = { assignee: toUser, assigned_at: new Date().toISOString(), assigned_by: req.user?.username || 'admin', transfer_note: note || '' };
+    await supabase.from('settings').upsert({ key: assignKey, value: assignments, updated_at: new Date().toISOString() });
+
+    // Add internal note about transfer
+    const notesKey = `wa_notes_${to}`;
+    const { data: notesData } = await supabase.from('settings').select('value').eq('key', notesKey).single();
+    const notes = notesData?.value || [];
+    notes.push({ id: Date.now().toString(), text: `💬 Chat transferred from ${req.user?.username || 'admin'} to ${toUser}${note ? ': ' + note : ''}`, author: 'system', timestamp: new Date().toISOString() });
+    await supabase.from('settings').upsert({ key: notesKey, value: notes, updated_at: new Date().toISOString() });
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/whatsapp/conversations/:phone/csat — Send CSAT survey to customer
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/conversations/:phone/csat', auth, async (req, res) => {
+  try {
+    const { phone } = req.params;
+    const to = normalisePhone(phone);
+    const csatMsg = `🌟 How was your experience with Sathvam?\n\nPlease rate us:\n⭐ 1 — Poor\n⭐⭐ 2 — Fair\n⭐⭐⭐ 3 — Good\n⭐⭐⭐⭐ 4 — Very Good\n⭐⭐⭐⭐⭐ 5 — Excellent\n\nJust reply with a number (1-5). Your feedback helps us serve you better! 🙏`;
+
+    const ok = await gaSendText(to, csatMsg, { priority: true });
+    if (!ok) return res.status(500).json({ error: 'Failed to send' });
+
+    await storeMessage({
+      phone: to, direction: 'outbound', type: 'text',
+      content: csatMsg, status: 'sent',
+      timestamp: new Date().toISOString(),
+      sent_by: req.user?.username || 'admin',
+    });
+
+    // Track CSAT sent
+    const csatKey = `wa_csat_${to}`;
+    await supabase.from('settings').upsert({ key: csatKey, value: { sent_at: new Date().toISOString(), sent_by: req.user?.username, rating: null }, updated_at: new Date().toISOString() });
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET/POST /api/whatsapp/auto-assign-rules — Auto-assign rules CRUD
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/auto-assign-rules', auth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'wa_auto_assign_rules').single();
+    res.json(data?.value || { enabled: false, rules: [] });
+  } catch (e) {
+    res.json({ enabled: false, rules: [] });
+  }
+});
+
+router.post('/auto-assign-rules', auth, async (req, res) => {
+  try {
+    const { enabled, rules } = req.body;
+    await supabase.from('settings').upsert({ key: 'wa_auto_assign_rules', value: { enabled, rules: rules || [] }, updated_at: new Date().toISOString() });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/whatsapp/stream — Server-Sent Events for real-time updates
+// ─────────────────────────────────────────────────────────────────────────────
+const sseClients = new Set();
+
+router.get('/stream', auth, (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  });
+  res.write('data: {"type":"connected"}\n\n');
+
+  const client = { res, user: req.user?.username };
+  sseClients.add(client);
+
+  // Heartbeat every 30s to keep connection alive
+  const heartbeat = setInterval(() => {
+    try { res.write(': heartbeat\n\n'); } catch { clearInterval(heartbeat); sseClients.delete(client); }
+  }, 30000);
+
+  req.on('close', () => {
+    clearInterval(heartbeat);
+    sseClients.delete(client);
+  });
+});
+
+// Broadcast to all SSE clients
+function sseNotify(event) {
+  const payload = `data: ${JSON.stringify(event)}\n\n`;
+  for (const client of sseClients) {
+    try { client.res.write(payload); } catch { sseClients.delete(client); }
+  }
+}
+
+// Export sseNotify so webhook handler can use it
+router._sseNotify = sseNotify;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/whatsapp/conversations/:phone/orders — Customer orders for inline display
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/conversations/:phone/orders', auth, async (req, res) => {
+  try {
+    const phone = normalisePhone(req.params.phone);
+    // Search orders by phone (in encrypted customer JSONB)
+    const { data: orders, error } = await supabase.from('webstore_orders')
+      .select('id,order_no,date,total,status,payment_status,items')
+      .order('created_at', { ascending: false }).limit(10);
+    if (error) throw error;
+
+    // Filter by phone match (customer data may be encrypted)
+    const matched = (orders || []).filter(o => {
+      try {
+        const cust = typeof o.customer === 'string' ? JSON.parse(o.customer) : o.customer;
+        const ph = (cust?.phone || '').replace(/\D/g, '');
+        return ph.includes(phone.slice(-10)) || phone.includes(ph.slice(-10));
+      } catch { return false; }
+    }).slice(0, 5);
+
+    res.json(matched);
+  } catch (e) {
+    res.json([]);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/whatsapp/ai-suggest — AI reply suggestions based on last messages
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/ai-suggest', auth, async (req, res) => {
+  try {
+    const { phone, lastMessages } = req.body;
+    if (!phone || !lastMessages?.length) return res.json({ suggestions: [] });
+
+    const context = lastMessages.slice(-5).map(m => `${m.direction === 'inbound' ? 'Customer' : 'Agent'}: ${m.content}`).join('\n');
+    const productCtx = await getProductContext();
+    const prodList = productCtx ? `\nProducts: ${productCtx.slice(0, 500)}` : '';
+
+    const resp = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6-20250514',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: `You are a WhatsApp business agent for Sathvam Oils & Spices (cold-pressed oils, millets, spices). Based on this conversation, suggest exactly 3 short reply options the agent could send. Each should be different in tone/approach. Keep each under 80 words. Return ONLY a JSON array of 3 strings, nothing else.${prodList}\n\nConversation:\n${context}` }],
+    });
+
+    const text = resp.content[0]?.text || '[]';
+    let suggestions = [];
+    try { suggestions = JSON.parse(text.match(/\[[\s\S]*\]/)?.[0] || '[]'); } catch { suggestions = []; }
+    res.json({ suggestions: suggestions.slice(0, 3) });
+  } catch (e) {
+    console.error('[ai-suggest]', e.message);
+    res.json({ suggestions: [] });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/whatsapp/sentiment — Analyze customer sentiment from recent messages
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/sentiment', auth, async (req, res) => {
+  try {
+    const { messages } = req.body;
+    if (!messages?.length) return res.json({ sentiment: 'neutral', emoji: '😐' });
+
+    const inbound = messages.filter(m => m.direction === 'inbound').slice(-5).map(m => m.content).join('\n');
+    if (!inbound.trim()) return res.json({ sentiment: 'neutral', emoji: '😐' });
+
+    const resp = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6-20250514',
+      max_tokens: 50,
+      messages: [{ role: 'user', content: `Analyze the customer sentiment of these WhatsApp messages. Reply with ONLY one JSON object: {"sentiment":"happy"|"neutral"|"upset"|"angry","emoji":"😊"|"😐"|"😟"|"😠"}\n\nMessages:\n${inbound}` }],
+    });
+
+    const text = resp.content[0]?.text || '{}';
+    try { res.json(JSON.parse(text.match(/\{[\s\S]*\}/)?.[0] || '{}')); } catch { res.json({ sentiment: 'neutral', emoji: '😐' }); }
+  } catch (e) {
+    res.json({ sentiment: 'neutral', emoji: '😐' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/whatsapp/translate — Translate message Tamil↔English
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/translate', auth, async (req, res) => {
+  try {
+    const { text, targetLang } = req.body;
+    if (!text?.trim()) return res.json({ translated: '' });
+
+    const target = targetLang === 'ta' ? 'Tamil' : 'English';
+    const resp = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6-20250514',
+      max_tokens: 500,
+      messages: [{ role: 'user', content: `Translate the following text to ${target}. Return ONLY the translated text, nothing else.\n\n${text}` }],
+    });
+
+    res.json({ translated: resp.content[0]?.text || text });
+  } catch (e) {
+    res.json({ translated: req.body.text || '' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/whatsapp/send-product-card — Send product catalog card via WhatsApp
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/send-product-card', auth, async (req, res) => {
+  try {
+    const { phone, productId } = req.body;
+    if (!phone || !productId) return res.status(400).json({ error: 'phone and productId required' });
+
+    const to = normalisePhone(phone);
+    const { data: prod } = await supabase.from('products').select('*').eq('id', productId).single();
+    if (!prod) return res.status(404).json({ error: 'Product not found' });
+
+    const price = prod.website_price || prod.retail_price || prod.price || 0;
+    const msg = `🛒 *${prod.name}*\n\n${prod.description ? prod.description.slice(0, 150) + '...' : ''}\n\n💰 Price: ₹${price}\n📦 Pack: ${prod.pack_size || ''} ${prod.pack_unit || prod.unit || ''}\n\n🛍️ Order now: https://sathvam.in\n\n_Sathvam Oils & Spices_ 🌿`;
+
+    // Send image if available, otherwise text
+    if (prod.image_url) {
+      await gaSendFile(to, prod.image_url, `${prod.name}.jpg`, msg);
+    } else {
+      await gaSendText(to, msg, { priority: true });
+    }
+
+    await storeMessage({
+      phone: to, direction: 'outbound', type: prod.image_url ? 'image' : 'text',
+      content: msg, status: 'sent', media_url: prod.image_url || null, media_type: prod.image_url ? 'image' : null,
+      timestamp: new Date().toISOString(), sent_by: req.user?.username || 'admin',
+    });
+
+    try { sseNotify({ type: 'message_sent', phone: to, content: msg.slice(0, 100), direction: 'outbound', timestamp: new Date().toISOString() }); } catch {}
+
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/whatsapp/conversation-summary — AI summary of conversation
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/conversation-summary', auth, async (req, res) => {
+  try {
+    const { messages } = req.body;
+    if (!messages?.length) return res.json({ summary: 'No messages' });
+
+    const convo = messages.slice(-20).map(m => `${m.direction === 'inbound' ? 'Customer' : 'Agent'}: ${m.content}`).join('\n');
+
+    const resp = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6-20250514',
+      max_tokens: 60,
+      messages: [{ role: 'user', content: `Summarize this WhatsApp business conversation in ONE short sentence (max 15 words). Focus on what the customer needs/wants.\n\n${convo}` }],
+    });
+
+    res.json({ summary: resp.content[0]?.text || 'Conversation' });
+  } catch (e) {
+    res.json({ summary: 'Conversation' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET/POST /api/whatsapp/scheduled — Scheduled messages queue
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/scheduled', auth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'wa_scheduled_messages').single();
+    res.json(data?.value || []);
+  } catch { res.json([]); }
+});
+
+router.post('/scheduled', auth, async (req, res) => {
+  try {
+    const { phone, text, scheduledAt, contactName } = req.body;
+    if (!phone || !text || !scheduledAt) return res.status(400).json({ error: 'phone, text, scheduledAt required' });
+
+    const { data: existing } = await supabase.from('settings').select('value').eq('key', 'wa_scheduled_messages').single();
+    const queue = existing?.value || [];
+    queue.push({ id: Date.now().toString(), phone: normalisePhone(phone), text, scheduledAt, contactName: contactName || '', createdBy: req.user?.username || 'admin', status: 'pending' });
+    await supabase.from('settings').upsert({ key: 'wa_scheduled_messages', value: queue, updated_at: new Date().toISOString() });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.delete('/scheduled/:id', auth, async (req, res) => {
+  try {
+    const { data: existing } = await supabase.from('settings').select('value').eq('key', 'wa_scheduled_messages').single();
+    const queue = (existing?.value || []).filter(m => m.id !== req.params.id);
+    await supabase.from('settings').upsert({ key: 'wa_scheduled_messages', value: queue, updated_at: new Date().toISOString() });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/whatsapp/saved-media — Saved media library for quick attach
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/saved-media', auth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'wa_saved_media').single();
+    res.json(data?.value || []);
+  } catch { res.json([]); }
+});
+
+router.post('/saved-media', auth, async (req, res) => {
+  try {
+    const { media } = req.body;
+    await supabase.from('settings').upsert({ key: 'wa_saved_media', value: media || [], updated_at: new Date().toISOString() });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Scheduled message processor — runs every 60s inside the server process
+// ─────────────────────────────────────────────────────────────────────────────
+setInterval(async () => {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'wa_scheduled_messages').single();
+    const queue = data?.value || [];
+    const now = new Date();
+    let changed = false;
+
+    for (const msg of queue) {
+      if (msg.status !== 'pending') continue;
+      const scheduledTime = new Date(msg.scheduledAt);
+      if (scheduledTime <= now) {
+        try {
+          const ok = await gaSendText(msg.phone, msg.text, { priority: true });
+          if (ok) {
+            await storeMessage({ phone: msg.phone, direction: 'outbound', type: 'text', content: msg.text, status: 'sent', timestamp: now.toISOString(), sent_by: msg.createdBy || 'scheduled' });
+            try { sseNotify({ type: 'message_sent', phone: msg.phone, content: msg.text.slice(0, 100), direction: 'outbound', timestamp: now.toISOString() }); } catch {}
+          }
+          msg.status = ok ? 'sent' : 'failed';
+          msg.sentAt = now.toISOString();
+          changed = true;
+        } catch (e) {
+          msg.status = 'failed';
+          msg.error = e.message;
+          changed = true;
+        }
+      }
+    }
+
+    if (changed) {
+      await supabase.from('settings').upsert({ key: 'wa_scheduled_messages', value: queue, updated_at: now.toISOString() });
+    }
+  } catch {}
+}, 60000);
 
 module.exports = router;

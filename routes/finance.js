@@ -5,9 +5,19 @@ const supabase  = require('../config/supabase');
 const { insertLedger } = require('../utils/ledger');
 
 // Zoho helper — gracefully unavailable if env vars not set
-let zoho = null;
-try { zoho = require('../config/zoho').zoho; } catch(e) {}
+let zohoApi = null, zohoFindOrCreateContact = null;
+try {
+  const z = require('../config/zoho');
+  zohoApi = z.zoho;
+  zohoFindOrCreateContact = z.findOrCreateContact;
+} catch(e) {}
 const ZOHO_ORG = () => process.env.ZOHO_ORG_ID;
+
+// Non-blocking Zoho sync helper — logs errors but never blocks the response
+function zohoSync(label, fn) {
+  if (!zohoApi || !ZOHO_ORG()) return;
+  fn().catch(e => console.error(`[Zoho sync] ${label} failed:`, e.response?.data?.message || e.message));
+}
 
 const round2 = n => Math.round((parseFloat(n) || 0) * 100) / 100;
 
@@ -321,6 +331,27 @@ router.post('/payables', auth, async (req, res) => {
     }).select().single();
     if (error) return res.status(400).json({ error: error.message });
     auditLog('vendor_bill', data.id, 'create', req.user?.email, data);
+
+    // Zoho Books: create vendor bill
+    zohoSync(`Create bill ${data.bill_no || data.id}`, async () => {
+      const contactId = await zohoFindOrCreateContact(vendor_name, null, null, 'vendor');
+      const billPayload = {
+        vendor_id:    contactId || undefined,
+        vendor_name:  contactId ? undefined : vendor_name,
+        bill_number:  data.bill_no || `BILL-${data.id}`,
+        date:         bill_date,
+        due_date:     due_date || undefined,
+        line_items:   [{ description: category || 'General', rate: round2(amount || 0), quantity: 1 }],
+        gst_no:       vendor_gst || undefined,
+        notes:        notes || `Vendor bill — ${vendor_name}`,
+      };
+      const result = await zohoApi('post', '/bills', billPayload);
+      if (result?.bill?.bill_id) {
+        await supabase.from('vendor_bills').update({ zoho_bill_id: result.bill.bill_id }).eq('id', data.id);
+        console.log(`[Zoho] Bill created: ${result.bill.bill_id} for vendor_bill #${data.id}`);
+      }
+    });
+
     res.status(201).json({ ...data, total_amount: round2((data.amount||0)+(data.gst_amount||0)), balance: round2((data.amount||0)+(data.gst_amount||0)), payments:[] });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -391,6 +422,22 @@ router.post('/payables/:id/payments', auth, async (req, res) => {
     }
     auditLog('vendor_bill', billId, 'payment', req.user?.email, { amount: amt, mode: mode||'bank_transfer' });
 
+    // Zoho Books: record bill payment
+    zohoSync(`Bill payment #${billId}`, async () => {
+      const { data: zBill } = await supabase.from('vendor_bills').select('zoho_bill_id,vendor_name').eq('id', billId).single();
+      if (zBill?.zoho_bill_id) {
+        await zohoApi('post', '/billpayments', {
+          vendor_id:     undefined, // Zoho resolves from bill
+          payment_mode:  mode === 'upi' || mode === 'bank_transfer' ? 'BankTransfer' : mode === 'cheque' ? 'Cheque' : 'Cash',
+          amount:        amt,
+          date:          date || new Date().toISOString().slice(0, 10),
+          reference_number: reference || '',
+          bills: [{ bill_id: zBill.zoho_bill_id, amount_applied: amt }],
+        });
+        console.log(`[Zoho] Bill payment recorded for bill #${billId} ₹${amt}`);
+      }
+    });
+
     // Auto-feed money_ledger — vendor bill payment
     const { data: billInfo } = await supabase.from('vendor_bills').select('vendor_name,bill_no,category').eq('id', billId).single();
     insertLedger({
@@ -417,6 +464,86 @@ router.get('/payables/:id/payments', auth, async (req, res) => {
   const { data, error } = await supabase.from('bill_payments').select('*').eq('bill_id', req.params.id).order('date');
   if (error) return res.status(500).json({ error: error.message });
   res.json(data || []);
+});
+
+// POST /finance/payables/:id/pay-via-zoho — pay vendor bill through Zoho Books (ICICI)
+router.post('/payables/:id/pay-via-zoho', auth, async (req, res) => {
+  if (!zohoApi) return res.status(503).json({ error: 'Zoho not configured' });
+  try {
+    const billId = parseInt(req.params.id);
+    const { amount, date, reference, zoho_bank_account_id } = req.body;
+    const amt = round2(amount);
+    if (!amt || amt <= 0) return res.status(400).json({ error: 'Invalid amount' });
+
+    // Get bill details
+    const { data: bill } = await supabase.from('vendor_bills')
+      .select('*').eq('id', billId).single();
+    if (!bill) return res.status(404).json({ error: 'Bill not found' });
+
+    const payDate = date || new Date().toISOString().slice(0, 10);
+    const bankAcctId = zoho_bank_account_id || '1247318000000189051'; // default ICICI
+
+    // Find or create vendor in Zoho
+    let vendorId;
+    try {
+      vendorId = await zohoFindOrCreateContact(bill.vendor_name, null, null, 'vendor');
+    } catch (_) {}
+
+    // If bill has a zoho_bill_id, pay against it
+    const zohoPayload = {
+      vendor_id: vendorId || undefined,
+      vendor_name: vendorId ? undefined : bill.vendor_name,
+      payment_mode: 'BankTransfer',
+      amount: amt,
+      date: payDate,
+      paid_through_account_id: bankAcctId,
+      reference_number: reference || '',
+      description: `Payment for bill ${bill.bill_no || billId} — ${bill.vendor_name}`,
+      ...(bill.zoho_bill_id ? {
+        bills: [{ bill_id: bill.zoho_bill_id, amount_applied: amt }],
+      } : {}),
+    };
+
+    const zohoResult = await zohoApi('post', '/vendorpayments', zohoPayload);
+    const zohoPaymentId = zohoResult?.vendorpayment?.payment_id;
+    console.log(`[Zoho] Vendor payment created: ${zohoPaymentId} ₹${amt} to ${bill.vendor_name}`);
+
+    // Record locally too
+    const { data: pmt } = await supabase.from('bill_payments').insert({
+      bill_id: billId, date: payDate, amount: amt,
+      mode: 'zoho_books', reference: zohoPaymentId || reference || '',
+      notes: `Paid via Zoho Books (ICICI). Zoho payment: ${zohoPaymentId || 'N/A'}`,
+      created_by: req.user?.email || '',
+    }).select().single();
+
+    // Update bill paid_amount
+    const newPaid = round2((bill.paid_amount || 0) + amt);
+    await supabase.from('vendor_bills').update({ paid_amount: newPaid, updated_at: new Date().toISOString() }).eq('id', billId);
+    const newStatus = await refreshBillStatus(billId);
+
+    auditLog('vendor_bill', billId, 'zoho_payment', req.user?.email, { amount: amt, zoho_payment_id: zohoPaymentId });
+
+    // Auto-feed money_ledger
+    insertLedger({
+      txn_date: payDate, direction: 'out', amount: amt,
+      category: 'expense', subcategory: bill.category || 'vendor_bill',
+      party: bill.vendor_name, party_type: 'vendor',
+      payment_mode: 'zoho_books',
+      narration: `Zoho payment — ${bill.bill_no || billId} — ${bill.vendor_name}`,
+      reference_no: zohoPaymentId || '', source_table: 'bill_payments',
+      source_id: String(pmt?.id || billId), created_by: req.user?.name || '',
+    }).catch(() => {});
+
+    res.json({
+      ok: true, payment: pmt, bill_status: newStatus, paid_amount: newPaid,
+      zoho_payment_id: zohoPaymentId,
+      message: `₹${amt.toLocaleString('en-IN')} paid to ${bill.vendor_name} via Zoho Books (ICICI)`,
+    });
+  } catch (e) {
+    const msg = e.response?.data?.message || e.message;
+    console.error('Zoho vendor payment error:', msg);
+    res.status(500).json({ error: 'Zoho payment failed: ' + msg });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -452,7 +579,7 @@ router.put('/bank/accounts/:id', auth, async (req, res) => {
 
 router.get('/bank/transactions', auth, async (req, res) => {
   try {
-    const { account_id, start, end, type, limit=200, offset=0 } = req.query;
+    const { account_id, start, end, type, limit=1000, offset=0 } = req.query;
     let q = supabase.from('bank_transactions').select('*').order('date',{ascending:false}).order('created_at',{ascending:false}).limit(parseInt(limit)).range(parseInt(offset), parseInt(offset)+parseInt(limit)-1);
     if (account_id) q = q.eq('bank_account_id', account_id);
     if (start) q = q.gte('date', start);
@@ -620,6 +747,24 @@ router.post('/journal', auth, async (req, res) => {
     if (le) return res.status(400).json({ error: le.message });
 
     auditLog('journal_entry', entry.id, 'create', req.user?.email, { description, total_amount: totalDebit });
+
+    // Zoho Books: create journal entry
+    zohoSync(`Journal ${entry.id}`, async () => {
+      const zohoLines = lines.map(l => ({
+        account_name:  l.account_name || 'Uncategorized',
+        debit_or_credit: parseFloat(l.debit || 0) > 0 ? 'debit' : 'credit',
+        amount:        parseFloat(l.debit || 0) > 0 ? round2(l.debit) : round2(l.credit),
+        description:   l.description || '',
+      }));
+      await zohoApi('post', '/journals', {
+        journal_date:    date,
+        reference_number: ref_no || `JE-${entry.id}`,
+        notes:           description,
+        line_items:      zohoLines,
+      });
+      console.log(`[Zoho] Journal entry created for JE #${entry.id}`);
+    });
+
     res.status(201).json({ ...entry, lines: jLines });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -880,6 +1025,205 @@ router.post('/zoho/gst/push-gstr3b', auth, async (req, res) => {
   } catch(e) {
     const msg = e.response?.data?.message || e.message;
     res.status(500).json({ error: 'Zoho error: ' + msg });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ZOHO BANK FEED SYNC (ICICI linked in Zoho Books)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/finance/zoho/bank-accounts — list all bank accounts from Zoho Books
+router.get('/zoho/bank-accounts', auth, async (req, res) => {
+  if (!zohoApi) return res.status(503).json({ error: 'Zoho not configured' });
+  try {
+    const data = await zohoApi('get', '/bankaccounts', null, { organization_id: ZOHO_ORG() });
+    const accounts = (data.bankaccounts || []).map(a => ({
+      zoho_account_id:  a.account_id,
+      account_name:     a.account_name,
+      account_number:   a.account_number || '',
+      bank_name:        a.bank_name || '',
+      account_type:     a.account_type,
+      balance:          parseFloat(a.balance) || 0,
+      currency:         a.currency_code || 'INR',
+      is_active:        a.is_active,
+      last_refreshed:   a.last_refreshed_date || null,
+    }));
+    res.json({ accounts, count: accounts.length });
+  } catch (e) {
+    res.status(500).json({ error: 'Zoho error: ' + (e.response?.data?.message || e.message) });
+  }
+});
+
+// POST /api/finance/zoho/sync-bank-transactions — fetch transactions from Zoho and upsert locally
+router.post('/zoho/sync-bank-transactions', auth, async (req, res) => {
+  if (!zohoApi) return res.status(503).json({ error: 'Zoho not configured' });
+  try {
+    const { zoho_account_id, local_account_id, from_date, to_date } = req.body;
+    if (!zoho_account_id || !local_account_id) {
+      return res.status(400).json({ error: 'zoho_account_id and local_account_id required' });
+    }
+
+    const fromDate = from_date || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const toDate   = to_date   || new Date().toISOString().slice(0, 10);
+
+    let page = 1, inserted = 0, updated = 0, skipped = 0;
+    while (true) {
+      const data = await zohoApi('get', `/banktransactions`, null, {
+        organization_id: ZOHO_ORG(),
+        account_id:      zoho_account_id,
+        date_start:      fromDate,
+        date_end:        toDate,
+        page,
+        per_page:        200,
+        sort_column:     'date',
+        sort_order:      'D',
+      });
+
+      const txns = data.banktransactions || [];
+      if (!txns.length) break;
+
+      for (const t of txns) {
+        const zohoTxnId = t.transaction_id;
+        const amount    = round2(Math.abs(parseFloat(t.amount) || 0));
+        if (amount <= 0) { skipped++; continue; }
+
+        // Skip Zoho accounting splits — only sync real bank feed entries
+        const desc = (t.payee || t.description || '').trim();
+        const ref = (t.reference_number || '').trim();
+        const isRealBankTxn = ref.length > 0 || /^(UPI|NEFT|RTGS|INF|MMT|ACH|BIL|MIN|MSI|EZY|Mob alrt)/i.test(desc);
+        if (!isRealBankTxn && t.source !== 'bank_feed') { skipped++; continue; }
+
+        const rec = {
+          bank_account_id: local_account_id,
+          date:            t.date,
+          type:            t.debit_or_credit === 'debit' ? 'credit' : 'debit',
+          amount,
+          description:     desc || ref || '',
+          reference:       ref || t.transaction_id || '',
+          category:        t.category_name || t.account_name || '',
+          zoho_txn_id:     zohoTxnId,
+          reconciled:      t.status === 'manually_added' || t.status === 'matched' || t.status === 'categorized',
+          created_by:      'zoho-bank-sync',
+        };
+
+        // Upsert by zoho_txn_id to avoid duplicates
+        const { data: existing } = await supabase
+          .from('bank_transactions')
+          .select('id')
+          .eq('zoho_txn_id', zohoTxnId)
+          .maybeSingle();
+
+        if (existing) {
+          await supabase.from('bank_transactions')
+            .update({ ...rec, updated_at: new Date().toISOString() })
+            .eq('id', existing.id);
+          updated++;
+        } else {
+          await supabase.from('bank_transactions').insert(rec);
+          // Don't adjust balance here — actual balance is set from Zoho at the end
+          inserted++;
+        }
+      }
+
+      if (!data.page_context?.has_more_page) break;
+      page++;
+      if (page > 20) break; // safety cap
+    }
+
+    // Also update the local account balance from Zoho's current balance
+    try {
+      const acctData = await zohoApi('get', `/bankaccounts/${zoho_account_id}`, null, { organization_id: ZOHO_ORG() });
+      const zohoBalance = parseFloat(acctData?.bankaccount?.balance) || null;
+      if (zohoBalance !== null) {
+        await supabase.from('bank_accounts')
+          .update({ current_balance: round2(zohoBalance), zoho_account_id, zoho_synced_at: new Date().toISOString() })
+          .eq('id', local_account_id);
+      }
+    } catch (balErr) {
+      console.warn('[Zoho] Could not update bank balance:', balErr.message);
+    }
+
+    auditLog('bank_sync', local_account_id, 'zoho_sync', req.user?.email, { inserted, updated, skipped, from: fromDate, to: toDate });
+
+    res.json({
+      ok: true,
+      inserted,
+      updated,
+      skipped,
+      total_synced: inserted + updated,
+      period: { from: fromDate, to: toDate },
+    });
+  } catch (e) {
+    const msg = e.response?.data?.message || e.message;
+    res.status(500).json({ error: 'Zoho bank sync error: ' + msg });
+  }
+});
+
+// GET /api/finance/zoho/bank-statement — fetch statement directly from Zoho (read-only, no local save)
+router.get('/zoho/bank-statement', auth, async (req, res) => {
+  if (!zohoApi) return res.status(503).json({ error: 'Zoho not configured' });
+  try {
+    const { account_id, from_date, to_date, page = 1 } = req.query;
+    if (!account_id) return res.status(400).json({ error: 'account_id (Zoho) required' });
+
+    const fromDate = from_date || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const toDate   = to_date   || new Date().toISOString().slice(0, 10);
+
+    const data = await zohoApi('get', '/banktransactions', null, {
+      organization_id: ZOHO_ORG(),
+      account_id,
+      date_start:      fromDate,
+      date_end:        toDate,
+      page:            parseInt(page),
+      per_page:        200,
+      sort_column:     'date',
+      sort_order:      'D',
+    });
+
+    const transactions = (data.banktransactions || []).map(t => ({
+      zoho_txn_id:     t.transaction_id,
+      date:            t.date,
+      type:            t.debit_or_credit === 'debit' ? 'credit' : 'debit',
+      amount:          round2(Math.abs(parseFloat(t.amount) || 0)),
+      payee:           t.payee || '',
+      description:     t.description || '',
+      reference:       t.reference_number || '',
+      category:        t.category_name || '',
+      status:          t.status,
+      account_name:    t.account_name || '',
+    }));
+
+    const totalCredit = transactions.filter(t => t.type === 'credit').reduce((s, t) => s + t.amount, 0);
+    const totalDebit  = transactions.filter(t => t.type === 'debit').reduce((s, t) => s + t.amount, 0);
+
+    res.json({
+      transactions,
+      count:        transactions.length,
+      total_credit: round2(totalCredit),
+      total_debit:  round2(totalDebit),
+      has_more:     data.page_context?.has_more_page || false,
+      period:       { from: fromDate, to: toDate },
+    });
+  } catch (e) {
+    res.status(500).json({ error: 'Zoho error: ' + (e.response?.data?.message || e.message) });
+  }
+});
+
+// POST /api/finance/zoho/link-bank-account — link a local bank account to a Zoho bank account
+router.post('/zoho/link-bank-account', auth, async (req, res) => {
+  try {
+    const { local_account_id, zoho_account_id } = req.body;
+    if (!local_account_id || !zoho_account_id) return res.status(400).json({ error: 'Both IDs required' });
+
+    const { data, error } = await supabase.from('bank_accounts')
+      .update({ zoho_account_id, zoho_synced_at: new Date().toISOString() })
+      .eq('id', local_account_id)
+      .select().single();
+
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ ok: true, account: data });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
   }
 });
 

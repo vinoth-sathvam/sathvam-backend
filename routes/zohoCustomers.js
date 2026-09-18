@@ -1,38 +1,7 @@
 const express = require('express');
 const router  = express.Router();
 const { auth } = require('../middleware/auth');
-const axios   = require('axios');
-
-const TOKEN_URL = 'https://accounts.zoho.in/oauth/v2/token';
-const API_BASE  = 'https://www.zohoapis.in/books/v3';
-const ORG_ID    = () => process.env.ZOHO_ORG_ID;
-
-let _accessToken = null;
-let _tokenExpiry = 0;
-
-async function getToken() {
-  if (_accessToken && Date.now() < _tokenExpiry) return _accessToken;
-  const res = await axios.post(TOKEN_URL, null, {
-    params: {
-      grant_type:    'refresh_token',
-      client_id:     process.env.ZOHO_CLIENT_ID,
-      client_secret: process.env.ZOHO_CLIENT_SECRET,
-      refresh_token: process.env.ZOHO_REFRESH_TOKEN,
-    },
-  });
-  _accessToken = res.data.access_token;
-  _tokenExpiry = Date.now() + (res.data.expires_in - 60) * 1000;
-  return _accessToken;
-}
-
-async function zohoGet(path, params = {}) {
-  const token = await getToken();
-  const res = await axios.get(`${API_BASE}${path}`, {
-    headers: { Authorization: `Zoho-oauthtoken ${token}` },
-    params: { organization_id: ORG_ID(), ...params },
-  });
-  return res.data;
-}
+const { zohoGet } = require('../config/zoho');
 
 // GET /api/zoho-customers/local — list all customers from Supabase DB
 router.get('/local', auth, async (req, res) => {

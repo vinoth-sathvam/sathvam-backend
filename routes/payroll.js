@@ -498,6 +498,10 @@ router.get('/salary-payments', auth, async (req, res) => {
   res.json(data || []);
 });
 
+// Zoho Books sync — gracefully unavailable if env vars not set
+let zohoApi = null;
+try { zohoApi = require('../config/zoho').zoho; } catch(e) {}
+
 // ── POST record a single salary payment ────────────────────────────────────────
 router.post('/salary-payments', auth, requireRole('admin', 'manager'), async (req, res) => {
   const { employee_id, employee_name, month, amount, payment_mode, payment_date, reference_no, notes } = req.body;
@@ -532,6 +536,24 @@ router.post('/salary-payments', auth, requireRole('admin', 'manager'), async (re
     source_id:    String(data.id),
     created_by:   req.user?.name || '',
   }).catch(() => {});
+
+  // Zoho Books: create journal entry for salary payment
+  if (zohoApi && process.env.ZOHO_ORG_ID) {
+    try {
+      await zohoApi('post', '/journals', {
+        journal_date:     data.payment_date,
+        reference_number: reference_no || `SAL-${month}-${employee_id}`,
+        notes:            `Salary ${month} — ${employee_name || ''}`,
+        line_items: [
+          { account_name: 'Salaries and Employee Wages', debit_or_credit: 'debit', amount: parseFloat(amount) },
+          { account_name: payment_mode === 'cash' ? 'Petty Cash' : 'Bank', debit_or_credit: 'credit', amount: parseFloat(amount) },
+        ],
+      });
+      console.log(`[Zoho] Salary journal created for ${employee_name} ${month}`);
+    } catch (ze) {
+      console.error('[Zoho] Salary journal error:', ze.response?.data?.message || ze.message);
+    }
+  }
 
   res.status(201).json(data);
 });
@@ -575,6 +597,24 @@ router.post('/pay-run', auth, requireRole('admin', 'manager'), async (req, res) 
     payment_mode: pMode, payment_date: pDate,
     reference_no: reference_no || '', notes: notes || '', created_by: paidBy,
   }, { onConflict: 'month' });
+
+  // Zoho Books: create single journal entry for bulk pay run
+  if (zohoApi && process.env.ZOHO_ORG_ID && totalAmount > 0) {
+    try {
+      await zohoApi('post', '/journals', {
+        journal_date:     pDate,
+        reference_number: reference_no || `PAYRUN-${month}`,
+        notes:            `Bulk pay run ${month} — ${rows.length} employees, total ₹${totalAmount}`,
+        line_items: [
+          { account_name: 'Salaries and Employee Wages', debit_or_credit: 'debit', amount: totalAmount },
+          { account_name: pMode === 'cash' ? 'Petty Cash' : 'Bank', debit_or_credit: 'credit', amount: totalAmount },
+        ],
+      });
+      console.log(`[Zoho] Pay run journal created for ${month} — ₹${totalAmount}`);
+    } catch (ze) {
+      console.error('[Zoho] Pay run journal error:', ze.response?.data?.message || ze.message);
+    }
+  }
 
   res.json({ ok: true, count: data?.length || rows.length, total_amount: totalAmount });
 });

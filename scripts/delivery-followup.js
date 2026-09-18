@@ -9,13 +9,12 @@
  */
 
 require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
-const { createClient }    = require('@supabase/supabase-js');
+const supabase = require('../config/supabase');
 const { sendText, isAutomationDisabled } = require('../lib/greenapi');
 const { decryptCustomer } = require('../config/crypto');
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-
 const GOOGLE_REVIEW_URL = process.env.GOOGLE_REVIEW_URL || 'https://g.page/r/sathvam/review';
+const DRIP_MODE         = true;  // send 1 message per run, exit — timer fires every 20 min
 const SEND_DELAY_MS     = 2000;
 const BATCH_SIZE        = 10;
 const BATCH_PAUSE_MS    = 30000;
@@ -76,28 +75,78 @@ async function run() {
   }
 
   console.log(`[delivery-followup] ${toSend.length} to message`);
+  const runId = `rev_${Date.now()}`;
 
-  for (let i = 0; i < toSend.length; i++) {
-    const t = toSend[i];
-    if (i > 0 && i % BATCH_SIZE === 0) {
-      console.log(`[delivery-followup] Batch pause ${BATCH_PAUSE_MS / 1000}s…`);
-      await sleep(BATCH_PAUSE_MS);
-    }
+  // IST business hours check (9 AM – 9 PM IST)
+  const istHour = new Date(Date.now() + 5.5 * 3600000).getUTCHours();
+  if (istHour < 9 || istHour >= 21) {
+    console.log(`[delivery-followup] Outside business hours (IST ${istHour}:00) — skipping`);
+    return;
+  }
 
+  if (DRIP_MODE && !dryRun) {
+    // ── DRIP: send exactly 1 message, then exit ──
+    const t = toSend[0];
+    if (!t) { console.log('[delivery-followup] No customers to message'); return; }
+
+    console.log(`[delivery-followup] Drip: 1 of ${toSend.length} → ${t.phone} (${t.name}) ${t.orderNo}`);
     const message = buildMessage(t.name);
-
-    if (dryRun) {
-      console.log(`[DRY RUN] → ${t.phone} (${t.name}) ${t.orderNo}`);
-      continue;
-    }
 
     try {
       const ok = await sendText(t.phone, message);
       console.log(`[${ok ? 'SENT' : 'FAIL'}] ${t.orderNo} → ${t.phone}`);
       if (ok) sentLog[t.orderId] = new Date().toISOString().slice(0, 10);
-      await sleep(SEND_DELAY_MS);
+
+      await supabase.from('customer_followup_log').insert({
+        type: 'review_request', phone: t.phone, name: t.name,
+        order_no: t.orderNo, days_since: 7,
+        status: ok ? 'sent' : 'failed', run_id: runId,
+      }).catch(e2 => console.error('[followup_log]', e2.message));
     } catch (e) {
       console.error(`[ERROR] ${t.orderNo}:`, e.message);
+      await supabase.from('customer_followup_log').insert({
+        type: 'review_request', phone: t.phone, name: t.name,
+        order_no: t.orderNo, days_since: 7,
+        status: 'failed', run_id: runId,
+      }).catch(() => {});
+    }
+
+  } else {
+    // ── BULK or DRY RUN ──
+    for (let i = 0; i < toSend.length; i++) {
+      const t = toSend[i];
+      if (i > 0 && i % BATCH_SIZE === 0) {
+        console.log(`[delivery-followup] Batch pause ${BATCH_PAUSE_MS / 1000}s…`);
+        await sleep(BATCH_PAUSE_MS);
+      }
+
+      const message = buildMessage(t.name);
+
+      if (dryRun) {
+        console.log(`[DRY RUN] → ${t.phone} (${t.name}) ${t.orderNo}`);
+        continue;
+      }
+
+      try {
+        const ok = await sendText(t.phone, message);
+        console.log(`[${ok ? 'SENT' : 'FAIL'}] ${t.orderNo} → ${t.phone}`);
+        if (ok) sentLog[t.orderId] = new Date().toISOString().slice(0, 10);
+
+        await supabase.from('customer_followup_log').insert({
+          type: 'review_request', phone: t.phone, name: t.name,
+          order_no: t.orderNo, days_since: 7,
+          status: ok ? 'sent' : 'failed', run_id: runId,
+        }).catch(e2 => console.error('[followup_log]', e2.message));
+
+        await sleep(SEND_DELAY_MS);
+      } catch (e) {
+        console.error(`[ERROR] ${t.orderNo}:`, e.message);
+        await supabase.from('customer_followup_log').insert({
+          type: 'review_request', phone: t.phone, name: t.name,
+          order_no: t.orderNo, days_since: 7,
+          status: 'failed', run_id: runId,
+        }).catch(() => {});
+      }
     }
   }
 

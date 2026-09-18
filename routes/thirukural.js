@@ -171,8 +171,8 @@ router.post('/broadcast', auth, async (req, res) => {
         const ok = await gaSendText(phone, message);
         if (ok) sent++; else failed++;
 
-        // Throttle — 3 messages per second to avoid rate limits
-        await new Promise(ok => setTimeout(ok, 333));
+        // Throttle — 1 message per 5 seconds to avoid Green API spam flag
+        await new Promise(ok => setTimeout(ok, 5000));
       } catch { failed++; }
     }
 
@@ -219,7 +219,7 @@ router.post('/approve-from-wa', async (req, res) => {
 
         const ok = await gaSendText(phone, message);
         if (ok) sent++; else failed++;
-        await new Promise(ok => setTimeout(ok, 333));
+        await new Promise(ok => setTimeout(ok, 5000));
       } catch { failed++; }
     }
 

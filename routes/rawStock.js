@@ -344,4 +344,243 @@ router.post('/sync', auth, requireRole('admin','manager'), async (req, res) => {
   }
 });
 
+// ── GET usage-report — raw material consumption & procurement over time periods ──
+router.get('/usage-report', auth, async (req, res) => {
+  try {
+    const now = new Date();
+    const istOffset = 5.5 * 3600000;
+    const istNow = new Date(now.getTime() + istOffset);
+    const todayIST = istNow.toISOString().slice(0, 10);
+
+    const todayStart = todayIST;
+    const weekStart  = new Date(istNow.getTime() - 7 * 86400000).toISOString().slice(0, 10);
+    const monthStart = new Date(istNow.getFullYear(), istNow.getMonth(), 1).toISOString().slice(0, 10);
+    const qStart     = new Date(istNow.getFullYear(), Math.floor(istNow.getMonth() / 3) * 3, 1).toISOString().slice(0, 10);
+    const yearStart  = istNow.getFullYear() + '-01-01';
+
+    // Fetch materials + products (for sale-to-raw-material mapping)
+    const { data: materials } = await supabase.from('raw_materials').select('*').eq('active', true);
+    const { data: products } = await supabase.from('products').select('id, name, pack_size, pack_unit, oil_type_key, raw_mat_key, cat');
+
+    // Build product lookup: product_id → { pack_size_kg, raw_mat_key/oil_type_key }
+    const prodMap = {};
+    (products || []).forEach(p => {
+      const ps = parseFloat(p.pack_size || 0);
+      const pu = (p.pack_unit || '').toLowerCase();
+      // Convert pack_size to kg
+      let packKg = 0;
+      if (pu === 'kg') packKg = ps;
+      else if (pu === 'g' || pu === 'gm' || pu === 'gms') packKg = ps / 1000;
+      else if (pu === 'l' || pu === 'ltr' || pu === 'litre' || pu === 'litres') packKg = ps; // 1L ≈ 1kg for oils
+      else if (pu === 'ml') packKg = ps / 1000;
+      prodMap[p.id] = { name: p.name, packKg, oilKey: p.oil_type_key || '', rawKey: p.raw_mat_key || '', cat: p.cat || '' };
+    });
+
+    // Helper: find which raw material a product maps to
+    // For oil products: match to the OIL raw material (tank), not the SEED
+    // e.g., "Groundnut Oil 1L" → "Groundnut Oil", NOT "Groundnut Seeds"
+    function findRawMat(prod, matList) {
+      const pName = (prod.name || '').toLowerCase();
+      const isOilProduct = pName.includes('oil');
+
+      // Try raw_mat_key first (explicit mapping — most reliable)
+      if (prod.rawKey) {
+        for (const m of matList) {
+          if (nameMatches(prod.rawKey, m.name)) return m;
+        }
+      }
+
+      // Try oil_type_key for oil products — match to OIL material, not SEED
+      if (prod.oilKey) {
+        const oilKey = prod.oilKey.toLowerCase();
+        // First try: find "[oilKey] Oil" raw material (e.g., "Groundnut Oil")
+        for (const m of matList) {
+          const mn = m.name.toLowerCase();
+          if (mn.includes(oilKey) && mn.includes('oil')) return m;
+        }
+        // If no oil material found, fall back to seed (for seed products like "Sesame Seeds 500g")
+        if (!isOilProduct) {
+          for (const m of matList) {
+            if (nameMatches(prod.oilKey, m.name)) return m;
+          }
+        }
+      }
+
+      // Fuzzy name match — but for oil products, prefer oil materials
+      if (isOilProduct) {
+        // First pass: match only oil raw materials
+        for (const m of matList) {
+          if (m.name.toLowerCase().includes('oil') && nameMatches(prod.name, m.name)) return m;
+        }
+      }
+
+      // General fuzzy match
+      for (const m of matList) {
+        if (nameMatches(prod.name, m.name)) return m;
+      }
+      return null;
+    }
+
+    // Fetch all data sources
+    const [procRes, oilRes, flourRes, spiceRes, wsRes, saleItemsRes, b2bItemsRes] = await Promise.all([
+      supabase.from('procurements').select('date, commodity_name, cleaned_qty, received_qty, status')
+        .in('status', ['received', 'stocked', 'cleaned']).gte('date', yearStart),
+      supabase.from('batches').select('date, oil_type, input_kg').gte('date', yearStart),
+      supabase.from('flour_batches').select('date, commodity, input_kg').gte('date', yearStart),
+      supabase.from('spice_powder_batches').select('date, ingredients').gte('date', yearStart).then(r => r).catch(() => ({ data: [] })),
+      // Sales channels
+      supabase.from('webstore_orders').select('date, items, status')
+        .not('status', 'in', '("cancelled","rejected")').gte('date', yearStart),
+      supabase.from('sale_items').select('product_id, product_name, qty, sales!inner(date, status)')
+        .not('sales.status', 'in', '("cancelled","rejected")').gte('sales.date', yearStart),
+      supabase.from('b2b_order_items').select('product_id, product_name, qty, b2b_orders!inner(date, stage)')
+        .not('b2b_orders.stage', 'in', '("cancelled","rejected")').gte('b2b_orders.date', yearStart)
+        .then(r => r).catch(() => ({ data: [] })),
+    ]);
+
+    const procs = procRes.data || [];
+    const oilBatches = oilRes.data || [];
+    const flourBatches = flourRes.data || [];
+    const spiceBatches = spiceRes.data || [];
+
+    // Build flat list of sold items: { date, product_id, product_name, qty }
+    const soldItems = [];
+
+    // Webstore orders
+    (wsRes.data || []).forEach(o => {
+      const orderItems = Array.isArray(o.items) ? o.items : [];
+      orderItems.forEach(it => {
+        soldItems.push({ date: o.date, productId: it.id || it.product_id, productName: it.name || it.productName || '', qty: parseFloat(it.qty || 0), channel: 'web' });
+      });
+    });
+
+    // POS sales (via sale_items join)
+    (saleItemsRes.data || []).forEach(si => {
+      const d = si.sales?.date;
+      if (!d) return;
+      soldItems.push({ date: d, productId: si.product_id, productName: si.product_name || '', qty: parseFloat(si.qty || 0), channel: 'pos' });
+    });
+
+    // B2B orders (via b2b_order_items join)
+    (b2bItemsRes.data || []).forEach(bi => {
+      const d = bi.b2b_orders?.date;
+      if (!d) return;
+      soldItems.push({ date: d, productId: bi.product_id, productName: bi.product_name || '', qty: parseFloat(bi.qty || 0), channel: 'b2b' });
+    });
+
+    const periods = ['today', 'week', 'month', 'quarter', 'year'];
+    const cutoffs = { today: todayStart, week: weekStart, month: monthStart, quarter: qStart, year: yearStart };
+
+    const matList = materials || [];
+
+    const items = matList.map(mat => {
+      const row = {
+        id: mat.id, name: mat.name, category: mat.category || 'other',
+        current_stock: parseFloat(mat.current_stock || 0),
+        min_stock: parseFloat(mat.min_stock || 0),
+        unit: mat.unit || 'kg',
+        // Consumption (OUT) per period — split by source
+        out_today: 0, out_week: 0, out_month: 0, out_quarter: 0, out_year: 0,
+        // Sales OUT per period (subset of out_*)
+        sales_today: 0, sales_week: 0, sales_month: 0, sales_quarter: 0, sales_year: 0,
+        // Batch OUT per period (subset of out_*)
+        batch_today: 0, batch_week: 0, batch_month: 0, batch_quarter: 0, batch_year: 0,
+        // Procurement (IN) per period
+        in_today: 0, in_week: 0, in_month: 0, in_quarter: 0, in_year: 0,
+      };
+
+      const addOut = (d, qty, source) => {
+        if (d >= todayStart) { row.out_today += qty; row[source+'_today'] += qty; }
+        if (d >= weekStart)  { row.out_week += qty;  row[source+'_week'] += qty; }
+        if (d >= monthStart) { row.out_month += qty; row[source+'_month'] += qty; }
+        if (d >= qStart)     { row.out_quarter += qty; row[source+'_quarter'] += qty; }
+        if (d >= yearStart)  { row.out_year += qty; row[source+'_year'] += qty; }
+      };
+
+      // Procurement IN
+      for (const p of procs) {
+        if (!nameMatches(p.commodity_name, mat.name)) continue;
+        const qty = parseFloat(p.cleaned_qty || p.received_qty || 0);
+        if (qty <= 0) continue;
+        const d = p.date;
+        if (d >= todayStart) row.in_today += qty;
+        if (d >= weekStart)  row.in_week += qty;
+        if (d >= monthStart) row.in_month += qty;
+        if (d >= qStart)     row.in_quarter += qty;
+        if (d >= yearStart)  row.in_year += qty;
+      }
+
+      // Oil batch consumption (seeds pressed into oil)
+      if (mat.category === 'oil_seed') {
+        for (const b of oilBatches) {
+          if (!nameMatches(b.oil_type, mat.name)) continue;
+          const qty = parseFloat(b.input_kg || 0);
+          if (qty > 0) addOut(b.date, qty, 'batch');
+        }
+      }
+
+      // Flour batch consumption
+      if (mat.category === 'millet' || mat.category === 'grain') {
+        for (const f of flourBatches) {
+          if (!nameMatches(f.commodity, mat.name)) continue;
+          const qty = parseFloat(f.input_kg || 0);
+          if (qty > 0) addOut(f.date, qty, 'batch');
+        }
+      }
+
+      // Spice batch consumption
+      if (mat.category === 'spice' || mat.category === 'other') {
+        for (const sb of spiceBatches) {
+          const ingredients = Array.isArray(sb.ingredients) ? sb.ingredients : [];
+          for (const ing of ingredients) {
+            const ingName = ing.name || ing.commodity || '';
+            if (!nameMatches(ingName, mat.name)) continue;
+            const qty = parseFloat(ing.qty || ing.amount_kg || 0);
+            if (qty > 0) addOut(sb.date, qty, 'batch');
+          }
+        }
+      }
+
+      return row;
+    });
+
+    // Sales consumption: map each sold product to its raw material
+    for (const si of soldItems) {
+      const prod = prodMap[si.productId];
+      if (!prod) continue;
+      const mat = findRawMat(prod, matList);
+      if (!mat) continue;
+      const kgUsed = si.qty * (prod.packKg || 0);
+      if (kgUsed <= 0) continue;
+
+      // Find the row for this material
+      const row = items.find(it => it.id === mat.id);
+      if (!row) continue;
+
+      const d = si.date;
+      if (d >= todayStart) { row.out_today += kgUsed; row.sales_today += kgUsed; }
+      if (d >= weekStart)  { row.out_week += kgUsed;  row.sales_week += kgUsed; }
+      if (d >= monthStart) { row.out_month += kgUsed; row.sales_month += kgUsed; }
+      if (d >= qStart)     { row.out_quarter += kgUsed; row.sales_quarter += kgUsed; }
+      if (d >= yearStart)  { row.out_year += kgUsed; row.sales_year += kgUsed; }
+    }
+
+    // Totals
+    const totals = { out: {}, in: {}, sales: {}, batch: {} };
+    for (const p of periods) { totals.out[p] = 0; totals.in[p] = 0; totals.sales[p] = 0; totals.batch[p] = 0; }
+    items.forEach(it => {
+      for (const p of periods) {
+        totals.out[p] += it['out_' + p];
+        totals.in[p]  += it['in_' + p];
+        totals.sales[p] += it['sales_' + p];
+        totals.batch[p] += it['batch_' + p];
+      }
+    });
+
+    res.json({ items: items.sort((a, b) => b.out_year - a.out_year), totals, periods: cutoffs });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

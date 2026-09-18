@@ -8,6 +8,7 @@ const supabase   = require('../config/supabase');
 const router     = express.Router();
 
 const { sendText: gaSendText, isAutomationDisabled } = require('../lib/greenapi');
+const Anthropic  = process.env.ANTHROPIC_API_KEY ? require('@anthropic-ai/sdk') : null;
 const SERVICE_KEY   = process.env.SCHEDULER_SECRET || process.env.SUPABASE_SERVICE_KEY?.slice(-16);
 const STORE_URL     = 'https://sathvam.in';
 
@@ -103,6 +104,47 @@ Order fresh cold-pressed oils now 👇
 — Team Sathvam`;
 }
 
+// AI-powered personalized restock message
+let _productsCache = null;
+async function getAIRestockMessage(order, daysAgo) {
+  if (!Anthropic || !process.env.ANTHROPIC_API_KEY) return null;
+  try {
+    const name = order.customer?.name || 'Customer';
+    const firstName = name.split(' ')[0];
+    const items = (order.items || []).slice(0, 5);
+    const purchasedList = items.map(it => `${it.productName || it.name} × ${it.qty}`).join(', ');
+
+    // Load product catalog (cached)
+    if (!_productsCache) {
+      const { data } = await supabase.from('products').select('name,website_price,cat,health_benefits').eq('active', true);
+      _productsCache = data || [];
+    }
+    const purchasedNames = items.map(i => (i.productName || i.name || '').toLowerCase());
+    const suggestions = _productsCache
+      .filter(p => !purchasedNames.some(pn => p.name.toLowerCase().includes(pn)))
+      .slice(0, 10)
+      .map(p => `${p.name} (₹${p.website_price || 0})`).join(', ');
+
+    const client = new Anthropic();
+    const msg = await client.messages.create({
+      model: 'claude-sonnet-4-6-20250514',
+      max_tokens: 250,
+      messages: [{
+        role: 'user',
+        content: `Write a WhatsApp restock reminder for ${firstName} from Sathvam cold-pressed oils.
+They last ordered ${daysAgo} days ago: ${purchasedList}.
+Suggest 1-2 new products they haven't tried from: ${suggestions}.
+Keep under 400 chars. Warm tone. End with shop link: https://sathvam.in. Sign: — Team Sathvam 🌿
+No markdown bold/italic. Output ONLY the message.`,
+      }],
+    });
+    return msg.content?.[0]?.text?.trim() || null;
+  } catch (e) {
+    console.error('[restock-reminder] AI message generation failed:', e.message);
+    return null;
+  }
+}
+
 async function sendWA(phone, message) {
   if (!phone) return;
   return gaSendText(phone, message);
@@ -150,9 +192,10 @@ router.post('/run', serviceAuth, async (req, res) => {
 
         if (!email && !phone) { results.skipped++; continue; }
 
-        // Send WhatsApp
+        // Send WhatsApp (try AI-personalized first, fallback to static)
         if (phone) {
-          await sendWA(phone, buildWAMessage(order, daysAgo));
+          const aiMsg = await getAIRestockMessage(order, daysAgo);
+          await sendWA(phone, aiMsg || buildWAMessage(order, daysAgo));
         }
 
         // Send email

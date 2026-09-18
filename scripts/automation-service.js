@@ -14,10 +14,8 @@ require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
 
 const cron     = require('node-cron');
 const nodemailer = require('nodemailer');
-const { createClient } = require('@supabase/supabase-js');
+const supabase = require('../config/supabase');
 const { sendFile: gaSendFile } = require('../lib/greenapi');
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 const mailer = nodemailer.createTransport({
   host:   process.env.SMTP_HOST || 'smtp.gmail.com',

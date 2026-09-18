@@ -3,6 +3,14 @@ const router   = express.Router();
 const supabase  = require('../config/supabase');
 const { auth, requireRole } = require('../middleware/auth');
 
+// Zoho Books sync
+let zohoApi = null, zohoFindOrCreateContact = null;
+try {
+  const z = require('../config/zoho');
+  zohoApi = z.zoho;
+  zohoFindOrCreateContact = z.findOrCreateContact;
+} catch(e) {}
+
 // Generate next CN number  e.g. CN-2026-0042
 async function nextCnNumber() {
   const year = new Date().getFullYear();
@@ -79,6 +87,34 @@ router.post('/', auth, requireRole('admin', 'manager', 'ceo'), async (req, res) 
     }).select().single();
 
     if (error) return res.status(400).json({ error: error.message });
+
+    // Zoho Books: create credit note
+    if (zohoApi && process.env.ZOHO_ORG_ID) {
+      try {
+        const contactId = await zohoFindOrCreateContact(b.customerName || 'Customer', b.customerEmail, null);
+        const cnLineItems = items.map(it => ({
+          name:     it.name || it.description || 'Item',
+          quantity: parseFloat(it.qty) || 1,
+          rate:     parseFloat(it.amount || it.rate || 0),
+        }));
+        const cnPayload = {
+          creditnote_number: cn_number,
+          date:              b.date || new Date().toISOString().slice(0, 10),
+          reference_number:  b.orderRef || cn_number,
+          line_items:        cnLineItems,
+          notes:             `${b.reason || 'Credit note'}${b.notes ? ' — ' + b.notes : ''}`,
+          ...(contactId ? { customer_id: contactId } : { customer_name: b.customerName || 'Customer' }),
+        };
+        const result = await zohoApi('post', '/creditnotes', cnPayload);
+        if (result?.creditnote?.creditnote_id) {
+          await supabase.from('credit_notes').update({ zoho_cn_id: result.creditnote.creditnote_id }).eq('id', data.id);
+          console.log(`[Zoho] Credit note created: ${result.creditnote.creditnote_id} for CN ${cn_number}`);
+        }
+      } catch (ze) {
+        console.error('[Zoho] Credit note sync error:', ze.response?.data?.message || ze.message);
+      }
+    }
+
     res.status(201).json(data);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });

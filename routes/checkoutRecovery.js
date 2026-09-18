@@ -20,16 +20,41 @@
 const express  = require('express');
 const cron     = require('node-cron');
 const { v4: uuidv4 } = require('uuid');
-const { createClient } = require('@supabase/supabase-js');
+const supabase = require('../config/supabase');
 const { sendText, isAutomationDisabled } = require('../lib/greenapi');
 const { auth }         = require('../middleware/auth');
 
 const router  = express.Router();
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 const SESSIONS_KEY = 'checkout_sessions';
 const CONFIG_KEY   = 'checkout_recovery_config';
 const SESSION_TTL  = 48 * 60 * 60 * 1000; // 48 hours
+
+// ── Persistent log helper ────────────────────────────────────────────────────
+// Upserts a session snapshot into checkout_recovery_log so data survives the 48h purge
+async function logSession(s) {
+  try {
+    await supabase.from('checkout_recovery_log').upsert({
+      session_id:   s.id,
+      phone:        s.phone || '',
+      name:         s.name  || '',
+      email:        s.email || '',
+      city:         s.city  || '',
+      referrer:     s.referrer || '',
+      cart_items:   Array.isArray(s.cart) ? s.cart.length : 0,
+      cart_total:   Number(s.cart_total) || 0,
+      is_returning: Boolean(s.is_returning),
+      started_at:   s.started_at,
+      wa_sent:      Boolean(s.wa_sent),
+      wa_sent_at:   s.wa_sent_at || null,
+      wa_ok:        s.wa_ok != null ? Boolean(s.wa_ok) : null,
+      completed:    Boolean(s.completed),
+      completed_at: s.completed_at || null,
+    }, { onConflict: 'session_id' });
+  } catch (e) {
+    console.error('[checkoutRecovery] logSession error:', e.message);
+  }
+}
 
 const DEFAULT_CONFIG = {
   auto_enabled:     true,
@@ -106,7 +131,7 @@ async function processAbandoned(dryRun = false) {
 
     if (!dryRun) {
       const msg = buildMessage(config.message_template, s);
-      const ok  = await sendText(s.phone, msg);
+      const ok  = await sendText(s.phone, msg, { priority: true });
       s.wa_sent    = true;
       s.wa_sent_at = new Date().toISOString();
       s.wa_ok      = ok;
@@ -116,13 +141,19 @@ async function processAbandoned(dryRun = false) {
     }
   }
 
-  if (!dryRun) await saveSessions(sessions);
+  if (!dryRun) {
+    await saveSessions(sessions);
+    // persist WA-sent sessions to log
+    for (const s of sessions) { if (s.wa_sent) await logSession(s); }
+  }
   return { sent, skipped };
 }
 
-// ── Cron: every 2 minutes ─────────────────────────────────────────────────────
-cron.schedule('*/2 * * * *', () => {
-  processAbandoned().catch(e => console.error('[checkoutRecovery cron]', e.message));
+// ── Cron: every 10 minutes (reduced from 2 min to avoid Green API spam) ──────
+cron.schedule('*/10 * * * *', () => {
+  processAbandoned().then(r => {
+    if (r.sent > 0 || r.skipped > 0) console.log(`[checkoutRecovery cron] sent=${r.sent} skipped=${r.skipped}`);
+  }).catch(e => console.error('[checkoutRecovery cron]', e.message));
 });
 
 // ── POST /session ─────────────────────────────────────────────────────────────
@@ -156,6 +187,7 @@ router.post('/session', async (req, res) => {
 
     filtered.push(session);
     await saveSessions(filtered);
+    await logSession(session);
 
     res.json({ ok: true, session_id: session.id });
   } catch (e) {
@@ -175,6 +207,7 @@ router.patch('/session/:id/complete', async (req, res) => {
       s.completed    = true;
       s.completed_at = new Date().toISOString();
       await saveSessions(sessions);
+      await logSession(s);
     }
     res.json({ ok: true });
   } catch (e) {
@@ -211,6 +244,7 @@ router.post('/sessions/:id/send-wa', auth, async (req, res) => {
     s.wa_sent_at = new Date().toISOString();
     s.wa_ok      = ok;
     await saveSessions(sessions);
+    await logSession(s);
 
     res.json({ ok, message_sent: msg });
   } catch (e) {
@@ -251,6 +285,113 @@ router.put('/config', auth, async (req, res) => {
     );
     res.json(updated);
   } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /report ──────────────────────────────────────────────────────────────
+// Admin: checkout recovery report with KPIs, daily breakdown, and session list
+router.get('/report', auth, async (req, res) => {
+  try {
+    const { from, to, page } = req.query;
+    const pageSize = 50;
+    const pageNum  = Math.max(1, parseInt(page) || 1);
+    const offset   = (pageNum - 1) * pageSize;
+
+    // Date filters
+    let fromDate = from || null;
+    let toDate   = to   || null;
+
+    // Default: last 30 days
+    if (!fromDate) {
+      const d = new Date(); d.setDate(d.getDate() - 30);
+      fromDate = d.toISOString().slice(0, 10);
+    }
+    if (!toDate) {
+      toDate = new Date().toISOString().slice(0, 10);
+    }
+
+    const startTs = fromDate + 'T00:00:00.000Z';
+    const endTs   = toDate + 'T23:59:59.999Z';
+
+    // KPI aggregates
+    const { data: allRows, error: allErr } = await supabase
+      .from('checkout_recovery_log')
+      .select('cart_total, wa_sent, wa_ok, completed, is_returning, started_at, completed_at')
+      .gte('started_at', startTs)
+      .lte('started_at', endTs);
+
+    if (allErr) throw new Error(allErr.message || allErr.details || JSON.stringify(allErr));
+    const rows = allRows || [];
+
+    const totalSessions      = rows.length;
+    const waSent             = rows.filter(r => r.wa_sent).length;
+    const waDelivered        = rows.filter(r => r.wa_sent && r.wa_ok).length;
+    const converted          = rows.filter(r => r.completed).length;
+    const convertedAfterWa   = rows.filter(r => r.completed && r.wa_sent).length;
+    const abandoned          = rows.filter(r => !r.completed).length;
+    const returningCount     = rows.filter(r => r.is_returning).length;
+    const totalCartValue     = rows.reduce((s, r) => s + Number(r.cart_total || 0), 0);
+    const recoveredValue     = rows.filter(r => r.completed).reduce((s, r) => s + Number(r.cart_total || 0), 0);
+    const lostValue          = totalCartValue - recoveredValue;
+
+    // Avg time to convert (for converted sessions that have both timestamps)
+    const convertTimes = rows
+      .filter(r => r.completed && r.started_at && r.completed_at)
+      .map(r => new Date(r.completed_at).getTime() - new Date(r.started_at).getTime());
+    const avgConvertMinutes = convertTimes.length
+      ? Math.round(convertTimes.reduce((a, b) => a + b, 0) / convertTimes.length / 60000)
+      : null;
+
+    // Daily breakdown
+    const dailyMap = {};
+    for (const r of rows) {
+      const day = String(r.started_at).slice(0, 10);
+      if (!dailyMap[day]) dailyMap[day] = { date: day, sessions: 0, wa_sent: 0, converted: 0, cart_value: 0, recovered_value: 0 };
+      dailyMap[day].sessions++;
+      if (r.wa_sent) dailyMap[day].wa_sent++;
+      if (r.completed) { dailyMap[day].converted++; dailyMap[day].recovered_value += Number(r.cart_total || 0); }
+      dailyMap[day].cart_value += Number(r.cart_total || 0);
+    }
+    const daily = Object.values(dailyMap).sort((a, b) => b.date.localeCompare(a.date));
+
+    // Paginated session list (newest first, with full details)
+    const { data: sessionRows, error: sesErr } = await supabase
+      .from('checkout_recovery_log')
+      .select('*')
+      .gte('started_at', startTs)
+      .lte('started_at', endTs)
+      .order('started_at', { ascending: false })
+      .range(offset, offset + pageSize - 1);
+
+    if (sesErr) throw new Error(sesErr.message || sesErr.details || JSON.stringify(sesErr));
+
+    res.json({
+      kpi: {
+        total_sessions:     totalSessions,
+        wa_sent:            waSent,
+        wa_delivered:       waDelivered,
+        converted:          converted,
+        converted_after_wa: convertedAfterWa,
+        abandoned:          abandoned,
+        returning_visitors: returningCount,
+        total_cart_value:   Math.round(totalCartValue),
+        recovered_value:    Math.round(recoveredValue),
+        lost_value:         Math.round(lostValue),
+        conversion_rate:    totalSessions ? Math.round(converted / totalSessions * 1000) / 10 : 0,
+        wa_recovery_rate:   waSent ? Math.round(convertedAfterWa / waSent * 1000) / 10 : 0,
+        wa_delivery_rate:   waSent ? Math.round(waDelivered / waSent * 1000) / 10 : 0,
+        avg_convert_minutes: avgConvertMinutes,
+      },
+      daily,
+      sessions: sessionRows || [],
+      page: pageNum,
+      page_size: pageSize,
+      from: fromDate,
+      to: toDate,
+    });
+  } catch (e) {
+    console.error('[checkoutRecovery] GET /report', e.message);
     res.status(500).json({ error: e.message });
   }
 });

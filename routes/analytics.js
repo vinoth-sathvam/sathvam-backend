@@ -349,18 +349,18 @@ router.get('/pnl', auth, async (req, res) => {
     const [salesRes, wsoRes, b2bRes, procRes, expRes,
            attRes, empRes,
            pSalesRes, pWsoRes, pB2bRes, pProcRes, pExpRes] = await Promise.allSettled([
-      supabase.from('sales').select('final_amount,date').gte('date',start).lte('date',end).eq('status','paid'),
-      supabase.from('webstore_orders').select('total,date,created_at').gte('date',start).lte('date',end).in('status',['confirmed','shipped','delivered','paid']),
-      supabase.from('b2b_orders').select('total_value,date').gte('date',start).lte('date',end).in('stage',['shipped','delivered','invoice_sent','paid']),
-      supabase.from('procurements').select('ordered_qty,ordered_price_per_kg,gst,date').gte('date',start).lte('date',end).in('status',['received','stocked','cleaned']),
-      supabase.from('company_expenses').select('amount,category,date').gte('date',start).lte('date',end).is('deleted_at',null),
+      supabase.from('sales').select('order_no,customer_name,final_amount,date,status,payment_method').gte('date',start).lte('date',end).not('status','eq','cancelled').order('date',{ascending:false}),
+      supabase.from('webstore_orders').select('order_no,total,date,created_at,status,customer').gte('date',start).lte('date',end).in('status',['confirmed','shipped','delivered','paid']).order('date',{ascending:false}),
+      supabase.from('b2b_orders').select('order_no,total_value,date,created_at,stage,buyer_name').gte('date',start).lte('date',end).in('stage',['shipped','delivered','invoice_sent','invoice_paid']).order('date',{ascending:false}),
+      supabase.from('procurements').select('commodity_name,ordered_qty,ordered_price_per_kg,gst,date,status').gte('date',start).lte('date',end).in('status',['received','stocked','cleaned']).order('date',{ascending:false}),
+      supabase.from('company_expenses').select('description,amount,category,date,vendor_name,payment_mode').gte('date',start).lte('date',end).is('deleted_at',null).order('date',{ascending:false}),
       // Payroll: attendance in period
       supabase.from('attendance').select('employee_id,status').gte('date',start).lte('date',end),
       supabase.from('employees').select('id,daily_rate'),
       // Previous period
-      supabase.from('sales').select('final_amount,date').gte('date',prevStartStr).lte('date',prevEndStr).eq('status','paid'),
+      supabase.from('sales').select('final_amount,date').gte('date',prevStartStr).lte('date',prevEndStr).not('status','eq','cancelled'),
       supabase.from('webstore_orders').select('total,date,created_at').gte('date',prevStartStr).lte('date',prevEndStr).in('status',['confirmed','shipped','delivered','paid']),
-      supabase.from('b2b_orders').select('total_value,date').gte('date',prevStartStr).lte('date',prevEndStr).in('stage',['shipped','delivered','invoice_sent','paid']),
+      supabase.from('b2b_orders').select('total_value,date,created_at').gte('date',prevStartStr).lte('date',prevEndStr).in('stage',['shipped','delivered','invoice_sent','invoice_paid']),
       supabase.from('procurements').select('ordered_qty,ordered_price_per_kg,gst,date').gte('date',prevStartStr).lte('date',prevEndStr).in('status',['received','stocked','cleaned']),
       supabase.from('company_expenses').select('amount,category,date').gte('date',prevStartStr).lte('date',prevEndStr).is('deleted_at',null),
     ]);
@@ -464,6 +464,13 @@ router.get('/pnl', auth, async (req, res) => {
       revenue_by_day: revenueByDay,
       expenses_by_category: expByCategory,
       counts: { sales: sales.length, webstore_orders: wso.length, b2b_orders: b2b.length },
+      orders: {
+        sales: sales.map(r=>({ order_no:r.order_no||'—', date:r.date, customer:r.customer_name||'—', amount:parseFloat(r.final_amount||0), status:r.status, payment_method:r.payment_method })),
+        webstore: wso.map(r=>{ const c=r.customer||{}; return { order_no:r.order_no||'—', date:r.date||(r.created_at||'').slice(0,10), customer:c.name||'—', amount:parseFloat(r.total||0), status:r.status }; }),
+        b2b: b2b.map(r=>({ order_no:r.order_no||'—', date:r.date, customer:r.buyer_name||'—', amount:parseFloat(r.total_value||0), stage:r.stage })),
+      },
+      expense_details: expenses.map(r=>({ date:r.date, category:r.category||'Other', description:r.description||'—', vendor:r.vendor_name||'—', amount:parseFloat(r.amount||0), payment_mode:r.payment_mode })),
+      procurement_details: procs.map(r=>{ const qty=parseFloat(r.ordered_qty||0),rate=parseFloat(r.ordered_price_per_kg||0),gst=parseFloat(r.gst||0); return { date:r.date, commodity:r.commodity_name||'—', qty, rate, gst_pct:gst, amount:qty*rate*(1+gst/100) }; }),
     });
   } catch(e) {
     res.status(500).json({ error: e.message });

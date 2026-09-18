@@ -90,7 +90,7 @@ router.post('/b2b-login', async (req, res) => {
       process.env.JWT_SECRET, { expiresIn: '7d' }
     );
     res.cookie('sathvam_b2b', token, COOKIE_OPTS);
-    res.json({ customer: { id: cust.id, companyName: cust.company_name, contactName: cust.contact_name, email: cust.email, country: cust.country, currency: cust.currency, address: cust.address, phone: cust.phone } });
+    res.json({ customer: { id: cust.id, companyName: cust.company_name, contactName: cust.contact_name, email: cust.email, country: cust.country, currency: cust.currency, address: cust.address, phone: cust.phone, showCostCalculator: !!cust.show_cost_calculator } });
   } catch { res.status(500).json({ error: 'Server error' }); }
 });
 

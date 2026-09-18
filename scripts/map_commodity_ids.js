@@ -2,12 +2,8 @@
 // Auto-maps products to their source commodity_id based on name matching
 // Run: node scripts/map_commodity_ids.js
 
-const { createClient } = require('@supabase/supabase-js');
-
-const supabase = createClient(
-  'https://qgoyiwtxgelupamskhaa.supabase.co',
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFnb3lpd3R4Z2VsdXBhbXNraGFhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NDUxMTkzMCwiZXhwIjoyMDkwMDg3OTMwfQ.0-WKSNEch8WDYnD5n8a_hsqA9_-T3RIa-xS5mttMCOg'
-);
+require('dotenv').config({ path: require('path').resolve(__dirname, '../.env') });
+const supabase = require('../config/supabase');
 
 // Full BULK_COMMODITIES list — mirrors frontend BULK_COMMODITIES_LIST
 const BULK_COMMODITIES = [

@@ -13,6 +13,16 @@ const { insertLedger } = require('../utils/ledger');
 const { bustCache } = require('./public');
 const { uploadFile } = require('../config/storage');
 
+// Title Case helper for product names: "SALT 500G" → "Salt 500G", "ragi/finger millet" → "Ragi/Finger Millet"
+function toTitleCase(str) {
+  if (!str) return str;
+  return str.replace(/\S+/g, w =>
+    w.replace(/[A-Za-z]+/g, part =>
+      part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()
+    )
+  );
+}
+
 const procUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const INVOICE_MIME = { 'image/jpeg':'jpg','image/jpg':'jpg','image/png':'png','image/webp':'webp','application/pdf':'pdf' };
 
@@ -146,7 +156,7 @@ products.get('/', auth, async (req, res) => {
 products.post('/', auth, requireRole('admin'), async (req, res) => {
   const p = req.body;
   const { data, error } = await supabase.from('products').insert({
-    name:p.name, sku:p.sku, cat:p.cat, unit:p.unit||'pcs',
+    name:toTitleCase(p.name), sku:p.sku, cat:p.cat, unit:p.unit||'pcs',
     pack_size:p.packSize, pack_unit:p.packUnit, pcs_per_box:p.pcsPerBox||null,
     oil_type_key:p.oilTypeKey,
     raw_mat_key:p.rawMatKey, cake_type_key:p.cakeTypeKey||null,
@@ -194,7 +204,7 @@ products.put('/batch', auth, requireRole('admin', 'manager'), async (req, res) =
   if (prods.length === 0) return res.json({ updated: 0 });
   const updates = prods.filter(p => p.id).map(p => ({
     id: p.id,
-    name: p.name, sku: p.sku, cat: p.cat, unit: p.unit,
+    name: toTitleCase(p.name), sku: p.sku, cat: p.cat, unit: p.unit,
     pack_size: p.packSize, pack_unit: p.packUnit, pcs_per_box: p.pcsPerBox ?? null,
     oil_type_key: p.oilTypeKey, raw_mat_key: p.rawMatKey, cake_type_key: p.cakeTypeKey ?? null,
     reorder: p.reorder || 0, gst: p.gst || 0,
@@ -225,7 +235,7 @@ products.put('/batch', auth, requireRole('admin', 'manager'), async (req, res) =
 products.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
   const p = req.body;
   const raw = {
-    name:p.name, sku:p.sku, cat:p.cat, unit:p.unit,
+    name:p.name ? toTitleCase(p.name) : undefined, sku:p.sku, cat:p.cat, unit:p.unit,
     pack_size:p.packSize, pack_unit:p.packUnit, pcs_per_box:p.pcsPerBox,
     oil_type_key:p.oilTypeKey, raw_mat_key:p.rawMatKey,
     cake_type_key:p.cakeTypeKey, reorder:p.reorder, gst:p.gst, price:p.price,
@@ -238,7 +248,7 @@ products.put('/:id', auth, requireRole('admin','manager'), async (req, res) => {
     image_url:p.imageUrl??p.image_url, description:p.description, hsn_code:p.hsnCode,
     offer_label:p.offer_label, offer_price:p.offer_price,
     offer_ends_at:p.offer_ends_at, commodity_id:p.commodityId,
-    fssai_license:p.fssaiLicense,
+    fssai_license:p.fssaiLicense, batch_product_name:p.batchProductName,
   };
   // Remove undefined keys so Supabase only updates fields actually provided
   const fields = Object.fromEntries(Object.entries(raw).filter(([,v]) => v !== undefined));
@@ -755,7 +765,7 @@ procurement.post('/', auth, requireRole('admin','manager'), async (req, res) => 
         const isFullPaid = payStatus === 'paid';
         const paidAmt    = isFullPaid ? amount : advPaid;
 
-        const { data: payable } = await supabase.from('vendor_bills').insert({
+        const billInsert = {
           vendor_name:  vendorName,
           bill_no:      invoiceNo || `PROC-${data.id}`,
           bill_date:    p.date || new Date().toISOString().slice(0,10),
@@ -767,7 +777,10 @@ procurement.post('/', auth, requireRole('admin','manager'), async (req, res) => 
           category:     'Raw Materials',
           notes:        `${isFullPaid?'Paid immediately (upfront)':'Advance paid'}: ${p.commodityName}${p.paymentRef?' | Ref: '+p.paymentRef:''}`,
           created_by:   req.user?.email || 'system',
-        }).select('id').single();
+        };
+        // Copy bill scan if already attached on the procurement
+        if (p.billScanUrl) billInsert.attachment_url = p.billScanUrl;
+        const { data: payable } = await supabase.from('vendor_bills').insert(billInsert).select('id').single();
 
         if (payable) {
           await supabase.from('procurements').update({ payable_id: payable.id }).eq('id', data.id);
@@ -842,7 +855,9 @@ procurement.put('/:id', auth, requireRole('admin','manager'), async (req, res) =
 
         const today   = new Date().toISOString().slice(0, 10);
         const dueDate = new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-        const { data: payable } = await supabase.from('vendor_bills').insert({
+        // Check if procurement already has a bill scan attached
+        const { data: procRow } = await supabase.from('procurements').select('bill_scan_url').eq('id', req.params.id).single();
+        const billInsert2 = {
           vendor_name:  vendorName,
           bill_no:      invoiceNo || `PROC-${req.params.id}`,
           bill_date:    p.receivedDate || today,
@@ -856,7 +871,9 @@ procurement.put('/:id', auth, requireRole('admin','manager'), async (req, res) =
           status:       'unpaid',
           paid_amount:  0,
           created_by:   req.user?.email || 'system',
-        }).select('id').single();
+        };
+        if (procRow?.bill_scan_url) billInsert2.attachment_url = procRow.bill_scan_url;
+        const { data: payable } = await supabase.from('vendor_bills').insert(billInsert2).select('id').single();
 
         if (payable) {
           await supabase.from('procurements').update({ payable_id: payable.id }).eq('id', req.params.id);
@@ -1054,8 +1071,8 @@ procurement.post('/:id/attach-bill', auth, requireRole('admin','manager'), procU
       scanUrl = await uploadFile('po-bills', fileName, req.file.buffer, req.file.mimetype);
     }
 
-    // Fetch current invoices array
-    const { data: current } = await supabase.from('procurements').select('invoices, vendor_bill_no, bill_scan_url').eq('id', req.params.id).single();
+    // Fetch current invoices array + linked vendor bill
+    const { data: current } = await supabase.from('procurements').select('invoices, vendor_bill_no, bill_scan_url, payable_id').eq('id', req.params.id).single();
     const invoices = Array.isArray(current?.invoices) ? [...current.invoices] : [];
 
     // Add new invoice entry
@@ -1071,6 +1088,18 @@ procurement.post('/:id/attach-bill', auth, requireRole('admin','manager'), procU
 
     const { data, error } = await supabase.from('procurements').update(updates).eq('id', req.params.id).select().single();
     if (error) return res.status(400).json({ error: error.message });
+
+    // ── Sync bill attachment to linked vendor_bills (AP) ──────────────────
+    const finalScanUrl = scanUrl || current?.bill_scan_url || '';
+    const linkedBillId = data.payable_id || current?.payable_id;
+    if (linkedBillId && finalScanUrl) {
+      supabase.from('vendor_bills')
+        .update({ attachment_url: finalScanUrl, bill_no: billNo || undefined })
+        .eq('id', linkedBillId)
+        .then(() => console.log(`[SYNC] Bill attachment synced to vendor_bill ${linkedBillId}`))
+        .catch(e => console.error('[SYNC] Bill attachment sync error:', e.message));
+    }
+
     res.json({ ok: true, vendor_bill_no: data.vendor_bill_no, bill_scan_url: data.bill_scan_url, invoices: data.invoices });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1481,8 +1510,11 @@ sales.post('/', auth, async (req, res) => {
           total:    parseFloat(s.finalAmount) || 0,
         };
         const invoice = await createInvoice(zohoOrder);
-        if (invoice?.invoice_id && parseFloat(s.amountPaid) > 0) {
-          await recordPayment(invoice, s.amountPaid, s.paymentMethod || 'cash', s.orderNo);
+        if (invoice?.invoice_id) {
+          if (parseFloat(s.amountPaid) > 0) {
+            await recordPayment(invoice, s.amountPaid, s.paymentMethod || 'cash', s.orderNo);
+          }
+          await supabase.from('sales').update({ zoho_invoice_id: invoice.invoice_id }).eq('order_no', s.orderNo);
         }
       } catch (ze) {
         console.error('Zoho POS invoice error:', ze.message);

@@ -60,7 +60,7 @@ async function sendOrderEmail(orderId, { subject, heading, rows, note, trackingU
 }
 
 const b2bCustomers = express.Router();
-const B2B_CUST_SELECT = 'id,company_name,contact_name,email,country,currency,address,delivery_address,phone,gstin,pan,gst_treatment,payment_terms,active,registered_date,credit_limit,credit_used,branch';
+const B2B_CUST_SELECT = 'id,company_name,contact_name,email,country,currency,address,delivery_address,phone,gstin,pan,gst_treatment,payment_terms,active,registered_date,credit_limit,credit_used,branch,show_cost_calculator';
 
 b2bCustomers.get('/', auth, requireRole('admin','manager','ceo'), async (req, res) => {
   const { data, error } = await supabase
@@ -89,6 +89,7 @@ b2bCustomers.put('/:id', auth, requireRole('admin','manager'), async (req, res) 
   if (c.active            !== undefined) updates.active           = c.active;
   if (c.creditLimit       !== undefined) updates.credit_limit     = c.creditLimit;
   if (c.branch            !== undefined) updates.branch           = c.branch;
+  if (c.showCostCalculator !== undefined) updates.show_cost_calculator = c.showCostCalculator;
   const { data, error } = await supabase.from('b2b_customers').update(updates).eq('id', req.params.id).select(B2B_CUST_SELECT + ',credit_limit,credit_used').single();
   if (error) return res.status(400).json({ error: 'Update failed' });
   res.json(data);
@@ -415,7 +416,10 @@ b2bOrders.put('/:id/stage', auth, requireRole('admin','manager','ceo'), async (r
           shipping: 0,
           total:    parseFloat(order.total_value) || 0,
         };
-        await createInvoice(zohoOrder);
+        const invoice = await createInvoice(zohoOrder);
+        if (invoice?.invoice_id) {
+          await supabase.from('b2b_orders').update({ zoho_invoice_id: invoice.invoice_id }).eq('id', orderId);
+        }
       } catch (ze) {
         console.error('Zoho B2B invoice error:', ze.message);
       }
@@ -629,9 +633,14 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
 
     // Financials from request body (most current — just saved by frontend)
     const fin = req.body.financials || full.financials || {};
-    // Which attachments to include (default: both)
+    // Which attachments to include (default: both PDFs)
     const sendInvoicePdf   = req.body.sendInvoicePdf   !== false;
     const sendLogisticsPdf = req.body.sendLogisticsPdf !== false;
+    // Excel attachment flags (default: false)
+    const sendMfgInvoiceXls  = req.body.sendMfgInvoiceXls  === true;
+    const sendMerchInvoiceXls= req.body.sendMerchInvoiceXls=== true;
+    const sendMfgPackingXls  = req.body.sendMfgPackingXls  === true;
+    const sendMerchPackingXls= req.body.sendMerchPackingXls=== true;
 
     // Compute MFG + MERCH totals
     const toNum = v => parseFloat(v)||0;
@@ -903,6 +912,196 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
       sendLogisticsPdf ? htmlPdf.generatePdf({ content: logisticsPdfHtml }, pdfOpts) : Promise.resolve(null),
     ]);
 
+    // ── Excel attachments (reuse helpers from logistics-vendor email) ───────
+    const xlsAttachments = [];
+    if (sendMfgInvoiceXls || sendMerchInvoiceXls || sendMfgPackingXls || sendMerchPackingXls) {
+      const ExcelJS = require('exceljs');
+      const HEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0A4840' } };
+      const HEADER_FONT = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+      const SUBHEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F5F9' } };
+      const BORDER_THIN = { top: {style:'thin'}, left: {style:'thin'}, bottom: {style:'thin'}, right: {style:'thin'} };
+      const NUM_FMT_INR = '#,##0.00';
+
+      const SHIPPER_ADDR_XLS = {
+        A: { name: 'SATHVAM OILS AND SPICES PVT LTD', addr: 'PLOT NO:6, ANAND JOTHI NAGAR, near ABS HOSPITAL, Thanthoni, Tamil Nadu 639005' },
+        B: { name: 'SATHVAM OILS AND SPICES PVT LTD', addr: '366 B AMARJOTHI GARDEN 2ND CROSS, GANDHIGRAMAM, KARUR, Tamil Nadu 639004' },
+      };
+      const COMPANY_INFO = { gst: '33ABFCS9387K1ZN', iec: 'ABFCS9387K', cin: 'U15400TN2021PTC142893', pan: 'ABFCS9387K', tan: 'CHES61531B' };
+      const getShipper = (inv) => {
+        if (inv?.shipperOption === 'custom' && inv?.shipperName) return { name: inv.shipperName, addr: (inv.shipperAddress || '').replace(/\n/g, ', ') };
+        return SHIPPER_ADDR_XLS[inv?.shipperOption] || SHIPPER_ADDR_XLS.B;
+      };
+
+      // ── Build Invoice Excel ──
+      async function buildCustInvoiceExcel(inv, typLabel) {
+        const wb = new ExcelJS.Workbook();
+        wb.creator = 'Sathvam Export'; wb.created = new Date();
+        const ws = wb.addWorksheet(`${typLabel} Invoice`);
+        ws.columns = [{ width: 5 },{ width: 30 },{ width: 12 },{ width: 8 },{ width: 10 },{ width: 14 },{ width: 12 },{ width: 14 }];
+
+        const shipper = getShipper(inv);
+        const items = (inv?.items || []).filter(i => i.product);
+
+        const titleRow = ws.addRow([`EXPORT INVOICE — ${typLabel}`]);
+        ws.mergeCells(titleRow.number, 1, titleRow.number, 8);
+        titleRow.getCell(1).font = { bold: true, size: 14, color: { argb: 'FF0A4840' } };
+        titleRow.getCell(1).alignment = { horizontal: 'center' };
+        titleRow.height = 28;
+
+        ws.addRow([]);
+        const expR = ws.addRow(['', 'Exporter:', shipper.name]);
+        expR.getCell(2).font = { bold: true, size: 10, color: { argb: 'FF6B7280' } };
+        expR.getCell(3).font = { bold: true, size: 11 };
+        ws.addRow(['', '', shipper.addr]);
+        ws.addRow(['', '', `GST: ${COMPANY_INFO.gst}  |  IEC: ${COMPANY_INFO.iec}`]);
+        ws.addRow(['', '', `PAN: ${COMPANY_INFO.pan}  |  CIN: ${COMPANY_INFO.cin}`]);
+        ws.addRow([]);
+        ws.addRow(['', 'Invoice No:', inv?.invoiceNo || '—', '', 'Invoice Date:', inv?.invoiceDate || '—']);
+        ws.addRow(['', 'PI / Ref No:', inv?.piNo || full.piNo || '—', '', 'PI Date:', inv?.piDate || '—']);
+        ws.addRow(['', 'Buyer:', company || customerName, '', 'Destination:', full.portOfDischarge || full.buyerCountry || '—']);
+        ws.addRow(['', 'Buyer Address:', cust?.address || '—']);
+        ws.addRow(['', 'Country of Origin:', 'INDIA', '', 'Country of Dest:', cust?.country || '—']);
+        ws.addRow(['', 'Port of Loading:', full.portOfLoading || '—', '', 'Port of Discharge:', full.portOfDischarge || '—']);
+        ws.addRow(['', 'Terms:', full.terms || full.paymentTerms || 'CIF', '', 'LUT ARN:', full.lutArn || '—']);
+        for (let r = 8; r <= 14; r++) { ws.getRow(r).getCell(2).font = { bold: true, size: 10, color: { argb: 'FF6B7280' } }; }
+
+        ws.addRow([]);
+        const hdr = ws.addRow(['S.No', 'Product Description', 'HSN Code', 'Qty', 'Pack Size', 'Unit Price (₹)', 'Weight (kg)', 'Total (₹)']);
+        hdr.eachCell(c => { c.fill = HEADER_FILL; c.font = HEADER_FONT; c.border = BORDER_THIN; c.alignment = { horizontal: 'center', vertical: 'middle' }; });
+        hdr.height = 22;
+
+        let totalQty = 0, totalWt = 0, totalVal = 0;
+        items.forEach((it, idx) => {
+          const qty = Number(it.qty) || 0;
+          const unitPrice = Number(it.unitPriceINR) || Number(it.rateINR) || Number(it.rate) || 0;
+          const wt = Number(it.weightKg) || 0;
+          const total = Number(it.totalINR) || (qty * unitPrice);
+          totalQty += qty; totalWt += wt; totalVal += total;
+          const row = ws.addRow([idx + 1, it.exportName || it.product, it.hsnCode || '', qty, `${it.packSize || ''} ${it.packUnit || ''}`, unitPrice, wt, total]);
+          row.eachCell(c => { c.border = BORDER_THIN; });
+          row.getCell(1).alignment = { horizontal: 'center' };
+          row.getCell(6).numFmt = NUM_FMT_INR;
+          row.getCell(8).numFmt = NUM_FMT_INR;
+        });
+
+        const totRow = ws.addRow(['', 'TOTAL', '', totalQty, '', '', totalWt.toFixed(2), totalVal]);
+        totRow.eachCell(c => { c.fill = SUBHEADER_FILL; c.font = { bold: true }; c.border = BORDER_THIN; });
+        totRow.getCell(8).numFmt = NUM_FMT_INR;
+
+        ws.addRow([]);
+        ws.addRow(['', 'For SATHVAM OILS AND SPICES PVT LTD']);
+        ws.addRow(['', 'Authorised Signatory']);
+
+        return wb.xlsx.writeBuffer();
+      }
+
+      // ── Build Packing List Excel (MFG or MERCH) ──
+      async function buildCustPackingExcel(invType) {
+        const wb = new ExcelJS.Workbook();
+        wb.creator = 'Sathvam Export'; wb.created = new Date();
+        const isMerch = invType === 'merch';
+        const typLabel = isMerch ? 'MERCH' : 'MFG';
+        const ws = wb.addWorksheet(`${typLabel} Packing List`);
+        ws.columns = [{ width: 10 },{ width: 30 },{ width: 12 },{ width: 8 },{ width: 10 },{ width: 12 },{ width: 12 },{ width: 20 }];
+
+        const shipper = getShipper(isMerch ? full.merch : full.mfg);
+        const inv = isMerch ? full.merch : full.mfg;
+
+        const titleRow = ws.addRow([`PACKING LIST — ${typLabel}`]);
+        ws.mergeCells(titleRow.number, 1, titleRow.number, 8);
+        titleRow.getCell(1).font = { bold: true, size: 14, color: { argb: 'FF0A4840' } };
+        titleRow.getCell(1).alignment = { horizontal: 'center' };
+        titleRow.height = 28;
+
+        ws.addRow([]);
+        ws.addRow(['', 'Exporter:', shipper.name]);
+        ws.addRow(['', '', shipper.addr]);
+        ws.addRow(['', 'Buyer:', company || customerName]);
+        ws.addRow(['', 'Invoice No:', inv?.invoiceNo || '—', '', 'Invoice Date:', inv?.invoiceDate || '—']);
+        ws.addRow(['', 'Port of Loading:', full.portOfLoading || '—', '', 'Port of Discharge:', full.portOfDischarge || '—']);
+        for (let r = 3; r <= 7; r++) { ws.getRow(r).getCell(2).font = { bold: true, size: 10, color: { argb: 'FF6B7280' } }; }
+
+        ws.addRow([]);
+        const hdr = ws.addRow(['Box / Sack', 'Product Description', 'Pack Size', 'Qty (pcs)', 'HSN Code', 'Gross Wt (kg)', 'Net Wt (kg)', 'Notes']);
+        hdr.eachCell(c => { c.fill = HEADER_FILL; c.font = HEADER_FONT; c.border = BORDER_THIN; c.alignment = { horizontal: 'center', vertical: 'middle' }; });
+        hdr.height = 22;
+
+        const boxes = (full.packingBoxes || []).filter(b => !b.inv || b.inv === invType);
+        const invItems = (inv?.items || []).filter(i => i.product);
+        let runningGross = 0, runningNet = 0, runningPcs = 0;
+        const prefix = isMerch ? 'M' : '';
+
+        if (boxes.length > 0) {
+          boxes.forEach((box, bi) => {
+            const label = prefix + (box.num != null ? String(box.num) : String(bi + 1).padStart(2, '0'));
+            const prods = box.products || [];
+            const grossWt = parseFloat(box.grossWt) || 0;
+            const netWt = parseFloat(box.netWt) || 0;
+            runningGross += grossWt; runningNet += netWt;
+            prods.forEach((pr, pi) => {
+              const pQty = Number(pr.qty) || 1;
+              runningPcs += pQty;
+              const matchItem = invItems.find(it => (it.exportName||it.product||'').toLowerCase() === (pr.name||'').toLowerCase());
+              const row = ws.addRow([
+                pi === 0 ? label : '',
+                pr.exportName || pr.name || '',
+                pr.packSize ? `${pr.packSize} ${pr.packUnit || ''}` : '',
+                pQty,
+                matchItem?.hsnCode || '',
+                pi === 0 ? (grossWt || '') : '',
+                pi === 0 ? (netWt || '') : '',
+                pi === 0 ? (box.note || '') : '',
+              ]);
+              row.eachCell(c => { c.border = BORDER_THIN; });
+              row.getCell(1).alignment = { horizontal: 'center' };
+              row.getCell(4).alignment = { horizontal: 'center' };
+            });
+          });
+        } else {
+          // Auto-generate from invoice items
+          let boxNo = 1, sackNo = 1;
+          invItems.forEach(it => {
+            const qty = Number(it.qty) || 0;
+            const perBox = Number(it.qtyPerBox) || 12;
+            const type = it.cartonType || 'box';
+            let remaining = qty;
+            while (remaining > 0) {
+              const count = Math.min(remaining, perBox);
+              const label = prefix + (type === 'sack' ? `S${sackNo++}` : String(boxNo++).padStart(2, '0'));
+              let netWt = Number(it.netWtPerBox) || 0;
+              if (!netWt && it.packSize) {
+                const ps = Number(it.packSize) || 0;
+                if (it.packUnit === 'GM' || it.packUnit === 'ML') netWt = parseFloat((count * ps / 1000).toFixed(3));
+                else netWt = parseFloat((count * ps).toFixed(3));
+              }
+              const grossWt = Number(it.grossWtPerBox) || (netWt ? parseFloat((netWt * 1.05).toFixed(3)) : 0);
+              runningGross += grossWt; runningNet += netWt; runningPcs += count;
+              const row = ws.addRow([label, it.exportName || it.product, `${it.packSize||''} ${it.packUnit||''}`, count, it.hsnCode || '', grossWt || '', netWt || '', '']);
+              row.eachCell(c => { c.border = BORDER_THIN; });
+              remaining -= count;
+            }
+          });
+        }
+
+        const totRow = ws.addRow(['TOTAL', `${boxes.length || '—'} boxes/sacks`, '', runningPcs, '', runningGross.toFixed(2), runningNet.toFixed(2), '']);
+        totRow.eachCell(c => { c.fill = SUBHEADER_FILL; c.font = { bold: true }; c.border = BORDER_THIN; });
+
+        ws.addRow([]);
+        ws.addRow(['', 'For SATHVAM OILS AND SPICES PVT LTD']);
+        ws.addRow(['', 'Authorised Signatory']);
+
+        return wb.xlsx.writeBuffer();
+      }
+
+      const xlsOrderRef = (order.order_no||proj.pi_no||'Export').replace(/[^a-zA-Z0-9-_]/g,'-');
+      const xlsTasks = [];
+      if (sendMfgInvoiceXls && mfgItems.length > 0)   xlsTasks.push(buildCustInvoiceExcel(full.mfg, 'MFG').then(b => xlsAttachments.push({ filename: `MFG_Invoice_${xlsOrderRef}.xlsx`, content: Buffer.from(b), contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })));
+      if (sendMerchInvoiceXls && mrchItems.length > 0) xlsTasks.push(buildCustInvoiceExcel(full.merch, 'MERCH').then(b => xlsAttachments.push({ filename: `MERCH_Invoice_${xlsOrderRef}.xlsx`, content: Buffer.from(b), contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })));
+      if (sendMfgPackingXls)  xlsTasks.push(buildCustPackingExcel('mfg').then(b => xlsAttachments.push({ filename: `MFG_PackingList_${xlsOrderRef}.xlsx`, content: Buffer.from(b), contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })));
+      if (sendMerchPackingXls) xlsTasks.push(buildCustPackingExcel('merch').then(b => xlsAttachments.push({ filename: `MERCH_PackingList_${xlsOrderRef}.xlsx`, content: Buffer.from(b), contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })));
+      await Promise.all(xlsTasks);
+    }
+
     // ── Email body ───────────────────────────────────────────────────────────
     const emailHtml = `<div style="font-family:Arial,sans-serif;max-width:580px;margin:0 auto;color:#1f2937">
       <div style="background:linear-gradient(135deg,#0A4840,#1A6B5E);padding:24px;border-radius:12px 12px 0 0;text-align:center">
@@ -911,10 +1110,14 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
       </div>
       <div style="background:#f9fafb;padding:24px;border-radius:0 0 12px 12px;border:1px solid #e5e7eb">
         <p style="margin:0 0 16px">Dear ${customerName}${company?` (${company})`:''},</p>
-        <p style="margin:0 0 20px;font-size:13px;color:#374151">Please find attached two documents for your reference:</p>
+        <p style="margin:0 0 20px;font-size:13px;color:#374151">Please find attached the documents for your reference:</p>
         <ol style="font-size:13px;color:#374151;line-height:1.8;margin:0 0 20px">
-          <li><strong>Invoice Summary</strong> — MFG (${proj.mfg_invoice_no||'—'}) + Merchandiser (${proj.merch_invoice_no||'—'}) · <strong>${fmtINR(invoiceVal)}</strong></li>
-          <li><strong>Logistics Debit Note</strong> — Sea Freight &amp; related charges · <strong>${fmtINR(logCharge+otherChr)}</strong></li>
+          ${sendInvoicePdf   ? `<li><strong>Invoice Summary (PDF)</strong> — MFG (${proj.mfg_invoice_no||'—'}) + Merchandiser (${proj.merch_invoice_no||'—'}) · <strong>${fmtINR(invoiceVal)}</strong></li>` : ''}
+          ${sendLogisticsPdf ? `<li><strong>Logistics Debit Note (PDF)</strong> — Sea Freight &amp; related charges · <strong>${fmtINR(logCharge+otherChr)}</strong></li>` : ''}
+          ${sendMfgInvoiceXls  && mfgItems.length > 0  ? `<li><strong>MFG Invoice (Excel)</strong> — ${proj.mfg_invoice_no||'—'}</li>` : ''}
+          ${sendMerchInvoiceXls && mrchItems.length > 0 ? `<li><strong>MERCH Invoice (Excel)</strong> — ${proj.merch_invoice_no||'—'}</li>` : ''}
+          ${sendMfgPackingXls  ? '<li><strong>MFG Packing List (Excel)</strong></li>' : ''}
+          ${sendMerchPackingXls ? '<li><strong>MERCH Packing List (Excel)</strong></li>' : ''}
         </ol>
         <table style="width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;margin-bottom:16px">
           <tbody>
@@ -942,11 +1145,12 @@ projects.post('/:id/email-summary', auth, requireRole('admin','manager','ceo'), 
     await mailer.sendMail({
       from: `"Sathvam Natural Products" <${process.env.SMTP_USER}>`,
       to: email,
-      subject: `Financial Summary — ${proj.project_name || order.order_no}`,
+      subject: `${xlsAttachments.length > 0 ? 'Export Documents' : 'Financial Summary'} — ${proj.project_name || order.order_no}`,
       html: emailHtml,
       attachments: [
         ...(invoicePdf   ? [{ filename: `Invoice_${orderRef}.pdf`,   content: invoicePdf,   contentType: 'application/pdf' }] : []),
         ...(logisticsPdf ? [{ filename: `Logistics_${orderRef}.pdf`, content: logisticsPdf, contentType: 'application/pdf' }] : []),
+        ...xlsAttachments,
       ],
     });
 
@@ -1221,47 +1425,14 @@ projects.post('/:id/email-logistics-vendor', auth, requireRole('admin','manager'
     ).join('');
 
     const emailHtml = `
-      <div style="font-family:Arial,sans-serif;max-width:700px;margin:0 auto">
-        <div style="background:#0A4840;color:#fff;padding:16px 24px;border-radius:8px 8px 0 0">
-          <h2 style="margin:0;font-size:18px">📦 Export Documents — ${proj.project_name || orderNo}</h2>
-          <p style="margin:4px 0 0;font-size:13px;color:#a7f3d0">From SATHVAM OILS AND SPICES PVT LTD</p>
-        </div>
-        <div style="background:#fff;border:1px solid #e5e7eb;border-top:none;padding:20px 24px;border-radius:0 0 8px 8px">
-          <p style="color:#374151;font-size:14px">Dear ${logistics.vendorName || 'Logistics Team'},</p>
-          <p style="color:#374151;font-size:14px">Please find attached the invoice and packing list for the upcoming shipment.</p>
-
-          <table style="width:100%;border-collapse:collapse;margin:16px 0;font-size:13px">
-            <tr><td style="padding:6px 0;color:#6b7280;width:160px"><strong>Project / Order</strong></td><td style="color:#111827;font-weight:600">${proj.project_name||''} ${orderNo?'('+orderNo+')':''}</td></tr>
-            <tr><td style="padding:6px 0;color:#6b7280"><strong>Buyer / Consignee</strong></td><td style="color:#111827">${buyerName}</td></tr>
-            <tr><td style="padding:6px 0;color:#6b7280"><strong>Destination</strong></td><td style="color:#111827">${full.portOfDischarge||full.buyerCountry||''}</td></tr>
-            <tr><td style="padding:6px 0;color:#6b7280"><strong>MFG Invoice</strong></td><td style="color:#111827">${full.mfg?.invoiceNo||'—'} (${mfgItems.length} items)</td></tr>
-            <tr><td style="padding:6px 0;color:#6b7280"><strong>MERCH Invoice</strong></td><td style="color:#111827">${full.merch?.invoiceNo||'—'} (${merchItems.length} items)</td></tr>
-            <tr><td style="padding:6px 0;color:#6b7280"><strong>Total Boxes/Sacks</strong></td><td style="color:#111827">${boxes.length} (${totalPcs} pcs)</td></tr>
-            <tr><td style="padding:6px 0;color:#6b7280"><strong>Gross / Net Weight</strong></td><td style="color:#111827">${totalGross.toFixed(2)} kg / ${totalNet.toFixed(2)} kg</td></tr>
-            <tr><td style="padding:6px 0;color:#6b7280"><strong>Port of Loading</strong></td><td style="color:#111827">${full.portOfLoading||'—'}</td></tr>
-            <tr><td style="padding:6px 0;color:#6b7280"><strong>Terms</strong></td><td style="color:#111827">${full.terms||full.paymentTerms||'CIF'}</td></tr>
-          </table>
-
-          <h3 style="color:#1f2937;font-size:14px;margin:20px 0 8px;border-bottom:2px solid #0A4840;padding-bottom:6px">Product Summary</h3>
-          <table style="width:100%;border-collapse:collapse">
-            <tr style="background:#f1f5f9"><th style="border:1px solid #d1d5db;padding:8px 10px;text-align:left;font-size:12px">Product</th><th style="border:1px solid #d1d5db;padding:8px 10px;text-align:center;font-size:12px">Pack Size</th><th style="border:1px solid #d1d5db;padding:8px 10px;text-align:center;font-size:12px">Qty</th><th style="border:1px solid #d1d5db;padding:8px 10px;font-size:12px">HSN</th></tr>
-            ${itemList}
-          </table>
-
-          <p style="margin-top:20px;color:#374151;font-size:14px"><strong>Attached documents (Excel):</strong></p>
-          <ul style="color:#374151;font-size:13px">
-            ${mfgItems.length > 0 ? '<li>📊 MFG Export Invoice (.xlsx)</li>' : ''}
-            ${merchItems.length > 0 ? '<li>📊 MERCH Export Invoice (.xlsx)</li>' : ''}
-            <li>📊 Combined Packing List (.xlsx)</li>
-          </ul>
-
-          <p style="color:#374151;font-size:14px">Please review and confirm receipt. If any corrections are needed, reply to this email with the details and we will send the revised documents.</p>
-
-          <div style="margin-top:24px;padding-top:16px;border-top:1px solid #e5e7eb">
-            <p style="margin:0;font-weight:700;color:#0A4840;font-size:13px">SATHVAM OILS AND SPICES PVT LTD</p>
-            <p style="margin:2px 0 0;color:#6b7280;font-size:12px">GST: 33ABFCS9387K1ZN | IEC: ABFCS9387K</p>
-            <p style="margin:2px 0 0;color:#6b7280;font-size:12px">MOB: +917092177092 | EMAIL: SALES@SATHVAM.IN</p>
-          </div>
+      <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto">
+        <p style="color:#1f2937;font-size:14px">Hello Team,</p>
+        <p style="color:#1f2937;font-size:14px">Please find the invoice and packing list for both Manufacture and Merchandiser. Pls review and confirm.</p>
+        <p style="color:#1f2937;font-size:14px;margin-top:16px">Thanks & Regards,</p>
+        <div style="margin-top:12px;padding-top:12px;border-top:1px solid #e5e7eb">
+          <p style="margin:0;font-weight:700;color:#0A4840;font-size:13px">SATHVAM OILS AND SPICES PVT LTD</p>
+          <p style="margin:2px 0 0;color:#6b7280;font-size:12px">GST: 33ABFCS9387K1ZN | IEC: ABFCS9387K</p>
+          <p style="margin:2px 0 0;color:#6b7280;font-size:12px">MOB: +917092177092 | EMAIL: SALES@SATHVAM.IN</p>
         </div>
       </div>`;
 
@@ -1274,7 +1445,7 @@ projects.post('/:id/email-logistics-vendor', auth, requireRole('admin','manager'
       auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
     });
 
-    const subject = `Invoice & Packing List — ${proj.project_name||orderNo} — ${buyerName} [${full.mfg?.invoiceNo||''}${full.merch?.invoiceNo?', '+full.merch.invoiceNo:''}]`;
+    const subject = req.body.subject || `Invoice & Packing List — ${proj.project_name||orderNo} — ${buyerName}`;
 
     await mailer.sendMail({
       from: process.env.SMTP_FROM || `"Sathvam Export" <${process.env.SMTP_USER}>`,
@@ -1624,11 +1795,153 @@ projects.post('/:id/email-mark-viewed', auth, async (req, res) => {
 
 projects.post('/:id/email-reply', auth, requireRole('admin','manager','ceo'), async (req, res) => {
   try {
-    const { to, cc, subject, body, inReplyTo } = req.body;
+    const { to, cc, subject, body, inReplyTo, attachExcels } = req.body;
     if (!to?.length || !subject || !body) return res.status(400).json({ error: 'to, subject, body required' });
 
     const { data: fullRow } = await supabase.from('settings').select('value').eq('key', `project_full_${req.params.id}`).maybeSingle();
     const full = fullRow?.value || {};
+
+    // ── Generate Excel attachments if requested ──
+    const attachments = [];
+    if (attachExcels && (attachExcels.mfgInv || attachExcels.merchInv || attachExcels.mfgPack || attachExcels.merchPack)) {
+      const ExcelJS = require('exceljs');
+      const HEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF0A4840' } };
+      const HEADER_FONT = { bold: true, color: { argb: 'FFFFFFFF' }, size: 11 };
+      const SUBHEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF1F5F9' } };
+      const BORDER_THIN = { top: {style:'thin'}, left: {style:'thin'}, bottom: {style:'thin'}, right: {style:'thin'} };
+      const NUM_FMT_INR = '#,##0.00';
+
+      // Load project + order info for Excel headers
+      const { data: proj } = await supabase.from('projects')
+        .select('id,project_name,b2b_order_id,buyer_name,pi_no,mfg_invoice_no,merch_invoice_no')
+        .eq('id', req.params.id).single();
+      let buyerName = proj?.buyer_name || full.buyerName || '';
+      let orderNo = '';
+      if (proj?.b2b_order_id) {
+        const { data: ord } = await supabase.from('b2b_orders').select('order_no,buyer_name').eq('id', proj.b2b_order_id).single();
+        if (ord) { orderNo = ord.order_no; buyerName = buyerName || ord.buyer_name; }
+      }
+
+      const SHIPPER_ADDR = {
+        A: { name: 'SATHVAM OILS AND SPICES PVT LTD', addr: 'PLOT NO:6, ANAND JOTHI NAGAR, near ABS HOSPITAL, Thanthoni, Tamil Nadu 639005' },
+        B: { name: 'SATHVAM OILS AND SPICES PVT LTD', addr: '366 B AMARJOTHI GARDEN 2ND CROSS, GANDHIGRAMAM, KARUR, Tamil Nadu 639004' },
+      };
+      const COMPANY_INFO = { gst: '33ABFCS9387K1ZN', iec: 'ABFCS9387K', cin: 'U15400TN2021PTC142893', pan: 'ABFCS9387K' };
+      const getShipper = (inv) => {
+        if (inv?.shipperOption === 'custom' && inv?.shipperName) return { name: inv.shipperName, addr: (inv.shipperAddress || '').replace(/\n/g, ', ') };
+        return SHIPPER_ADDR[inv?.shipperOption] || SHIPPER_ADDR.B;
+      };
+
+      const mfgItems = (full.mfg?.items || []).filter(i => i.product);
+      const merchItems = (full.merch?.items || []).filter(i => i.product);
+      const boxes = full.packingBoxes || [];
+
+      // Build Invoice Excel
+      async function buildInvXls(inv, typLabel) {
+        const wb = new ExcelJS.Workbook(); wb.creator = 'Sathvam Export'; wb.created = new Date();
+        const ws = wb.addWorksheet(`${typLabel} Invoice`);
+        ws.columns = [{ width: 5 },{ width: 30 },{ width: 12 },{ width: 8 },{ width: 10 },{ width: 14 },{ width: 12 },{ width: 14 }];
+        const shipper = getShipper(inv);
+        const items = (inv?.items || []).filter(i => i.product);
+        const titleRow = ws.addRow([`EXPORT INVOICE — ${typLabel}`]);
+        ws.mergeCells(titleRow.number, 1, titleRow.number, 8);
+        titleRow.getCell(1).font = { bold: true, size: 14, color: { argb: 'FF0A4840' } };
+        titleRow.getCell(1).alignment = { horizontal: 'center' }; titleRow.height = 28;
+        ws.addRow([]);
+        const expR = ws.addRow(['', 'Exporter / Shipper:', shipper.name]);
+        expR.getCell(2).font = { bold: true, size: 10, color: { argb: 'FF6B7280' } };
+        expR.getCell(3).font = { bold: true, size: 11 };
+        ws.addRow(['', '', shipper.addr]);
+        ws.addRow(['', '', `GST: ${COMPANY_INFO.gst}  |  IEC: ${COMPANY_INFO.iec}`]);
+        ws.addRow(['', '', `PAN: ${COMPANY_INFO.pan}  |  CIN: ${COMPANY_INFO.cin}`]);
+        ws.addRow([]);
+        ws.addRow(['', 'Invoice No:', inv?.invoiceNo || '—', '', 'Invoice Date:', inv?.invoiceDate || '—']);
+        ws.addRow(['', 'PI / Ref No:', inv?.piNo || full.piNo || '—', '', 'PI Date:', inv?.piDate || '—']);
+        ws.addRow(['', 'Buyer:', buyerName, '', 'Destination:', full.portOfDischarge || full.buyerCountry || '—']);
+        ws.addRow(['', 'Buyer Address:', full.buyerAddress || '—']);
+        ws.addRow(['', 'Country of Origin:', 'INDIA', '', 'Country of Dest:', full.buyerCountry || '—']);
+        ws.addRow(['', 'Port of Loading:', full.portOfLoading || '—', '', 'Port of Discharge:', full.portOfDischarge || '—']);
+        ws.addRow(['', 'Terms:', full.terms || full.paymentTerms || 'CIF', '', 'LUT ARN:', full.lutArn || '—']);
+        for (let r = 8; r <= 14; r++) { ws.getRow(r).getCell(2).font = { bold: true, size: 10, color: { argb: 'FF6B7280' } }; }
+        ws.addRow([]);
+        const hdr = ws.addRow(['S.No', 'Product Description', 'HSN Code', 'Qty', 'Pack Size', 'Unit Price (₹)', 'Weight (kg)', 'Total (₹)']);
+        hdr.eachCell(c => { c.fill = HEADER_FILL; c.font = HEADER_FONT; c.border = BORDER_THIN; c.alignment = { horizontal: 'center', vertical: 'middle' }; });
+        hdr.height = 22;
+        let totalQty = 0, totalWt = 0, totalVal = 0;
+        items.forEach((it, idx) => {
+          const qty = Number(it.qty) || 0; const unitPrice = Number(it.unitPriceINR) || 0;
+          const wt = Number(it.weightKg) || 0; const total = Number(it.totalINR) || (qty * unitPrice);
+          totalQty += qty; totalWt += wt; totalVal += total;
+          const row = ws.addRow([idx + 1, it.exportName || it.product, it.hsnCode || '', qty, `${it.packSize || ''} ${it.packUnit || ''}`, unitPrice, wt, total]);
+          row.eachCell(c => { c.border = BORDER_THIN; });
+          row.getCell(6).numFmt = NUM_FMT_INR; row.getCell(8).numFmt = NUM_FMT_INR;
+        });
+        const totRow = ws.addRow(['', 'TOTAL', '', totalQty, '', '', totalWt.toFixed(2), totalVal]);
+        totRow.eachCell(c => { c.fill = SUBHEADER_FILL; c.font = { bold: true }; c.border = BORDER_THIN; });
+        totRow.getCell(8).numFmt = NUM_FMT_INR;
+        ws.addRow([]); ws.addRow(['', 'For SATHVAM OILS AND SPICES PVT LTD']); ws.addRow(['', 'Authorised Signatory']);
+        return wb.xlsx.writeBuffer();
+      }
+
+      // Build Packing List Excel
+      async function buildPackXls(type) {
+        const wb = new ExcelJS.Workbook(); wb.creator = 'Sathvam Export'; wb.created = new Date();
+        const ws = wb.addWorksheet(`${type.toUpperCase()} Packing List`);
+        ws.columns = [{ width: 10 },{ width: 30 },{ width: 12 },{ width: 8 },{ width: 10 },{ width: 12 },{ width: 12 },{ width: 20 }];
+        const titleRow = ws.addRow([`${type.toUpperCase()} PACKING LIST`]);
+        ws.mergeCells(titleRow.number, 1, titleRow.number, 8);
+        titleRow.getCell(1).font = { bold: true, size: 14, color: { argb: 'FF0A4840' } };
+        titleRow.getCell(1).alignment = { horizontal: 'center' }; titleRow.height = 28;
+        ws.addRow([]); ws.addRow(['', 'Exporter:', 'SATHVAM OILS AND SPICES PVT LTD']);
+        ws.addRow(['', 'Buyer:', buyerName]);
+        const invNo = type === 'mfg' ? (full.mfg?.invoiceNo || '—') : (full.merch?.invoiceNo || '—');
+        ws.addRow(['', 'Invoice:', invNo]);
+        ws.addRow([]);
+        const hdr = ws.addRow(['Box / Sack', 'Product Description', 'Pack Size', 'Qty (pcs)', 'HSN Code', 'Gross Wt (kg)', 'Net Wt (kg)', 'Notes']);
+        hdr.eachCell(c => { c.fill = HEADER_FILL; c.font = HEADER_FONT; c.border = BORDER_THIN; c.alignment = { horizontal: 'center', vertical: 'middle' }; });
+        hdr.height = 22;
+        const allInvItems = [...mfgItems, ...merchItems];
+        let runningPcs = 0, runningGross = 0, runningNet = 0;
+        // Filter boxes by type: mfg boxes have numeric labels (01,02..), merch have M-prefix (M01,M02..)
+        const filteredBoxes = boxes.filter(b => {
+          const num = String(b.num || '');
+          if (type === 'mfg') return !num.startsWith('M');
+          return num.startsWith('M');
+        });
+        if (filteredBoxes.length > 0) {
+          filteredBoxes.forEach((box, bi) => {
+            const label = box.num || (box.type === 'sack' ? `S${bi+1}` : `B${bi+1}`);
+            const prods = box.products || [];
+            const grossWt = parseFloat(box.grossWt) || 0;
+            const netWt = parseFloat(box.netWt) || 0;
+            runningGross += grossWt; runningNet += netWt;
+            if (prods.length === 0) {
+              const row = ws.addRow([label, '—', '', '', '', grossWt || '', netWt || '', box.note || '']);
+              row.eachCell(c => { c.border = BORDER_THIN; });
+            } else {
+              prods.forEach((pr, pi) => {
+                const pQty = Number(pr.qty) || 1; runningPcs += pQty;
+                const matchItem = allInvItems.find(it => (it.exportName||it.product||'').toLowerCase() === (pr.name||'').toLowerCase());
+                const row = ws.addRow([pi === 0 ? label : '', pr.name || '', pr.packSize ? `${pr.packSize} ${pr.packUnit || ''}` : '', pQty, matchItem?.hsnCode || '', pi === 0 ? (grossWt || '') : '', pi === 0 ? (netWt || '') : '', pi === 0 ? (box.note || '') : '']);
+                row.eachCell(c => { c.border = BORDER_THIN; });
+              });
+            }
+          });
+        }
+        const totRow = ws.addRow(['TOTAL', '', '', runningPcs, '', runningGross.toFixed(2), runningNet.toFixed(2), '']);
+        totRow.eachCell(c => { c.fill = SUBHEADER_FILL; c.font = { bold: true }; c.border = BORDER_THIN; });
+        ws.addRow([]); ws.addRow(['', 'For SATHVAM OILS AND SPICES PVT LTD']); ws.addRow(['', 'Authorised Signatory']);
+        return wb.xlsx.writeBuffer();
+      }
+
+      const safeRef = (orderNo || proj?.project_name || 'Export').replace(/[^a-zA-Z0-9-_]/g, '-');
+      const xlsTasks = [];
+      if (attachExcels.mfgInv && mfgItems.length > 0)    xlsTasks.push(buildInvXls(full.mfg, 'MFG').then(b => attachments.push({ filename: `MFG_Invoice_${safeRef}.xlsx`, content: Buffer.from(b), contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })));
+      if (attachExcels.merchInv && merchItems.length > 0)  xlsTasks.push(buildInvXls(full.merch, 'MERCH').then(b => attachments.push({ filename: `MERCH_Invoice_${safeRef}.xlsx`, content: Buffer.from(b), contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })));
+      if (attachExcels.mfgPack)   xlsTasks.push(buildPackXls('mfg').then(b => attachments.push({ filename: `MFG_PackingList_${safeRef}.xlsx`, content: Buffer.from(b), contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })));
+      if (attachExcels.merchPack) xlsTasks.push(buildPackXls('merch').then(b => attachments.push({ filename: `MERCH_PackingList_${safeRef}.xlsx`, content: Buffer.from(b), contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' })));
+      await Promise.all(xlsTasks);
+    }
 
     const mailOpts = {
       from: process.env.SMTP_FROM || `Sathvam Exports <${process.env.SMTP_USER}>`,
@@ -1637,6 +1950,7 @@ projects.post('/:id/email-reply', auth, requireRole('admin','manager','ceo'), as
       subject,
       text: body,
       ...(inReplyTo ? { inReplyTo, references: inReplyTo } : {}),
+      ...(attachments.length > 0 ? { attachments } : {}),
     };
     await mailer.sendMail(mailOpts);
 
@@ -2559,6 +2873,33 @@ b2bOrders.get('/:id/project-docs', auth, async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: 'Failed to load project documents' });
   }
+});
+
+// GET /api/b2b/orders/:id/cc-feedback — Get cost calculator feedback from customer
+b2bOrders.get('/:id/cc-feedback', auth, async (req, res) => {
+  try {
+    if (req.user.type === 'b2b_customer') {
+      const { data: order } = await supabase.from('b2b_orders').select('customer_id').eq('id', req.params.id).single();
+      if (!order || order.customer_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+    }
+    const { data } = await supabase.from('settings').select('value').eq('key', `cc_feedback_${req.params.id}`).maybeSingle();
+    res.json(data?.value || { items: {}, general: '', submittedAt: null });
+  } catch { res.status(500).json({ error: 'Failed to load feedback' }); }
+});
+
+// POST /api/b2b/orders/:id/cc-feedback — Save cost calculator feedback from customer
+b2bOrders.post('/:id/cc-feedback', auth, async (req, res) => {
+  try {
+    // Only B2B customers can submit feedback
+    if (req.user.type === 'b2b_customer') {
+      const { data: order } = await supabase.from('b2b_orders').select('customer_id,order_no').eq('id', req.params.id).single();
+      if (!order || order.customer_id !== req.user.id) return res.status(403).json({ error: 'Forbidden' });
+    }
+    const { items, general } = req.body; // items: { "0": "reduce to 8%", "3": "too high" }, general: "overall note"
+    const feedback = { items: items || {}, general: general || '', submittedAt: new Date().toISOString(), submittedBy: req.user.companyName || req.user.email || 'customer' };
+    await supabase.from('settings').upsert({ key: `cc_feedback_${req.params.id}`, value: feedback }, { onConflict: 'key' });
+    res.json({ success: true });
+  } catch { res.status(500).json({ error: 'Failed to save feedback' }); }
 });
 
 // POST /api/b2b/orders/:id/email-logistics — B2B customer requests logistics invoice PDF emailed to them
