@@ -1133,7 +1133,7 @@ router.post('/zoho/sync-bank-transactions', auth, async (req, res) => {
     // Also update the local account balance from Zoho's current balance
     try {
       const acctData = await zohoApi('get', `/bankaccounts/${zoho_account_id}`, null, { organization_id: ZOHO_ORG() });
-      const zohoBalance = parseFloat(acctData?.bankaccount?.balance) || null;
+      const zohoBalance = parseFloat(acctData?.bankaccount?.bank_balance ?? acctData?.bankaccount?.balance) || null;
       if (zohoBalance !== null) {
         await supabase.from('bank_accounts')
           .update({ current_balance: round2(zohoBalance), zoho_account_id, zoho_synced_at: new Date().toISOString() })

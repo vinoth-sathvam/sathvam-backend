@@ -909,7 +909,7 @@ function startScheduler() {
         // Update balance from Zoho
         try {
           const acctData = await zohoApi('get', `/bankaccounts/${acct.zoho_account_id}`, null, { organization_id: process.env.ZOHO_ORG_ID });
-          const zohoBalance = parseFloat(acctData?.bankaccount?.balance);
+          const zohoBalance = parseFloat(acctData?.bankaccount?.bank_balance ?? acctData?.bankaccount?.balance);
           if (!isNaN(zohoBalance)) {
             await supabase.from('bank_accounts').update({ current_balance: round2(zohoBalance), zoho_synced_at: new Date().toISOString() }).eq('id', acct.id);
           }
