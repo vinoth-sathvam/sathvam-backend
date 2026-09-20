@@ -123,12 +123,56 @@ router.post('/', auth, requireRole('admin', 'manager'), async (req, res) => {
   // Zoho Books: create expense
   if (zohoApi && process.env.ZOHO_ORG_ID) {
     try {
+      // Map local category → Zoho Books expense account_id
+      const ZOHO_ACCOUNT_MAP = {
+        'Raw Materials':        '1247318000000015100', // Raw Materials And Consumables
+        'Packaging':            '1247318000000376767', // Pet Bottles
+        'Office & Admin':       '1247318000000000498', // Office Supplies
+        'Rent':                 '1247318000013542191', // FACTORY RENT
+        'Miscellaneous':        '1247318000000000558', // Other Expenses
+        'Salary':               '1247318000000000543', // Salaries and Employee Wages
+        'Transport':            '1247318000000015104', // Transportation Expense
+        'Fuel':                 '1247318000002248184', // Fuel/Mileage Expenses
+        'Electricity':          '1247318000000367606', // Electricity bill
+        'Repairs':              '1247318000000000555', // Repairs and Maintenance
+        'Marketing':            '1247318000000000501', // Advertising And Marketing
+        'Travel':               '1247318000000000516', // Travel Expense
+        'Food':                 '1247318000009002569', // Food
+        'Tea & Groceries':      '1247318000001646121', // Tea & Groceries
+        'Milk':                 '1247318000001675001', // Milk Exp
+        'Telephone':            '1247318000000000519', // Telephone Expense
+        'IT & Internet':        '1247318000000000525', // IT and Internet Expenses
+        'Bank Charges':         '1247318000000000507', // Bank Fees and Charges
+        'Printing':             '1247318000000000540', // Printing and Stationery
+        'Labels':               '1247318000000376805', // Labels
+        'License':              '1247318000000376633', // License
+        'Lab Test':             '1247318000000318161', // LAB TEST
+        'Grinding':             '1247318000000331007', // Griding Charges
+        'Consultant':           '1247318000000000552', // Consultant Expense
+        'Bonus':                '1247318000002403033', // Bonus
+        'Packing Tools':        '1247318000001758001', // Packing Tools
+        'Parking':              '1247318000002248024', // Parking
+        'Pooja':                '1247318000000470028', // Office Expenses - Pooja items
+        'Logistics':            '1247318000000377231', // Logistic
+        'Custom Duty':          '1247318000000423640', // Custom Duty
+        'Taxes':                '1247318000009935567', // Taxes
+        'Covers':               '1247318000000377646', // Covers
+        'Shrinks':              '1247318000000376935', // PLASTIC SHRINKS
+      };
+      const ZOHO_PAID_THROUGH = {
+        'cash':   '1247318000000000459', // Petty Cash
+        'bank':   '1247318000000189051', // sathvam oils and spices pvt ltd (ICICI)
+        'upi':    '1247318000000189051',
+        'cheque': '1247318000000189051',
+      };
+      const zohoAccountId = ZOHO_ACCOUNT_MAP[category] || '1247318000000000558'; // Other Expenses
+      const paidThroughId = ZOHO_PAID_THROUGH[payment_mode] || '1247318000000000459'; // Petty Cash
       const expPayload = {
         date,
         amount:       parsed,
         description:  description.trim(),
-        account_name: category || 'Miscellaneous Expense',
-        paid_through_account_name: payment_mode === 'cash' ? 'Petty Cash' : 'Bank',
+        account_id:   zohoAccountId,
+        paid_through_account_id: paidThroughId,
         reference_number: reference_no || '',
         vendor_name:  vendor_name || undefined,
       };
