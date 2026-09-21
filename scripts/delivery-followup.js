@@ -157,4 +157,4 @@ async function run() {
   console.log('[delivery-followup] Done');
 }
 
-run().catch(e => { console.error(e); process.exit(1); });
+run().then(() => process.exit(0)).catch(e => { console.error(e); process.exit(1); });

@@ -18,9 +18,13 @@
  *   Sec43B      — unpaid TDS/PF/ESI → disallowed deduction risk
  *   BooksQuality— round-number expenses, missing vendor/narration, unexplained entries
  *   Payroll     — pending payroll, bonus act compliance, Professional Tax (Tamil Nadu)
- *   Expenses    — large single expenses, month-over-month spike
- *   Revenue     — revenue drop, zero-sales weekdays
+ *   Expenses    — large single expenses, month-over-month spike, commodity cost anomalies
+ *   Revenue     — revenue drop, zero-sales weekdays, revenue leakage, B2B order profitability
  *   Compliance  — TDS/PF/ESI/GST deadlines, advance tax, e-invoice threshold, overdue items
+ *   DoubleEntry — paid sales without matching bank credits
+ *   Inventory   — stock ledger vs finished goods divergence
+ *   CashFlow    — 30/60/90 day cash flow projection
+ *   AP (extra)  — unpaid procurements without linked vendor bills
  */
 'use strict';
 require('dotenv').config({ path: require('path').join(__dirname, '../.env') });
@@ -1058,6 +1062,610 @@ async function checkCompliance() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// NEW: DOUBLE ENTRY RECONCILIATION — sales vs bank credits
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkDoubleEntry() {
+  const findings = [];
+  const since30 = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+
+  const { data: paidSales } = await supabase
+    .from('sales')
+    .select('id,order_no,final_amount,date,customer_name')
+    .eq('status', 'paid')
+    .gte('date', since30)
+    .limit(200);
+
+  if (!paidSales || paidSales.length === 0) return findings;
+
+  const { data: bankCredits } = await supabase
+    .from('bank_transactions')
+    .select('id,date,amount,description')
+    .eq('type', 'credit')
+    .gte('date', since30)
+    .limit(500);
+
+  const credits = bankCredits || [];
+
+  const unmatched = [];
+  for (const sale of paidSales) {
+    const saleAmt = parseFloat(sale.final_amount || 0);
+    const saleDate = new Date(sale.date);
+    const hasMatch = credits.some(c => {
+      const creditAmt = parseFloat(c.amount || 0);
+      const creditDate = new Date(c.date);
+      const amtMatch = Math.abs(creditAmt - saleAmt) / saleAmt <= 0.05;
+      const daysDiff = Math.abs(creditDate - saleDate) / 86400000;
+      return amtMatch && daysDiff <= 7;
+    });
+    if (!hasMatch) unmatched.push(sale);
+  }
+
+  if (unmatched.length > 0) {
+    const total = unmatched.reduce((s, x) => s + parseFloat(x.final_amount || 0), 0);
+    findings.push(finding('DoubleEntry', 'high',
+      `${unmatched.length} paid sales with no corresponding bank credit in last 30 days`,
+      `Total: ₹${round2(total).toLocaleString('en-IN')}. Orders: ${unmatched.slice(0, 3).map(s => s.order_no || s.id).join(', ')}. These sales are marked "paid" but no matching bank deposit found (±5% amount, ±7 days). Verify payment receipts and reconcile.`,
+      round2(total)
+    ));
+  }
+
+  return findings;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW: INVENTORY VALUATION — stock_ledger vs finished_goods divergence
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkInventoryValuation() {
+  const findings = [];
+
+  const [ledgerRes, fgRes] = await Promise.all([
+    supabase.from('stock_ledger').select('product_id,product_name,type,qty').limit(2000),
+    supabase.from('finished_goods').select('product_id,product_name,type,qty').limit(2000),
+  ]);
+
+  const ledgerData = ledgerRes.data || [];
+  const fgData = fgRes.data || [];
+
+  // Aggregate stock_ledger by product_id
+  const ledgerNet = {};
+  for (const r of ledgerData) {
+    if (!r.product_id) continue;
+    if (!ledgerNet[r.product_id]) ledgerNet[r.product_id] = { name: r.product_name, qty: 0 };
+    const q = parseFloat(r.qty || 0);
+    ledgerNet[r.product_id].qty += (r.type === 'IN' ? q : -q);
+  }
+
+  // Aggregate finished_goods by product_id
+  const fgNet = {};
+  for (const r of fgData) {
+    if (!r.product_id) continue;
+    if (!fgNet[r.product_id]) fgNet[r.product_id] = { name: r.product_name, qty: 0 };
+    const q = parseFloat(r.qty || 0);
+    fgNet[r.product_id].qty += (r.type === 'IN' ? q : -q);
+  }
+
+  const divergent = [];
+  for (const pid of Object.keys(ledgerNet)) {
+    const lQty = ledgerNet[pid].qty;
+    const fQty = (fgNet[pid] || { qty: 0 }).qty;
+    if (lQty === 0 && fQty === 0) continue;
+    const base = Math.max(Math.abs(lQty), Math.abs(fQty));
+    if (base > 0 && Math.abs(lQty - fQty) / base > 0.10) {
+      divergent.push({ name: ledgerNet[pid].name || pid, ledger: round2(lQty), fg: round2(fQty) });
+    }
+  }
+
+  if (divergent.length > 0) {
+    findings.push(finding('Inventory', 'high',
+      `${divergent.length} products with >10% stock divergence between ledger and finished goods`,
+      `Examples: ${divergent.slice(0, 3).map(d => `${d.name}: ledger=${d.ledger}, FG=${d.fg}`).join('; ')}. Stock ledger and finished goods records must agree. Investigate missing IN/OUT entries, unrecorded sales, or data entry errors.`,
+      null
+    ));
+  }
+
+  return findings;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW: PROCUREMENT PAYMENT MATCH — unpaid procurements without vendor bills
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkProcurementPaymentMatch() {
+  const findings = [];
+  const ago30 = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+
+  const { data: unpaidProc } = await supabase
+    .from('procurements')
+    .select('id,date,supplier,commodity_name,ordered_qty,ordered_price_per_kg,payment_status')
+    .neq('payment_status', 'paid')
+    .lt('date', ago30)
+    .limit(200);
+
+  if (!unpaidProc || unpaidProc.length === 0) return findings;
+
+  const { data: vendorBills } = await supabase
+    .from('vendor_bills')
+    .select('id,vendor_name,amount,bill_date,payable_id')
+    .is('deleted_at', null)
+    .limit(500);
+
+  const billPayableIds = new Set((vendorBills || []).map(b => b.payable_id).filter(Boolean));
+  const billVendors = new Set((vendorBills || []).map(b => (b.vendor_name || '').toLowerCase()));
+
+  const unlinked = unpaidProc.filter(p => {
+    if (billPayableIds.has(p.id)) return false;
+    // Also check by vendor name match as fallback
+    if (billVendors.has((p.supplier || '').toLowerCase())) return false;
+    return true;
+  });
+
+  if (unlinked.length > 0) {
+    const total = unlinked.reduce((s, p) => s + round2((parseFloat(p.ordered_qty)||0) * (parseFloat(p.ordered_price_per_kg)||0)), 0);
+    findings.push(finding('AP', 'medium',
+      `${unlinked.length} unpaid procurements >30 days old with no linked vendor bill`,
+      `Total estimated: ₹${round2(total).toLocaleString('en-IN')}. Suppliers: ${[...new Set(unlinked.map(p => p.supplier))].slice(0, 3).join(', ')}. Create vendor bills for these procurements to maintain proper AP tracking and ensure payments are scheduled.`,
+      round2(total)
+    ));
+  }
+
+  return findings;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW: REVENUE LEAKAGE — delivered orders without payment
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkRevenueLeakage() {
+  const findings = [];
+  const today = new Date();
+  const ago15 = new Date(Date.now() - 15 * 86400000).toISOString().slice(0, 10);
+
+  // B2B orders delivered >15 days but not paid
+  const { data: b2bDelivered } = await supabase
+    .from('b2b_orders')
+    .select('id,order_no,customer_name,total_value,created_at,stage')
+    .eq('stage', 'delivered')
+    .lt('created_at', ago15)
+    .limit(100);
+
+  if (b2bDelivered && b2bDelivered.length > 0) {
+    const total = b2bDelivered.reduce((s, o) => s + parseFloat(o.total_value || 0), 0);
+    const oldest = Math.max(...b2bDelivered.map(o => Math.floor((today - new Date(o.created_at)) / 86400000)));
+    findings.push(finding('Revenue', 'high',
+      `${b2bDelivered.length} B2B orders delivered >15 days without payment recorded`,
+      `Total: ₹${round2(total).toLocaleString('en-IN')}. Oldest: ${oldest} days. Customers: ${[...new Set(b2bDelivered.map(o => o.customer_name))].slice(0, 3).join(', ')}. Revenue leakage risk — follow up on collections immediately.`,
+      round2(total)
+    ));
+  }
+
+  // Webstore orders delivered but payment not paid
+  const { data: wsUnpaid } = await supabase
+    .from('webstore_orders')
+    .select('id,order_no,total,date,status,payment_status')
+    .eq('status', 'delivered')
+    .neq('payment_status', 'paid')
+    .lt('date', ago15)
+    .limit(50);
+
+  if (wsUnpaid && wsUnpaid.length > 0) {
+    const total = wsUnpaid.reduce((s, o) => s + parseFloat(o.total || 0), 0);
+    findings.push(finding('Revenue', 'high',
+      `${wsUnpaid.length} webstore orders delivered but payment not marked as paid`,
+      `Total: ₹${round2(total).toLocaleString('en-IN')}. These may be COD orders not collected or payment recording missed. Verify and update payment status.`,
+      round2(total)
+    ));
+  }
+
+  return findings;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW: COST ANOMALIES — commodity price spikes vs 3-month average
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkCostAnomalies() {
+  const findings = [];
+  const ago30 = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  const ago90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+
+  const { data: recent } = await supabase
+    .from('procurements')
+    .select('commodity_name,ordered_qty,ordered_price_per_kg,date')
+    .gte('date', ago30)
+    .limit(500);
+
+  const { data: historical } = await supabase
+    .from('procurements')
+    .select('commodity_name,ordered_qty,ordered_price_per_kg,date')
+    .gte('date', ago90)
+    .lt('date', ago30)
+    .limit(1000);
+
+  if (!recent || recent.length === 0 || !historical || historical.length === 0) return findings;
+
+  // 3-month avg by commodity (weighted by qty)
+  const histAvg = {};
+  for (const p of historical) {
+    const qty = parseFloat(p.ordered_qty || 0);
+    const rate = parseFloat(p.ordered_price_per_kg || 0);
+    if (qty <= 0 || rate <= 0) continue;
+    if (!histAvg[p.commodity_name]) histAvg[p.commodity_name] = { totalCost: 0, totalQty: 0 };
+    histAvg[p.commodity_name].totalCost += qty * rate;
+    histAvg[p.commodity_name].totalQty += qty;
+  }
+
+  // Current 30-day avg by commodity
+  const currAvg = {};
+  for (const p of recent) {
+    const qty = parseFloat(p.ordered_qty || 0);
+    const rate = parseFloat(p.ordered_price_per_kg || 0);
+    if (qty <= 0 || rate <= 0) continue;
+    if (!currAvg[p.commodity_name]) currAvg[p.commodity_name] = { totalCost: 0, totalQty: 0 };
+    currAvg[p.commodity_name].totalCost += qty * rate;
+    currAvg[p.commodity_name].totalQty += qty;
+  }
+
+  for (const [commodity, curr] of Object.entries(currAvg)) {
+    const hist = histAvg[commodity];
+    if (!hist || hist.totalQty === 0) continue;
+    const currRate = curr.totalCost / curr.totalQty;
+    const histRate = hist.totalCost / hist.totalQty;
+    if (currRate > histRate * 1.20) {
+      const pctUp = round2(((currRate - histRate) / histRate) * 100);
+      findings.push(finding('Expenses', 'medium',
+        `${commodity} procurement cost up ${pctUp}% vs 3-month average`,
+        `Current avg: ₹${round2(currRate).toLocaleString('en-IN')}/kg vs 3-month avg: ₹${round2(histRate).toLocaleString('en-IN')}/kg. Investigate market conditions, negotiate better rates, or consider alternate suppliers.`,
+        round2(curr.totalCost)
+      ));
+    }
+  }
+
+  return findings;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW: CASH FLOW PROJECTION — 30/60/90 day runway
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkCashFlowProjection() {
+  const findings = [];
+  const today = new Date();
+  const todayStr = today.toISOString().slice(0, 10);
+  const d30 = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+  const d60 = new Date(Date.now() + 60 * 86400000).toISOString().slice(0, 10);
+  const d90 = new Date(Date.now() + 90 * 86400000).toISOString().slice(0, 10);
+
+  // Current cash
+  const { data: accounts } = await supabase
+    .from('bank_accounts')
+    .select('current_balance')
+    .eq('is_active', true);
+  const cashBalance = (accounts || []).reduce((s, a) => s + parseFloat(a.current_balance || 0), 0);
+
+  // Employee count for salary estimate
+  const { data: employees } = await supabase
+    .from('employees')
+    .select('id,monthly_salary')
+    .eq('status', 'active');
+  const monthlySalary = (employees || []).reduce((s, e) => s + parseFloat(e.monthly_salary || 0), 0);
+
+  // Recurring expenses estimate (last 3 months average)
+  const ago90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+  const { data: recentExp } = await supabase
+    .from('company_expenses')
+    .select('amount')
+    .gte('date', ago90)
+    .is('deleted_at', null);
+  const avgMonthlyExpenses = round2((recentExp || []).reduce((s, e) => s + parseFloat(e.amount || 0), 0) / 3);
+
+  // Vendor bills due in 30/60/90 days
+  const { data: upcomingBills } = await supabase
+    .from('vendor_bills')
+    .select('amount,gst_amount,paid_amount,due_date')
+    .in('status', ['unpaid', 'partial', 'overdue'])
+    .is('deleted_at', null)
+    .lte('due_date', d90)
+    .limit(300);
+
+  const billsDue = { d30: 0, d60: 0, d90: 0 };
+  for (const b of (upcomingBills || [])) {
+    const outstanding = round2((parseFloat(b.amount||0) + parseFloat(b.gst_amount||0)) - parseFloat(b.paid_amount||0));
+    if (b.due_date <= d30) billsDue.d30 += outstanding;
+    else if (b.due_date <= d60) billsDue.d60 += outstanding;
+    else billsDue.d90 += outstanding;
+  }
+
+  const proj30 = round2(cashBalance - monthlySalary - avgMonthlyExpenses - billsDue.d30);
+  const proj60 = round2(proj30 - monthlySalary - avgMonthlyExpenses - billsDue.d60);
+  const proj90 = round2(proj60 - monthlySalary - avgMonthlyExpenses - billsDue.d90);
+
+  if (proj30 < 0) {
+    findings.push(finding('CashFlow', 'critical',
+      `30-day cash flow projection is NEGATIVE: ₹${round2(proj30).toLocaleString('en-IN')}`,
+      `Current cash: ₹${round2(cashBalance).toLocaleString('en-IN')}. Outflows (30d): salary ₹${round2(monthlySalary).toLocaleString('en-IN')} + expenses ₹${round2(avgMonthlyExpenses).toLocaleString('en-IN')} + bills ₹${round2(billsDue.d30).toLocaleString('en-IN')}. Immediate action: accelerate AR collections, negotiate AP deferrals, or arrange credit facility.`,
+      round2(Math.abs(proj30))
+    ));
+  } else if (proj60 < 0) {
+    findings.push(finding('CashFlow', 'high',
+      `60-day cash flow projection turns negative: ₹${round2(proj60).toLocaleString('en-IN')}`,
+      `Current cash: ₹${round2(cashBalance).toLocaleString('en-IN')}. 30-day balance: ₹${round2(proj30).toLocaleString('en-IN')}. Plan ahead to cover shortfall — accelerate collections or defer non-critical expenses.`,
+      round2(Math.abs(proj60))
+    ));
+  } else if (proj90 < 0) {
+    findings.push(finding('CashFlow', 'medium',
+      `90-day cash flow projection turns negative: ₹${round2(proj90).toLocaleString('en-IN')}`,
+      `Current cash: ₹${round2(cashBalance).toLocaleString('en-IN')}. Monitor closely — consider building reserves or reducing discretionary spending.`,
+      round2(Math.abs(proj90))
+    ));
+  }
+
+  return findings;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW: B2B ORDER PROFITABILITY — margin analysis on active orders
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkB2BOrderProfitability() {
+  const findings = [];
+
+  const { data: activeOrders } = await supabase
+    .from('b2b_orders')
+    .select('id,order_no,customer_name,total_value,items,stage')
+    .not('stage', 'in', '("cancelled","delivered","invoice_paid")')
+    .limit(50);
+
+  if (!activeOrders || activeOrders.length === 0) return findings;
+
+  // Get project expenses
+  const { data: projExpenses } = await supabase
+    .from('project_expenses')
+    .select('project_id,amount,category')
+    .limit(500);
+
+  // Get procurements linked to B2B orders
+  const { data: b2bProcs } = await supabase
+    .from('procurements')
+    .select('b2b_order_id,ordered_qty,ordered_price_per_kg')
+    .limit(500);
+
+  const expByProject = {};
+  for (const e of (projExpenses || [])) {
+    if (!e.project_id) continue;
+    expByProject[e.project_id] = (expByProject[e.project_id] || 0) + parseFloat(e.amount || 0);
+  }
+
+  const procByOrder = {};
+  for (const p of (b2bProcs || [])) {
+    if (!p.b2b_order_id) continue;
+    const amt = round2((parseFloat(p.ordered_qty)||0) * (parseFloat(p.ordered_price_per_kg)||0));
+    procByOrder[p.b2b_order_id] = (procByOrder[p.b2b_order_id] || 0) + amt;
+  }
+
+  for (const order of activeOrders) {
+    const revenue = parseFloat(order.total_value || 0);
+    if (revenue <= 0) continue;
+
+    const expenses = (expByProject[order.id] || 0) + (procByOrder[order.id] || 0);
+    if (expenses <= 0) continue; // No cost data to compare
+
+    const margin = round2(((revenue - expenses) / revenue) * 100);
+
+    if (margin < 0) {
+      findings.push(finding('Revenue', 'critical',
+        `B2B order ${order.order_no} has NEGATIVE margin: ${margin}%`,
+        `Customer: ${order.customer_name}. Revenue: ₹${round2(revenue).toLocaleString('en-IN')}, Costs: ₹${round2(expenses).toLocaleString('en-IN')}. Loss: ₹${round2(expenses - revenue).toLocaleString('en-IN')}. Review pricing and cost structure immediately.`,
+        round2(expenses - revenue)
+      ));
+    } else if (margin < 10) {
+      findings.push(finding('Revenue', 'medium',
+        `B2B order ${order.order_no} has thin margin: ${margin}%`,
+        `Customer: ${order.customer_name}. Revenue: ₹${round2(revenue).toLocaleString('en-IN')}, Costs: ₹${round2(expenses).toLocaleString('en-IN')}. Profit: ₹${round2(revenue - expenses).toLocaleString('en-IN')}. Consider renegotiating pricing for future orders.`,
+        round2(revenue - expenses)
+      ));
+    }
+  }
+
+  return findings;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW: TAX COMPLIANCE GAPS — missing GST on large transactions
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkTaxComplianceGaps() {
+  const findings = [];
+  const ago30 = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+
+  // Vendor bills >₹10K with no GST — possible missed ITC
+  const { data: noGstBills } = await supabase
+    .from('vendor_bills')
+    .select('id,vendor_name,amount,bill_date,category')
+    .gt('amount', 10000)
+    .is('deleted_at', null)
+    .gte('bill_date', ago30)
+    .limit(100);
+
+  const zeroGstBills = (noGstBills || []).filter(b =>
+    !b.gst_amount || parseFloat(b.gst_amount) === 0
+  );
+
+  if (zeroGstBills.length > 0) {
+    const total = zeroGstBills.reduce((s, b) => s + parseFloat(b.amount || 0), 0);
+    findings.push(finding('GST', 'medium',
+      `${zeroGstBills.length} vendor bills >₹10K with zero GST recorded`,
+      `Total: ₹${round2(total).toLocaleString('en-IN')}. Vendors: ${[...new Set(zeroGstBills.map(b => b.vendor_name))].slice(0, 3).join(', ')}. If these vendors are GST-registered, you may be missing ITC claims. Verify if GST was charged and update bill records.`,
+      round2(total)
+    ));
+  }
+
+  // Procurements >₹5K with no GST
+  const { data: noGstProc } = await supabase
+    .from('procurements')
+    .select('id,supplier,commodity_name,ordered_qty,ordered_price_per_kg,gst,date')
+    .gte('date', ago30)
+    .limit(200);
+
+  const zeroGstProc = (noGstProc || []).filter(p =>
+    round2((parseFloat(p.ordered_qty)||0) * (parseFloat(p.ordered_price_per_kg)||0)) > 5000 &&
+    (!p.gst || parseFloat(p.gst) === 0)
+  );
+
+  if (zeroGstProc.length > 0) {
+    const total = zeroGstProc.reduce((s, p) => s + round2((parseFloat(p.ordered_qty)||0) * (parseFloat(p.ordered_price_per_kg)||0)), 0);
+    findings.push(finding('GST', 'medium',
+      `${zeroGstProc.length} procurements >₹5K with no GST recorded`,
+      `Total: ₹${round2(total).toLocaleString('en-IN')}. Commodities: ${[...new Set(zeroGstProc.map(p => p.commodity_name))].slice(0, 3).join(', ')}. If from registered dealers, GST must be captured for ITC claims. If from farmers/unregistered, verify RCM applicability.`,
+      round2(total)
+    ));
+  }
+
+  return findings;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW: SALARY-ATTENDANCE RECONCILIATION — payroll vs attendance vs expenses
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkSalaryAttendanceReconciliation() {
+  const findings = [];
+  const today = new Date();
+  const currentMonth = today.toISOString().slice(0, 7); // YYYY-MM
+  const monthStart = `${currentMonth}-01`;
+  const monthEnd = new Date(today.getFullYear(), today.getMonth() + 1, 0).toISOString().slice(0, 10);
+
+  // Active employees with salary
+  const { data: employees } = await supabase
+    .from('employees')
+    .select('id,name,monthly_salary')
+    .eq('status', 'active');
+
+  if (!employees || employees.length === 0) return findings;
+
+  const expectedSalary = employees.reduce((s, e) => s + parseFloat(e.monthly_salary || 0), 0);
+
+  // Attendance for current month
+  const { data: attendance } = await supabase
+    .from('attendance')
+    .select('employee_id,status')
+    .gte('date', monthStart)
+    .lte('date', monthEnd);
+
+  if (attendance && attendance.length > 0) {
+    const presentByEmp = {};
+    for (const a of attendance) {
+      if (a.status === 'present') {
+        presentByEmp[a.employee_id] = (presentByEmp[a.employee_id] || 0) + 1;
+      } else if (a.status === 'half-day') {
+        presentByEmp[a.employee_id] = (presentByEmp[a.employee_id] || 0) + 0.5;
+      }
+    }
+    const workingDays = today.getDate(); // approximate
+    const lowAttendance = employees.filter(e => {
+      const present = presentByEmp[e.id] || 0;
+      return workingDays > 5 && present < workingDays * 0.5;
+    });
+    if (lowAttendance.length > 0 && expectedSalary > 0) {
+      findings.push(finding('Payroll', 'medium',
+        `${lowAttendance.length} employees with <50% attendance this month — verify salary deductions`,
+        `Employees: ${lowAttendance.slice(0, 3).map(e => e.name).join(', ')}. Ensure proportional salary deduction or leave deduction is applied. Full salary for low attendance inflates payroll costs.`,
+        null
+      ));
+    }
+  }
+
+  // Salary expenses recorded this month
+  const { data: salaryExpenses } = await supabase
+    .from('company_expenses')
+    .select('amount')
+    .ilike('category', '%salary%')
+    .gte('date', monthStart)
+    .lte('date', monthEnd)
+    .is('deleted_at', null);
+
+  const actualSalaryExp = (salaryExpenses || []).reduce((s, e) => s + parseFloat(e.amount || 0), 0);
+
+  if (actualSalaryExp > 0 && expectedSalary > 0) {
+    const diff = Math.abs(actualSalaryExp - expectedSalary) / expectedSalary;
+    if (diff > 0.05) {
+      findings.push(finding('Payroll', 'medium',
+        `Salary expense ₹${round2(actualSalaryExp).toLocaleString('en-IN')} diverges from expected ₹${round2(expectedSalary).toLocaleString('en-IN')} by ${round2(diff * 100)}%`,
+        `Expected: employee salaries total ₹${round2(expectedSalary).toLocaleString('en-IN')}/month. Recorded salary expenses: ₹${round2(actualSalaryExp).toLocaleString('en-IN')}. Investigate — could be missing expense entries, underpayments, or bonus/arrears not categorized correctly.`,
+        round2(Math.abs(actualSalaryExp - expectedSalary))
+      ));
+    }
+  }
+
+  return findings;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NEW: DUPLICATE TRANSACTIONS — expenses and bank transactions
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function checkDuplicateTransactions() {
+  const findings = [];
+  const since60 = new Date(Date.now() - 60 * 86400000).toISOString().slice(0, 10);
+
+  // Duplicate company expenses
+  const { data: expenses } = await supabase
+    .from('company_expenses')
+    .select('id,date,amount,vendor_name,description,category')
+    .gte('date', since60)
+    .is('deleted_at', null)
+    .order('date', { ascending: false })
+    .limit(500);
+
+  if (expenses && expenses.length > 0) {
+    const groups = {};
+    for (const e of expenses) {
+      const key = `${e.date}__${round2(e.amount)}__${(e.vendor_name || e.description || '').toLowerCase().slice(0, 30)}`;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(e);
+    }
+    const dupes = Object.values(groups).filter(g => g.length > 1);
+    if (dupes.length > 0) {
+      const total = dupes.reduce((s, g) => s + parseFloat(g[0].amount || 0) * (g.length - 1), 0);
+      findings.push(finding('BooksQuality', 'high',
+        `${dupes.length} possible duplicate expense entries in last 60 days`,
+        `Potential overstatement: ₹${round2(total).toLocaleString('en-IN')}. Examples: ${dupes.slice(0, 2).map(g => `₹${g[0].amount} ${g[0].vendor_name || g[0].category} on ${g[0].date} (${g.length}x)`).join('; ')}. Verify and remove duplicates to avoid inflated expenses.`,
+        round2(total)
+      ));
+    }
+  }
+
+  // Duplicate bank transactions
+  const { data: bankTxns } = await supabase
+    .from('bank_transactions')
+    .select('id,date,amount,description,type')
+    .gte('date', since60)
+    .order('date', { ascending: false })
+    .limit(500);
+
+  if (bankTxns && bankTxns.length > 0) {
+    const groups = {};
+    for (const t of bankTxns) {
+      const key = `${t.date}__${round2(t.amount)}__${t.type}__${(t.description || '').toLowerCase().slice(0, 30)}`;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(t);
+    }
+    const dupes = Object.values(groups).filter(g => g.length > 1);
+    if (dupes.length > 0) {
+      const total = dupes.reduce((s, g) => s + parseFloat(g[0].amount || 0) * (g.length - 1), 0);
+      findings.push(finding('BooksQuality', 'high',
+        `${dupes.length} possible duplicate bank transactions in last 60 days`,
+        `Total duplicate amount: ₹${round2(total).toLocaleString('en-IN')}. Examples: ${dupes.slice(0, 2).map(g => `₹${g[0].amount} "${g[0].description || 'no desc'}" on ${g[0].date} (${g.length}x)`).join('; ')}. Verify with bank statement and remove duplicate entries.`,
+        round2(total)
+      ));
+    }
+  }
+
+  return findings;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // CLAUDE AI ANALYSIS
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1070,7 +1678,7 @@ async function analyzeWithClaude(allFindings, dashboardData) {
 
     const msg = await anthropic.messages.create({
       model:      'claude-haiku-4-5-20251001',
-      max_tokens: 1000,
+      max_tokens: 2000,
       messages: [{
         role: 'user',
         content: `You are a senior Chartered Accountant (FCA) reviewing the financial health and tax compliance of Sathvam Natural Products Private Limited — a cold-pressed oil manufacturing Private Limited Company registered in Karur, Tamil Nadu, India. The company is incorporated under Companies Act 2013, GST-registered, subject to TDS provisions, employs staff under EPF/ESI, and must comply with MCA ROC filings (AOC-4, MGT-7A, DIR-3 KYC, board meetings) as per Indian law.
@@ -1167,6 +1775,16 @@ async function main() {
     checkExpenses().catch(e   => { console.error('Expenses check failed:', e.message); return []; }),
     checkRevenue().catch(e    => { console.error('Revenue check failed:', e.message); return []; }),
     checkCompliance().catch(e => { console.error('Compliance check failed:', e.message); return []; }),
+    checkDoubleEntry().catch(e => { console.error('DoubleEntry check failed:', e.message); return []; }),
+    checkInventoryValuation().catch(e => { console.error('InventoryValuation check failed:', e.message); return []; }),
+    checkProcurementPaymentMatch().catch(e => { console.error('ProcurementPaymentMatch check failed:', e.message); return []; }),
+    checkRevenueLeakage().catch(e => { console.error('RevenueLeakage check failed:', e.message); return []; }),
+    checkCostAnomalies().catch(e => { console.error('CostAnomalies check failed:', e.message); return []; }),
+    checkCashFlowProjection().catch(e => { console.error('CashFlowProjection check failed:', e.message); return []; }),
+    checkB2BOrderProfitability().catch(e => { console.error('B2BOrderProfitability check failed:', e.message); return []; }),
+    checkTaxComplianceGaps().catch(e => { console.error('TaxComplianceGaps check failed:', e.message); return []; }),
+    checkSalaryAttendanceReconciliation().catch(e => { console.error('SalaryAttendance check failed:', e.message); return []; }),
+    checkDuplicateTransactions().catch(e => { console.error('DuplicateTransactions check failed:', e.message); return []; }),
   ]);
 
   const allFindings = results.flat();
@@ -1209,7 +1827,7 @@ async function main() {
   console.log('--- CA Analysis ---\n' + aiAnalysis + '\n--- END ---\n');
 }
 
-main().catch(e => {
+main().then(() => process.exit(0)).catch(e => {
   console.error('CA Agent fatal error:', e);
   process.exit(1);
 });

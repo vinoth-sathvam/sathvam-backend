@@ -1119,9 +1119,31 @@ router.post('/zoho/sync-bank-transactions', auth, async (req, res) => {
             .eq('id', existing.id);
           updated++;
         } else {
-          await supabase.from('bank_transactions').insert(rec);
-          // Don't adjust balance here — actual balance is set from Zoho at the end
-          inserted++;
+          // Check if this transaction already exists from CSV/manual upload
+          // (same date, amount, type, same bank account — but no zoho_txn_id)
+          // This prevents duplicates when CSV bank statement is uploaded before Zoho sync
+          const { data: csvMatch } = await supabase
+            .from('bank_transactions')
+            .select('id, zoho_txn_id')
+            .eq('bank_account_id', local_account_id)
+            .eq('date', rec.date)
+            .eq('type', rec.type)
+            .eq('amount', rec.amount)
+            .is('zoho_txn_id', null)
+            .limit(1)
+            .maybeSingle();
+
+          if (csvMatch) {
+            // Link the existing CSV entry to this Zoho transaction (don't insert a duplicate)
+            await supabase.from('bank_transactions')
+              .update({ zoho_txn_id: zohoTxnId, reconciled: rec.reconciled, updated_at: new Date().toISOString() })
+              .eq('id', csvMatch.id);
+            updated++;
+          } else {
+            await supabase.from('bank_transactions').insert(rec);
+            // Don't adjust balance here — actual balance is set from Zoho at the end
+            inserted++;
+          }
         }
       }
 
