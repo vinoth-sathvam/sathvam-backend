@@ -29,13 +29,9 @@
 
 const fs               = require('fs');
 const crypto           = require('crypto');
-const { createClient } = require('@supabase/supabase-js');
 const { sendText, toChatId, sendButtons, sendListMessage } = require('../lib/greenapi');
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY,
-);
+const supabase = require('../config/supabase');
 
 const GREENAPI_BASE = 'https://api.green-api.com';
 const PNG_GEN_URL   = process.env.DOCKER_ENV === 'true'

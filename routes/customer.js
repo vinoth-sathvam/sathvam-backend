@@ -379,6 +379,36 @@ router.get('/orders', custAuth, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
+// PUT /api/customer/orders/:id/address — change delivery address (before dispatch)
+router.put('/orders/:id/address', custAuth, async (req, res) => {
+  try {
+    const eHash = hmac(req.customer.email);
+    const { data: order } = await supabase.from('webstore_orders')
+      .select('id, order_no, status, customer, customer_email_hash')
+      .eq('id', req.params.id).eq('customer_email_hash', eHash).maybeSingle();
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    if (!['new', 'confirmed', 'packed', 'pending'].includes(order.status))
+      return res.status(400).json({ error: 'Address can only be changed before dispatch' });
+    const { name, phone, address, city, state, pincode } = req.body;
+    if (!address || !city || !pincode) return res.status(400).json({ error: 'Address, city and pincode are required' });
+    const { decryptCustomer: dc } = require('../config/crypto');
+    const existing = order.customer ? dc(order.customer) : {};
+    const updated = {
+      ...existing,
+      name: name || existing.name,
+      phone: phone || existing.phone,
+      address, city,
+      state: state || existing.state || 'Tamil Nadu',
+      pincode,
+    };
+    const { encryptCustomer: ec } = require('../config/crypto');
+    const { error: upErr } = await supabase.from('webstore_orders')
+      .update({ customer: ec(updated) }).eq('id', order.id);
+    if (upErr) return res.status(500).json({ error: upErr.message });
+    res.json({ success: true, customer: updated, order_no: order.order_no });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 // POST /api/customer/update
 router.post('/update', custAuth, async (req, res) => {
   try {

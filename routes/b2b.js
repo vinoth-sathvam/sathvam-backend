@@ -307,6 +307,7 @@ b2bOrders.put('/:id/stage', auth, requireRole('admin','manager','ceo'), async (r
             notes: `Auto-deducted on B2B ${stage} — ${orderNo}`,
             batch_ref: orderNo, created_by: 'system',
             created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
+            b2b_order_id: req.params.id,
           });
 
           if (i.product_id) {
@@ -317,6 +318,7 @@ b2bOrders.put('/:id/stage', auth, requireRole('admin','manager','ceo'), async (r
               total_value: gap * (parseFloat(i.unit_price) || 0),
               channel: 'b2b', reference: orderNo,
               notes: `${stage} — B2B ${orderNo}`,
+              b2b_order_id: req.params.id,
             });
           }
         }
@@ -468,6 +470,38 @@ b2bOrders.put('/:id', auth, requireRole('admin','manager'), async (req, res) => 
       rows: changed,
       note: null,
     }));
+  }
+
+  // Stock deduction when stage changes to a shipping stage (same logic as /:id/stage endpoint)
+  const POST_SHIP = ['shipped','sailing','in_transit','arrived_at_port','customs_clearance','delivered'];
+  if (o.stage && POST_SHIP.includes(o.stage)) {
+    setImmediate(async () => {
+      try {
+        const { data: orderItems } = await supabase.from('b2b_order_items').select('*').eq('order_id', req.params.id);
+        const { data: orderMeta }  = await supabase.from('b2b_orders').select('order_no').eq('id', req.params.id).single();
+        if (!orderItems?.length) return;
+        const orderNo = orderMeta?.order_no || req.params.id;
+        const today   = new Date().toISOString().slice(0, 10);
+        const { data: existingFG } = await supabase.from('finished_goods').select('product_name,qty').eq('type','out').eq('batch_ref', orderNo);
+        const existingMap = {};
+        for (const r of (existingFG || [])) existingMap[r.product_name] = (existingMap[r.product_name]||0) + parseFloat(r.qty||0);
+        const fgRows = [], ledgerRows = [];
+        for (const i of orderItems) {
+          const pname = i.product_name || 'Unknown';
+          const needed = parseFloat(i.shipped_qty != null ? i.shipped_qty : i.qty) || 1;
+          const already = existingMap[pname] || 0;
+          const gap = needed - already;
+          if (gap <= 0) continue;
+          fgRows.push({ product_name: pname, category: 'other', unit: 'pcs', qty: gap, type: 'out', date: today, notes: `Auto-deducted on B2B ${o.stage} — ${orderNo}`, batch_ref: orderNo, created_by: 'system', created_at: new Date().toISOString(), updated_at: new Date().toISOString(), b2b_order_id: req.params.id });
+          if (i.product_id) {
+            ledgerRows.push({ product_id: i.product_id, product_name: pname, date: today, type: 'out', qty: gap, unit: i.unit || 'pcs', rate: parseFloat(i.unit_price) || 0, total_value: gap * (parseFloat(i.unit_price) || 0), channel: 'b2b', reference: orderNo, notes: `${o.stage} — B2B ${orderNo}`, b2b_order_id: req.params.id });
+          }
+        }
+        if (fgRows.length) await supabase.from('finished_goods').insert(fgRows);
+        if (ledgerRows.length) await supabase.from('stock_ledger').insert(ledgerRows);
+        if (fgRows.length) console.log(`[B2B-STOCK] Generic PUT deducted ${fgRows.length} items for ${orderNo} on ${o.stage}`);
+      } catch (e) { console.error('[B2B-STOCK] Generic PUT deduct error:', e.message); }
+    });
   }
 });
 b2bOrders.delete('/:id', auth, requireRole('admin'), async (req, res) => {

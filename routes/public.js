@@ -456,8 +456,9 @@ router.post('/cart', async (req, res) => {
       await supabase.from('abandoned_carts').delete().eq('session_id', sessionId);
       return res.json({ ok: true });
     }
+    const cart_total = items.reduce((s, i) => s + (parseFloat(i.price || i.website_price || 0) * (parseInt(i.qty, 10) || 1)), 0);
     await supabase.from('abandoned_carts').upsert({
-      session_id: sessionId, items, updated_at: new Date().toISOString(),
+      session_id: sessionId, items, cart_total, updated_at: new Date().toISOString(),
     }, { onConflict: 'session_id' });
     res.json({ ok: true });
   } catch { res.json({ ok: false }); }

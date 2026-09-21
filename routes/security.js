@@ -904,6 +904,17 @@ router.get('/metrics', ...adminOrCeo, async (req, res) => {
   }
 });
 
+// ── GET /api/security/monitor-metrics — proxy full monitor metrics (host) ─────
+router.get('/monitor-metrics', ...adminOrCeo, async (req, res) => {
+  try {
+    const r = await fetch('http://host.docker.internal:9191/metrics');
+    const data = await r.json();
+    res.json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── GET /api/security/deploy-status — proxy to monitor-api (host) ────────────
 // Backend runs in Docker — no git/.git or systemctl available inside container.
 // Monitor API runs on host (port 9191) and has full access to both.

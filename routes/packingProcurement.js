@@ -103,6 +103,7 @@ router.post('/', auth, requireRole('admin','manager'), async (req, res) => {
       bill_no:      bill_no || '',
       payable_id:   null,
       created_by:   req.user?.email || '',
+      b2b_order_id: req.body.b2bOrderId || req.body.b2b_order_id || null,
     }).select().single();
 
     if (error) return res.status(400).json({ error: error.message });

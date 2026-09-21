@@ -30,6 +30,7 @@ const STATUS_STYLES = {
   rejected:         { color: '#7f1d1d', bg: '#fecaca', label: 'Order Rejected',    labelTa: 'நிராகரிக்கப்பட்டது',    emoji: '❌' },
   refund_initiated: { color: '#5b21b6', bg: '#ede9fe', label: 'Refund Initiated',  labelTa: 'பணம் திரும்பும்',         emoji: '💸' },
   refunded:         { color: '#3730a3', bg: '#e0e7ff', label: 'Refund Completed',  labelTa: 'பணம் திரும்பியது',        emoji: '✅' },
+  partial_refund:   { color: '#ea580c', bg: '#fff7ed', label: 'Partial Refund',    labelTa: 'பகுதி பணத் திரும்பல்',    emoji: '💸' },
 };
 
 function buildStatusCardHtml(order, newStatus, opts = {}) {
@@ -615,6 +616,8 @@ async function sendStatusWhatsApp(order, newStatus, cancelReason) {
     dispatched: 'order_shipped', shipped: 'order_shipped',
     delivered: 'order_delivered',
     cancelled: 'order_cancelled', rejected: 'order_cancelled',
+    refunded: 'order_cancelled', refund_initiated: 'order_cancelled',
+    partial_refund: 'order_cancelled',
   }[newStatus];
   if (toggleKey && await isAutomationDisabled(toggleKey)) return;
 
@@ -832,6 +835,23 @@ async function sendStatusWhatsApp(order, newStatus, cancelReason) {
       `The amount should now reflect in your account. 🙏`,
       `${footer}`,
     ].join('\n'),
+
+    partial_refund: [
+      `💸 *பகுதி பணத் திரும்பப் பெறுதல் — ${orderNo}*`,
+      ``,
+      `வணக்கம் ${name},`,
+      ``,
+      `உங்கள் ஆர்டரின் சில பொருட்கள் ரத்து செய்யப்பட்டு பணம் திரும்ப அனுப்பப்படும்.`,
+      `5–7 வேலை நாட்களில் உங்கள் கணக்கில் வரும்.`,
+      ``,
+      `━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+      ``,
+      `💸 *Partial Refund — ${orderNo}*`,
+      ``,
+      `Dear ${name}, some items in your order have been cancelled.`,
+      `The refund will reach your account within 5–7 business days.`,
+      `${footer}`,
+    ].join('\n'),
   };
 
   const caption = msgMap[newStatus];
@@ -849,15 +869,46 @@ async function sendStatusWhatsApp(order, newStatus, cancelReason) {
     }
 
     // ── 2. Send image + caption (or plain text fallback) ─────────────────────
-    await sendViaBotSailor(phone, caption, cardUrl || undefined);
+    const sent = await sendViaBotSailor(phone, caption, cardUrl || undefined);
+
+    // ── 2b. Log to whatsapp_messages so it appears in admin WA panel ─────────
+    if (sent !== false) {
+      try {
+        await supabase.from('whatsapp_messages').insert({
+          phone,
+          contact_name: name || 'Customer',
+          direction:    'outbound',
+          type:         cardUrl ? 'image' : 'text',
+          content:      caption,
+          status:       'sent',
+          timestamp:    new Date().toISOString(),
+          sent_by:      'bot',
+          media_url:    cardUrl || null,
+        });
+      } catch (logErr) { console.error('WA log to messages error:', logErr.message); }
+    }
 
     // ── 3. For confirmed/dispatched/delivered — send invoice PDF as follow-up ─
     if (['confirmed', 'dispatched', 'delivered'].includes(newStatus)) {
       try {
         const pdfUrl = await generateInvoicePdfUrl(order);
         if (pdfUrl) {
-          const invoiceCaption = `🧾 *Invoice — ${orderNo}*\n\nவிலைப்பட்டியல் / Your tax invoice is attached below.\n\n📥 Download: ${pdfUrl}\n\n🌐 sathvam.in · 📞 +91 70923 77092`;
-          await sendViaBotSailor(phone, invoiceCaption);
+          const invoiceCaption = `🧾 *Invoice — ${orderNo}*\n\nவிலைப்பட்டியல் / Your tax invoice is attached below.\n\n🌐 sathvam.in · 📞 +91 70923 77092`;
+          await gaSendFile(phone, pdfUrl, `Invoice-${orderNo}.pdf`, invoiceCaption, { priority: true });
+
+          // Log to whatsapp_messages
+          try {
+            await supabase.from('whatsapp_messages').insert({
+              phone,
+              contact_name: `${(order.customer||{}).name || ''} | ${orderNo}`,
+              direction:    'outbound',
+              type:         'document',
+              content:      invoiceCaption,
+              status:       'sent',
+              timestamp:    new Date().toISOString(),
+              sent_by:      `invoice:${orderNo}`,
+            });
+          } catch (logErr) { console.error('Invoice WA log error:', logErr.message); }
         }
       } catch (invErr) {
         console.error('Invoice follow-up error:', invErr.message);
@@ -1817,3 +1868,6 @@ router.post('/:id/addon-merge', auth, async (req, res) => {
 module.exports = router;
 module.exports.sendCustomerInvoice = sendCustomerInvoice;
 module.exports.sendInvoiceWhatsApp = sendInvoiceWhatsApp;
+module.exports.sendStatusWhatsApp  = sendStatusWhatsApp;
+module.exports.sendStatusEmail     = sendStatusEmail;
+module.exports.decryptOrder        = decryptOrder;

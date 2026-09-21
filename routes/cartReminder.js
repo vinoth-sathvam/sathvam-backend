@@ -17,6 +17,7 @@ const express    = require('express');
 const fs         = require('fs');
 const { auth }   = require('../middleware/auth');
 const { toChatId, isAutomationDisabled } = require('../lib/greenapi');
+const supabase   = require('../config/supabase');
 
 const router     = express.Router();
 
@@ -77,6 +78,65 @@ async function runGenerator(data, type) {
   return json.path;
 }
 
+// ── Helper: fetch current cart from DB with live product prices ──────────────
+async function refreshCartForPhone(phone) {
+  try {
+    if (!phone) return null;
+    const clean = String(phone).replace(/\D/g, '');
+    const last10 = clean.length > 10 ? clean.slice(-10) : clean;
+
+    // Find customer by phone
+    const { data: customers } = await supabase
+      .from('customers')
+      .select('id')
+      .like('phone', `%${last10}`)
+      .limit(1);
+    if (!customers?.length) return null;
+
+    const sessionId = 'cust_' + customers[0].id;
+    const { data: cartRow } = await supabase
+      .from('abandoned_carts')
+      .select('items')
+      .eq('session_id', sessionId)
+      .maybeSingle();
+    if (!cartRow?.items?.length) return null;
+
+    // Fetch current prices
+    const productIds = cartRow.items.map(i => i.id).filter(Boolean);
+    if (!productIds.length) return null;
+
+    const { data: products } = await supabase
+      .from('products')
+      .select('id, website_price, price, offer_price, offer_ends_at, name')
+      .in('id', productIds);
+    if (!products?.length) return null;
+
+    const priceMap = {};
+    for (const p of products) priceMap[p.id] = p;
+
+    let total = 0;
+    const freshItems = cartRow.items.map(item => {
+      const dbProd = priceMap[item.id];
+      if (!dbProd) return { product: item.name || 'Item', qty: item.qty || 1 };
+      let currentPrice = parseFloat(dbProd.website_price || dbProd.price || 0);
+      if (dbProd.offer_price && dbProd.offer_ends_at) {
+        const offerEnd = new Date(dbProd.offer_ends_at);
+        if (offerEnd > new Date() && parseFloat(dbProd.offer_price) < currentPrice) {
+          currentPrice = parseFloat(dbProd.offer_price);
+        }
+      }
+      const qty = item.qty || 1;
+      total += currentPrice * qty;
+      return { product: dbProd.name || item.name, qty };
+    });
+
+    return { items: freshItems, cart_value: Math.round(total) };
+  } catch (e) {
+    console.error('[cart-reminder] refreshCartForPhone error:', e.message);
+    return null;
+  }
+}
+
 // ── POST /api/cart-reminder/send ──────────────────────────────────────────────
 router.post('/send', auth, async (req, res) => {
   if (await isAutomationDisabled('checkout_recovery')) return res.status(403).json({ error: 'checkout_recovery automation is disabled' });
@@ -92,13 +152,24 @@ router.post('/send', auth, async (req, res) => {
                                         return res.status(400).json({ error: 'items must be a non-empty array' });
 
   try {
+    // Refresh cart value from DB with current product prices
+    let freshItems = items;
+    let freshCartValue = cart_value;
+    if (!isNudge) {
+      const freshData = await refreshCartForPhone(phone);
+      if (freshData) {
+        freshItems    = freshData.items;
+        freshCartValue = freshData.cart_value;
+      }
+    }
+
     const caption = isNudge
       ? `🌿 *SATHVAM*\n_Pure. Cold-Pressed. Honest._\n\nHi *${name}*! 👋\n\nWe noticed you're exploring our store — great taste! 🌾\n\nNeed help choosing the right oil or have any questions? Just reply here, we'd love to help.\n\n👉 *Continue shopping:*\nhttps://www.sathvam.in/products\n\n🙏 Team Sathvam`
       : `🌿 *SATHVAM*\n_Pure. Cold-Pressed. Honest._\n\nDear *${name}*, your cart is saved and waiting for you 🛒\n\n👉 *Complete your order:*\nhttps://www.sathvam.in/cart\n\nReply here anytime — we're happy to help! 🙏`;
 
-    if (!isNudge || (Array.isArray(items) && items.length)) {
+    if (!isNudge || (Array.isArray(freshItems) && freshItems.length)) {
       // Generate branded PNG + send with image
-      const pngPath = await runGenerator({ name, items: items || [], cart_value: cart_value || 0 }, 'cart');
+      const pngPath = await runGenerator({ name, items: freshItems || [], cart_value: freshCartValue || 0 }, 'cart');
       const msgId   = await sendPngViaGreenApi(phone, pngPath, caption);
       return res.json({ ok: true, idMessage: msgId });
     }

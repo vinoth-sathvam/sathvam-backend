@@ -7,11 +7,10 @@
 
 const express    = require('express');
 const router     = express.Router();
-const { createClient } = require('@supabase/supabase-js');
 const Anthropic  = require('@anthropic-ai/sdk');
 const { auth }   = require('../middleware/auth');
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const supabase = require('../config/supabase');
 const claude   = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // Returns today's date in IST (YYYY-MM-DD)

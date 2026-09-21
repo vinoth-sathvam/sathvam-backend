@@ -26,13 +26,12 @@
 
 const express   = require('express');
 const Anthropic  = require('@anthropic-ai/sdk');
-const { createClient } = require('@supabase/supabase-js');
 const { sendText, sendFile, toChatId } = require('../lib/greenapi');
 const { handleBotMessage } = require('./waOrdering');
 const { decrypt } = require('../config/crypto');
 
 const router    = express.Router();
-const supabase  = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const supabase  = require('../config/supabase');
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const AI_REPLIES_ENABLED = process.env.WHATSAPP_AI_REPLIES !== 'false';
@@ -641,27 +640,38 @@ router.post('/webhook', async (req, res) => {
       return;
     }
 
-    // Only process incoming text messages
+    // Only process incoming messages
     console.log('[wa-debug] webhook type:', body.typeWebhook, 'msgType:', body.messageData?.typeMessage);
     if (body.typeWebhook !== 'incomingMessageReceived') return;
 
     const typeMessage = body.messageData?.typeMessage;
-    const ACCEPTED_TYPES = ['textMessage', 'extendedTextMessage', 'buttonsResponseMessage', 'listResponseMessage', 'templateButtonReplyMessage'];
-    if (typeMessage && !ACCEPTED_TYPES.includes(typeMessage)) return;
+    const TEXT_TYPES = ['textMessage', 'extendedTextMessage', 'buttonsResponseMessage', 'listResponseMessage', 'templateButtonReplyMessage'];
+    const MEDIA_TYPES = ['imageMessage', 'videoMessage', 'documentMessage', 'audioMessage', 'stickerMessage'];
 
     const rawChatId = body.senderData?.chatId || body.senderData?.sender || '';
     const phone = rawChatId.replace('@c.us', '').replace(/\D/g, '');
     if (!phone) return;
 
     // Extract text from all supported message types
-    const last_message =
+    let last_message =
       body.messageData?.textMessageData?.textMessage ||
       body.messageData?.extendedTextMessageData?.text ||
       body.messageData?.buttonsResponseMessage?.selectedButtonId ||
       body.messageData?.listResponseMessage?.listResponseRow?.rowId ||
       body.messageData?.templateButtonReplyMessage?.selectedId || '';
-    console.log('[wa-debug] phone:', phone, 'type:', typeMessage, 'msg:', JSON.stringify(last_message));
-    if (!last_message.trim()) return;
+
+    // Handle media messages — extract caption or describe the media type
+    let isMediaMsg = false;
+    if (!last_message.trim() && MEDIA_TYPES.includes(typeMessage)) {
+      isMediaMsg = true;
+      const caption = body.messageData?.imageMessageData?.caption ||
+        body.messageData?.videoMessageData?.caption ||
+        body.messageData?.documentMessageData?.caption || '';
+      last_message = caption || `[Customer sent a ${typeMessage.replace('Message','')}]`;
+    }
+
+    console.log('[wa-debug] phone:', phone, 'type:', typeMessage, 'msg:', JSON.stringify(last_message), 'media:', isMediaMsg);
+    if (!last_message.trim() && !TEXT_TYPES.includes(typeMessage) && !MEDIA_TYPES.includes(typeMessage)) return;
 
     const subscriber_name = body.senderData?.senderName || body.senderData?.chatName || null;
 
@@ -794,52 +804,78 @@ router.post('/webhook', async (req, res) => {
     }
     if (custCtx.coupon) custInfo += `\n- Personal coupon ready: ${custCtx.coupon} (5% off) — offer this strategically when they show interest or hesitate on price`;
 
+    // ── Order lookup for AI context ─────────────────────────────────────────
+    // If customer mentions an order number, fetch its details
+    let orderLookup = '';
+    const orderMatch = last_message.match(/SA\d{4}[A-Z]{3}\d{2}-\d{2}|SAT-\d{4}-\d+/i);
+    if (orderMatch) {
+      try {
+        const { data: oData } = await supabase.from('webstore_orders')
+          .select('order_no,status,total,date,items,tracking_no,courier')
+          .eq('order_no', orderMatch[0].toUpperCase()).maybeSingle();
+        if (oData) {
+          const items = (oData.items||[]).map(i=>`${i.qty}× ${i.name||i.productName}`).join(', ');
+          orderLookup = `\n\nORDER LOOKUP RESULT (share with customer):\n- Order: ${oData.order_no}\n- Date: ${oData.date}\n- Status: ${oData.status}\n- Total: ₹${oData.total}\n- Items: ${items}`;
+          if (oData.tracking_no) orderLookup += `\n- Tracking: ${oData.tracking_no} (${oData.courier||'courier'})`;
+        }
+      } catch {}
+    }
+
     const aiResponse = await anthropic.messages.create({
       model:      'claude-sonnet-4-6',
       max_tokens: 500,
-      system: `You are Sathvam's WhatsApp sales assistant — friendly, persuasive, and goal-oriented. Your #1 job is to CONVERT conversations into orders on sathvam.in.
+      system: `You are Sathvam's WhatsApp customer support & sales assistant — intelligent, warm, and solution-oriented.
+
+YOUR ROLE:
+1. CUSTOMER SUPPORT — resolve queries about orders, delivery, refunds, products quickly
+2. SALES — help customers discover products and place orders on sathvam.in
+3. ESCALATE — if you cannot solve a problem, say "Let me connect you with our team" and add [ESCALATE] at the end of your reply
 
 PERSONALITY:
-- Warm, personal, enthusiastic — like a knowledgeable friend who genuinely cares about their health
-- Use the customer's name naturally (if known)
-- Mix English and Tamil naturally (many customers are Tamil-speaking)
-- Use emojis sparingly but effectively (1-2 per message, not every line)
+- Warm, personal, empathetic — like a helpful friend who works at Sathvam
+- Use customer's name naturally (if known)
+- Mix English and Tamil naturally (many customers speak Tamil)
+- Use emojis sparingly (1-2 per message)
 
-SALES TACTICS (use naturally, not robotically):
-- UNDERSTAND NEED FIRST: Ask what they're looking for before recommending
-- HEALTH BENEFITS: Connect products to real health benefits (cold-pressed = no chemicals, retains nutrients)
-- SOCIAL PROOF: "This is our bestseller" / "Most families reorder this monthly"
-- URGENCY: "We press in small batches — stock moves fast" (only if true/low stock)
-- UPSELL: Suggest complementary products naturally ("Most people pair sesame oil with our turmeric powder")
-- BUNDLE VALUE: If cart > ₹2000, mention free delivery; if close, nudge them to add one more item
-- COUPON STRATEGY: Don't offer coupon immediately. First build value. Offer the coupon when:
-  * Customer hesitates on price ("let me think", "too expensive", "discount?")
-  * Customer is close to buying but needs a nudge
-  * Customer asks for a deal/offer
-- REORDER: For returning customers, ask if they need a refill of their usual items
-- CLOSE THE DEAL: Always end with a clear call-to-action → "Shall I send you the direct link?" / "Add to cart here: sathvam.in"
-- OBJECTION HANDLING:
-  * "Too expensive" → Explain value (cold-pressed vs refined = 10x healthier, lasts longer since you use less)
-  * "I'll think about it" → "No rush! But this batch was pressed just [X] days ago — freshness matters for nutrients 🌿"
-  * "Is it organic?" → Yes, FSSAI certified, no chemicals, traditional wooden press (chekku/ghani)
-  * "Delivery?" → Free above ₹2500, otherwise ₹50-80 depending on location. Delivered in 3-5 days.
+CUSTOMER SUPPORT:
+- Order status: If customer asks about their order, use the ORDER LOOKUP data provided. Share status clearly.
+- Payment issues: "I paid but no order" → Reassure: "Don't worry! Our system may take a few minutes. If still missing, our team will check Razorpay and create your order. Your money is safe."
+- Delivery: Most orders deliver in 3-5 business days. Free shipping above ₹2500.
+- Refund: Refunds take 5-7 business days to process back to the original payment method.
+- Address change: Customer can change delivery address from My Orders on sathvam.in (before dispatch).
+- Returns: Within 7 days of delivery. Contact us with order number and reason.
+- Product quality: All our products are FSSAI certified, cold-pressed (chekku/ghani), no chemicals.
+
+SALES (when appropriate):
+- Understand need first before recommending
+- Health benefits: cold-pressed = no chemicals, retains nutrients
+- Suggest complementary products naturally
+- Coupon: offer when customer hesitates or asks for discount
+- Free delivery above ₹2500
+- Shop link: https://sathvam.in
+
+ESCALATION RULES — Add [ESCALATE] at the end of your message when:
+- Customer reports a payment captured but no order (after reassuring them)
+- Complaint about wrong/damaged product
+- Refund request for a specific order
+- Customer is angry or frustrated after 2+ messages
+- You genuinely don't know the answer
+- Customer explicitly asks to speak to a person/manager
 
 COUPON CODES:
-- Spin wheel coupons are always active: SPIN5 (5%), SPIN8 (8%), SPIN10 (10%), SPIN15 (15%), SPINSHIP (free shipping)
-- Customer's personal coupon (if shown below): offer when strategically right
-- If coupon isn't working, tell them to type the code in this chat to verify, or try at checkout
-- NEVER say "we don't have active coupon codes"
+- SPIN5 (5%), SPIN8 (8%), SPIN10 (10%), SPIN15 (15%), SPINSHIP (free shipping)
+- Customer's personal coupon (if available below)
 
 RULES:
-- Keep messages SHORT (4-6 lines max). This is WhatsApp, not email.
-- Never make up prices — use only what's in the product list below
-- If asked about order tracking: tell them to reply TRACK <order number>
-- If you genuinely can't help, offer to connect with team: +91 70923 77092
-- Don't be pushy or fake — be genuinely helpful. If someone clearly isn't interested, respect that gracefully.
-- Always include the shop link when recommending products: https://sathvam.in
+- Keep messages SHORT (4-6 lines max). This is WhatsApp.
+- Never make up prices — use only the product list below
+- Never make up order status — use only ORDER LOOKUP data
+- If customer sent an image/screenshot, acknowledge it and ask them to describe the issue
+- Always be helpful. Even if you can't solve it, show you care.
 
 Store: https://sathvam.in
-${custInfo}
+Contact: +91 70923 77092
+${custInfo}${orderLookup}
 
 CURRENT PRODUCTS:
 ${productCtx}`,
@@ -849,8 +885,12 @@ ${productCtx}`,
       ],
     });
 
-    const reply = aiResponse.content[0]?.text || '';
+    let reply = aiResponse.content[0]?.text || '';
     if (!reply) return;
+
+    // Check for escalation flag
+    const shouldEscalate = reply.includes('[ESCALATE]');
+    reply = reply.replace(/\[ESCALATE\]/g, '').trim();
 
     await sendText(phone, reply);
     await storeMessage({
@@ -864,8 +904,32 @@ ${productCtx}`,
       { role: 'assistant', content: reply },
     ]);
 
+    // Escalate to admin if AI flagged it
+    if (shouldEscalate) {
+      const adminPhones = [process.env.WA_ADMIN_PHONE1, process.env.WA_NOTIFY_TO]
+        .filter(Boolean).map(n => n.replace(/\D/g, '')).filter((v, i, a) => v && a.indexOf(v) === i);
+      const escalationMsg =
+        `🚨 *AI Escalation — Customer Needs Help*\n\n` +
+        `👤 ${subscriber_name || '—'}\n📞 ${phone}\n\n` +
+        `💬 Customer said:\n_"${last_message.substring(0, 200)}"_\n\n` +
+        `🤖 AI replied:\n_"${reply.substring(0, 200)}"_\n\n` +
+        `➡️ Please review and respond in WhatsApp tab.`;
+      for (const ap of adminPhones) {
+        try { await sendText(ap, escalationMsg); } catch {}
+      }
+      console.log(`[wa-ai] Escalated to admin: phone=${phone} msg="${last_message.substring(0,50)}"`);
+    }
+
   } catch (e) {
     console.error('Green API webhook error:', e.message);
+    // Send a fallback message so customer doesn't feel ignored
+    try {
+      const phone = (req.body?.senderData?.chatId || '').replace('@c.us', '').replace(/\D/g, '');
+      if (phone) {
+        await sendText(phone, `🙏 Thank you for reaching out to Sathvam!\n\nOur team will get back to you shortly. For urgent queries, call us at +91 70923 77092.`);
+        await storeMessage({ phone, direction: 'outbound', type: 'text', content: 'Fallback: team will respond', status: 'sent', sent_by: 'bot', timestamp: new Date().toISOString() });
+      }
+    } catch {}
   }
 });
 

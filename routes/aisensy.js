@@ -26,10 +26,8 @@
 
 const express   = require('express');
 const Anthropic  = require('@anthropic-ai/sdk');
-const { createClient } = require('@supabase/supabase-js');
-
 const router    = express.Router();
-const supabase  = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const supabase  = require('../config/supabase');
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 const AISENSY_API_KEY  = () => process.env.AISENSY_API_KEY;

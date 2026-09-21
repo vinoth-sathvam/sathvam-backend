@@ -205,6 +205,7 @@ app.use('/api/engagement',        require('./routes/engagement'));    // Custome
 app.use('/api/flash-offer',       require('./routes/flashOffer'));    // Daily flash offer WhatsApp (4-5 PM / 9-11 PM)
 app.use('/api/customer-delight',  require('./routes/customerDelight')); // Customer delight hub (batch-notify, followup, birthday)
 app.use('/api/eway-bill',         require('./routes/ewayBill'));          // E-Way Bill generation via Zoho Books
+app.use('/api/gst-filing',        require('./routes/gstFiling'));          // GST filing: GSTR-1/3B/9, ITC reconciliation, challans
 
 // ── Finance Intelligence — Universal Ledger + CFO + CCO ───────────────────────
 app.use('/api/ledger',            require('./routes/ledger'));

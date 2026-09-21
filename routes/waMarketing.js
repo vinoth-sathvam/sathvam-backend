@@ -4,12 +4,11 @@
  * Mounted at /api/wa-marketing
  */
 const express = require('express');
-const { createClient } = require('@supabase/supabase-js');
 const { auth } = require('../middleware/auth');
 const { sendText: gaSendText, sendFile: gaSendFile, isAutomationDisabled } = require('../lib/greenapi');
 const { decryptCustomer, decrypt } = require('../config/crypto');
 const router = express.Router();
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const supabase = require('../config/supabase');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 

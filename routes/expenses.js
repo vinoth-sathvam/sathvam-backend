@@ -117,6 +117,7 @@ router.post('/', auth, requireRole('admin', 'manager'), async (req, res) => {
     notes:        notes        || '',
     created_by:   req.user?.name || req.user?.email || '',
     updated_at:   new Date().toISOString(),
+    b2b_order_id: req.body.b2bOrderId || req.body.b2b_order_id || null,
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
 

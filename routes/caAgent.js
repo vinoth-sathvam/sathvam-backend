@@ -1454,4 +1454,710 @@ router.post('/run', auth, roleGuard, async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /ca-agent/live-monitor — Real-time financial health score (0-100)
+// Fast endpoint, no AI call. Returns in <500ms.
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/live-monitor', auth, roleGuard, async (req, res) => {
+  try {
+    const r2 = n => Math.round((parseFloat(n) || 0) * 100) / 100;
+    const now = new Date();
+    const today = now.toISOString().slice(0, 10);
+    const d30 = new Date(now - 30 * 86400000).toISOString().slice(0, 10);
+    const d90 = new Date(now - 90 * 86400000).toISOString().slice(0, 10);
+
+    const [bankR, apR, arB2bR, arWsR, findingsR, unreconR, revenueR] = await Promise.all([
+      supabase.from('bank_accounts').select('current_balance').eq('is_active', true),
+      supabase.from('vendor_bills').select('amount,gst_amount,paid_amount').in('status', ['overdue']).is('deleted_at', null),
+      supabase.from('b2b_orders').select('total_value,stage,created_at').not('stage', 'in', '("delivered","cancelled","invoice_paid")'),
+      supabase.from('webstore_orders').select('total,status,date').in('status', ['confirmed','processing']),
+      supabase.from('ca_agent_findings').select('severity').eq('resolved', false),
+      supabase.from('bank_transactions').select('id').eq('reconciled', false).gte('date', d30),
+      supabase.from('webstore_orders').select('total').eq('payment_status', 'paid').gte('date', d30),
+    ]);
+
+    const cashBalance = r2((bankR.data || []).reduce((s, a) => s + (a.current_balance || 0), 0));
+    const apOverdue = r2((apR.data || []).reduce((s, b) => s + (b.amount || 0) + (b.gst_amount || 0) - (b.paid_amount || 0), 0));
+    const arB2b = r2((arB2bR.data || []).reduce((s, o) => s + (o.total_value || 0), 0));
+    const arB2bOld = (arB2bR.data || []).filter(o => o.created_at && o.created_at < d90).length;
+    const arWs = r2((arWsR.data || []).reduce((s, o) => s + (o.total || 0), 0));
+    const unreconCount = (unreconR.data || []).length;
+    const revenue30d = r2((revenueR.data || []).reduce((s, o) => s + (o.total || 0), 0));
+
+    const findings = findingsR.data || [];
+    const criticalCount = findings.filter(f => f.severity === 'critical').length;
+    const highCount = findings.filter(f => f.severity === 'high').length;
+    const mediumCount = findings.filter(f => f.severity === 'medium').length;
+
+    // Compute score 0-100
+    let score = 100;
+    const deductions = [];
+
+    if (criticalCount > 0) { const d = Math.min(criticalCount * 15, 45); score -= d; deductions.push({ label: `${criticalCount} critical findings`, points: -d }); }
+    if (highCount > 0) { const d = Math.min(highCount * 5, 25); score -= d; deductions.push({ label: `${highCount} high findings`, points: -d }); }
+    if (mediumCount > 0) { const d = Math.min(mediumCount * 2, 10); score -= d; deductions.push({ label: `${mediumCount} medium findings`, points: -d }); }
+    if (cashBalance < 50000) { score -= 20; deductions.push({ label: 'Cash below ₹50K', points: -20 }); }
+    else if (cashBalance < 200000) { score -= 10; deductions.push({ label: 'Cash below ₹2L', points: -10 }); }
+    if (apOverdue > 100000) { score -= 10; deductions.push({ label: 'AP overdue > ₹1L', points: -10 }); }
+    if (unreconCount > 10) { score -= 10; deductions.push({ label: `${unreconCount} unreconciled txns`, points: -10 }); }
+    if (arB2bOld > 0) { score -= 10; deductions.push({ label: `${arB2bOld} AR entries 90+ days`, points: -10 }); }
+
+    score = Math.max(0, Math.min(100, score));
+    const grade = score >= 90 ? 'A' : score >= 75 ? 'B' : score >= 60 ? 'C' : score >= 40 ? 'D' : 'F';
+
+    res.json({
+      score, grade, deductions,
+      components: {
+        cash_balance: cashBalance,
+        ap_overdue: apOverdue,
+        ar_b2b: arB2b,
+        ar_webstore: arWs,
+        revenue_30d: revenue30d,
+        unreconciled_txns: unreconCount,
+        critical_findings: criticalCount,
+        high_findings: highCount,
+        medium_findings: mediumCount,
+      },
+      generated_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error('[live-monitor]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /ca-agent/order-profitability/:orderId — Full P&L for one B2B order
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/order-profitability/:orderId', auth, roleGuard, async (req, res) => {
+  try {
+    const orderId = req.params.orderId;
+    const r2 = n => Math.round((parseFloat(n) || 0) * 100) / 100;
+
+    // 1. Order + items
+    const [orderR, itemsR] = await Promise.all([
+      supabase.from('b2b_orders').select('*').eq('id', orderId).single(),
+      supabase.from('b2b_order_items').select('*').eq('order_id', orderId),
+    ]);
+    const order = orderR.data;
+    if (!order) return res.status(404).json({ error: 'Order not found' });
+    const items = itemsR.data || [];
+
+    // 2. Linked project
+    const { data: projRows } = await supabase.from('projects').select('id,project_name,status').eq('b2b_order_id', orderId);
+    const project = (projRows || [])[0] || null;
+
+    // 3. Project full data from settings (cc, expenses, financials)
+    let projectData = null;
+    if (project) {
+      const { data: settingsRow } = await supabase.from('settings').select('value').eq('key', `project_full_${project.id}`).maybeSingle();
+      projectData = settingsRow?.value || null;
+    }
+
+    // 4. Procurements linked by FK
+    const { data: procFK } = await supabase.from('procurements')
+      .select('id,commodity_name,supplier,ordered_qty,received_qty,ordered_price_per_kg,total_amount,gst,order_date,status')
+      .eq('b2b_order_id', orderId);
+
+    // 5. Fallback: match procurements by date range + commodity for legacy data
+    let procMatched = [];
+    if ((procFK || []).length === 0 && order.created_at) {
+      const orderDate = (order.created_at || order.date || '').slice(0, 10);
+      const matchEnd = new Date(new Date(orderDate).getTime() + 60 * 86400000).toISOString().slice(0, 10);
+      // Get product names to guess commodities
+      const productNames = items.map(i => (i.product_name || '').toLowerCase());
+      const commodityHints = [];
+      productNames.forEach(n => {
+        if (n.includes('groundnut') || n.includes('peanut')) commodityHints.push('groundnut');
+        if (n.includes('sesame') || n.includes('gingelly')) commodityHints.push('sesame');
+        if (n.includes('coconut')) commodityHints.push('coconut');
+        if (n.includes('mustard')) commodityHints.push('mustard');
+        if (n.includes('castor')) commodityHints.push('castor');
+        if (n.includes('neem')) commodityHints.push('neem');
+      });
+      if (commodityHints.length > 0) {
+        const { data: procGuess } = await supabase.from('procurements')
+          .select('id,commodity_name,supplier,ordered_qty,received_qty,ordered_price_per_kg,total_amount,gst,order_date,status')
+          .gte('order_date', orderDate).lte('order_date', matchEnd);
+        procMatched = (procGuess || []).filter(p => {
+          const cn = (p.commodity_name || '').toLowerCase();
+          return commodityHints.some(h => cn.includes(h));
+        });
+      }
+    }
+    const allProc = [...(procFK || []), ...procMatched];
+
+    // 6. Packing procurement linked by FK
+    const { data: packFK } = await supabase.from('packing_procurement')
+      .select('id,po_number,vendor_name,items,total,date,status')
+      .eq('b2b_order_id', orderId);
+
+    // 7. Project expenses
+    let projExpenses = [];
+    if (project) {
+      const { data: pe } = await supabase.from('project_expenses').select('*').eq('project_id', project.id);
+      projExpenses = pe || [];
+    }
+
+    // 8. Company expenses linked by FK
+    const { data: compExp } = await supabase.from('company_expenses')
+      .select('id,date,category,description,amount,vendor')
+      .eq('b2b_order_id', orderId);
+
+    // 9. Stock deductions (finished_goods OUT + stock_ledger OUT)
+    const { data: fgOut } = await supabase.from('finished_goods')
+      .select('product_name,qty,date,notes')
+      .eq('b2b_order_id', orderId).eq('type', 'out');
+
+    // Fallback: match by batch_ref containing order_no
+    let fgByRef = [];
+    if ((fgOut || []).length === 0 && order.order_no) {
+      const { data: fgRef } = await supabase.from('finished_goods')
+        .select('product_name,qty,date,notes,batch_ref')
+        .eq('type', 'out').ilike('batch_ref', `%${order.order_no}%`);
+      fgByRef = fgRef || [];
+    }
+    const allFgOut = [...(fgOut || []), ...fgByRef];
+
+    // 10. Compute totals
+    const totalRevenue = r2(parseFloat(order.total_value) || 0);
+
+    const procTotal = r2(allProc.reduce((s, p) => s + (parseFloat(p.total_amount) || (parseFloat(p.ordered_qty || 0) * parseFloat(p.ordered_price_per_kg || 0))), 0));
+    const packTotal = r2((packFK || []).reduce((s, p) => s + (parseFloat(p.total) || 0), 0));
+    const projExpTotal = r2(projExpenses.reduce((s, e) => s + (parseFloat(e.total_cost) || 0), 0));
+    const compExpTotal = r2((compExp || []).reduce((s, e) => s + (parseFloat(e.amount) || 0), 0));
+    const logisticsCost = r2(parseFloat(projectData?.financials?.logisticsCharge) || 0);
+
+    const totalCost = r2(procTotal + packTotal + projExpTotal + compExpTotal + logisticsCost);
+    const grossProfit = r2(totalRevenue - totalCost);
+    const marginPct = totalRevenue > 0 ? r2((grossProfit / totalRevenue) * 100) : 0;
+
+    // 11. Shipping status per item
+    const shippingStatus = items.map(i => ({
+      product: i.product_name,
+      qty_ordered: parseFloat(i.qty) || 0,
+      qty_shipped: parseFloat(i.shipped_qty) || 0,
+      qty_pending: Math.max(0, (parseFloat(i.qty) || 0) - (parseFloat(i.shipped_qty) || 0)),
+    }));
+
+    const totalOrdered = shippingStatus.reduce((s, i) => s + i.qty_ordered, 0);
+    const totalShipped = shippingStatus.reduce((s, i) => s + i.qty_shipped, 0);
+    const totalPending = shippingStatus.reduce((s, i) => s + i.qty_pending, 0);
+
+    // 12. Idle stock
+    const stockProduced = allFgOut.reduce((s, f) => s + (parseFloat(f.qty) || 0), 0);
+    const stockIdle = Math.max(0, stockProduced - totalShipped);
+    const avgUnitCost = totalOrdered > 0 ? totalCost / totalOrdered : 0;
+    const idleValue = r2(stockIdle * avgUnitCost);
+
+    // 13. Payments received (from project financials)
+    const advanceEntries = projectData?.financials?.advanceEntries || [];
+    const paymentsReceived = r2(advanceEntries.reduce((s, e) => s + (parseFloat(e.amount) || 0), 0));
+    const balanceDue = r2(totalRevenue - paymentsReceived);
+
+    // 14. AI analysis (optional — only if ?ai=true)
+    let aiAnalysis = null;
+    if (req.query.ai === 'true') {
+      try {
+        const Anthropic = require('@anthropic-ai/sdk');
+        const client = new Anthropic();
+        const prompt = `You are a Chartered Accountant analyzing B2B order ${order.order_no} for Sathvam Oils & Spices.
+
+Order: ${order.order_no} | Customer: ${order.buyer_name || order.customer_name} | Revenue: ₹${totalRevenue} | Stage: ${order.stage}
+Total Cost: ₹${totalCost} (Procurement: ₹${procTotal}, Packing: ₹${packTotal}, Project Expenses: ₹${projExpTotal}, Logistics: ₹${logisticsCost})
+Gross Profit: ₹${grossProfit} (${marginPct}%)
+Shipped: ${totalShipped}/${totalOrdered} items | Pending: ${totalPending} | Idle Stock: ${stockIdle} units (₹${idleValue})
+Payments Received: ₹${paymentsReceived} | Balance Due: ₹${balanceDue}
+
+In 3-4 sentences: assess profitability, flag any concern (low margin, idle stock, unpaid balance, cost overrun), and recommend one action.`;
+
+        const msg = await client.messages.create({
+          model: 'claude-haiku-4-5-20251001', max_tokens: 300,
+          messages: [{ role: 'user', content: prompt }],
+        });
+        aiAnalysis = msg.content?.[0]?.text || null;
+      } catch (e) {
+        console.warn('[order-profitability] AI analysis failed:', e.message);
+      }
+    }
+
+    res.json({
+      order: {
+        id: order.id, order_no: order.order_no, date: order.date || order.created_at?.slice(0, 10),
+        customer: order.buyer_name || order.customer_name, stage: order.stage,
+        total_value: totalRevenue, currency: order.currency || 'INR',
+      },
+      project: project ? { id: project.id, name: project.project_name, status: project.status } : null,
+      procurement: {
+        raw_materials: allProc.map(p => ({
+          commodity: p.commodity_name, vendor: p.supplier, qty: p.ordered_qty,
+          received: p.received_qty, rate: p.ordered_price_per_kg, total: r2(p.total_amount || (p.ordered_qty * p.ordered_price_per_kg)),
+          gst_pct: p.gst, date: p.order_date, status: p.status, linked: !!(procFK || []).find(f => f.id === p.id),
+        })),
+        packing: (packFK || []).map(p => ({
+          po_number: p.po_number, vendor: p.vendor_name, items: p.items,
+          total: p.total, date: p.date, status: p.status,
+        })),
+        total_procurement: procTotal,
+        total_packing: packTotal,
+      },
+      expenses: {
+        project_expenses: projExpenses.map(e => ({
+          category: e.category, description: e.description, vendor: e.vendor,
+          amount: parseFloat(e.total_cost) || 0, date: e.date, stage: e.stage,
+        })),
+        company_expenses: (compExp || []).map(e => ({
+          category: e.category, description: e.description, vendor: e.vendor,
+          amount: parseFloat(e.amount) || 0, date: e.date,
+        })),
+        logistics: logisticsCost,
+        total_expenses: r2(projExpTotal + compExpTotal + logisticsCost),
+      },
+      shipping: {
+        items: shippingStatus,
+        total_ordered: totalOrdered, total_shipped: totalShipped, total_pending: totalPending,
+      },
+      inventory: {
+        stock_deducted: allFgOut.map(f => ({ product: f.product_name, qty: f.qty, date: f.date })),
+        stock_produced: stockProduced, stock_shipped: totalShipped,
+        stock_idle: stockIdle, idle_value: idleValue,
+      },
+      financials: {
+        total_revenue: totalRevenue, total_cost: totalCost,
+        gross_profit: grossProfit, margin_pct: marginPct,
+        payments_received: paymentsReceived, balance_due: balanceDue,
+        advances: advanceEntries,
+      },
+      ai_analysis: aiAnalysis,
+    });
+  } catch (e) {
+    console.error('[order-profitability]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /ca-agent/anomalies — All unresolved anomalies grouped + timeline
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/anomalies', auth, roleGuard, async (req, res) => {
+  try {
+    const d30 = new Date(Date.now() - 30 * 86400000).toISOString();
+
+    const { data: findings } = await supabase.from('ca_agent_findings')
+      .select('id,severity,category,title,detail,amount,created_at,resolved,run_id')
+      .eq('resolved', false)
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    const rows = findings || [];
+
+    // Group by category
+    const byCategory = {};
+    rows.forEach(f => {
+      if (!byCategory[f.category]) byCategory[f.category] = [];
+      byCategory[f.category].push(f);
+    });
+
+    // 30-day timeline
+    const timeline = [];
+    for (let i = 29; i >= 0; i--) {
+      const d = new Date(Date.now() - i * 86400000).toISOString().slice(0, 10);
+      const dayFindings = rows.filter(f => (f.created_at || '').slice(0, 10) === d);
+      timeline.push({
+        date: d,
+        critical: dayFindings.filter(f => f.severity === 'critical').length,
+        high: dayFindings.filter(f => f.severity === 'high').length,
+        medium: dayFindings.filter(f => f.severity === 'medium').length,
+        low: dayFindings.filter(f => f.severity === 'low').length,
+        total: dayFindings.length,
+      });
+    }
+
+    // Summary
+    const summary = {
+      total: rows.length,
+      critical: rows.filter(f => f.severity === 'critical').length,
+      high: rows.filter(f => f.severity === 'high').length,
+      medium: rows.filter(f => f.severity === 'medium').length,
+      low: rows.filter(f => f.severity === 'low').length,
+      categories: Object.keys(byCategory).length,
+      total_amount: Math.round(rows.reduce((s, f) => s + (parseFloat(f.amount) || 0), 0) * 100) / 100,
+    };
+
+    res.json({ anomalies: rows, by_category: byCategory, timeline, summary });
+  } catch (e) {
+    console.error('[anomalies]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /ca-agent/deep-audit — Comprehensive Claude Sonnet audit
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/deep-audit', auth, roleGuard, async (req, res) => {
+  try {
+    const r2 = n => Math.round((parseFloat(n) || 0) * 100) / 100;
+
+    // Gather comprehensive data
+    const [bankR, apR, arR, salesR, expR, procR, findingsR, b2bR] = await Promise.all([
+      supabase.from('bank_accounts').select('name,current_balance,type').eq('is_active', true),
+      supabase.from('vendor_bills').select('vendor_name,amount,gst_amount,paid_amount,status,due_date').is('deleted_at', null).in('status', ['unpaid', 'partial', 'overdue']),
+      supabase.from('b2b_orders').select('order_no,total_value,stage,buyer_name,created_at').not('stage', 'in', '("cancelled")').order('created_at', { ascending: false }).limit(20),
+      supabase.from('webstore_orders').select('order_no,total,status,payment_status,date').order('date', { ascending: false }).limit(50),
+      supabase.from('company_expenses').select('category,amount,date').gte('date', new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10)),
+      supabase.from('procurements').select('commodity_name,total_amount,ordered_qty,ordered_price_per_kg,order_date').order('order_date', { ascending: false }).limit(50),
+      supabase.from('ca_agent_findings').select('severity,category,title,detail,amount').eq('resolved', false).limit(30),
+      supabase.from('b2b_orders').select('order_no,total_value,stage').not('stage', 'in', '("delivered","cancelled","invoice_paid")'),
+    ]);
+
+    const cashTotal = r2((bankR.data || []).reduce((s, a) => s + (a.current_balance || 0), 0));
+    const apTotal = r2((apR.data || []).reduce((s, b) => s + (b.amount || 0) + (b.gst_amount || 0) - (b.paid_amount || 0), 0));
+    const arTotal = r2((arR.data || []).reduce((s, o) => s + (o.total_value || 0), 0));
+    const revenue30d = r2((salesR.data || []).filter(s => s.date >= new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)).reduce((s, o) => s + (o.total || 0), 0));
+    const expenses30d = r2((expR.data || []).filter(e => e.date >= new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)).reduce((s, e) => s + (e.amount || 0), 0));
+
+    const openFindings = (findingsR.data || []).map(f => `[${f.severity.toUpperCase()}] ${f.category}: ${f.title} (₹${f.amount || 0})`).join('\n');
+
+    const prompt = `You are a senior Chartered Accountant conducting a deep audit of SATHVAM OILS AND SPICES PRIVATE LIMITED (GSTIN: 33ABFCS9387K1ZN, Tamil Nadu).
+
+FINANCIAL SNAPSHOT:
+- Cash & Bank Balance: ₹${cashTotal.toLocaleString('en-IN')}
+- Accounts Receivable (B2B open): ₹${arTotal.toLocaleString('en-IN')} across ${(b2bR.data || []).length} orders
+- Accounts Payable (outstanding): ₹${apTotal.toLocaleString('en-IN')} across ${(apR.data || []).length} bills
+- Revenue (last 30 days): ₹${revenue30d.toLocaleString('en-IN')}
+- Expenses (last 30 days): ₹${expenses30d.toLocaleString('en-IN')}
+- Net Cash Flow: ₹${(revenue30d - expenses30d).toLocaleString('en-IN')}
+
+BANK ACCOUNTS:
+${(bankR.data || []).map(a => `  ${a.name} (${a.type}): ₹${(a.current_balance || 0).toLocaleString('en-IN')}`).join('\n')}
+
+TOP AP (overdue/unpaid):
+${(apR.data || []).slice(0, 10).map(b => `  ${b.vendor_name}: ₹${((b.amount || 0) - (b.paid_amount || 0)).toLocaleString('en-IN')} (due: ${b.due_date || 'N/A'})`).join('\n')}
+
+RECENT PROCUREMENTS:
+${(procR.data || []).slice(0, 10).map(p => `  ${p.commodity_name}: ${p.ordered_qty}kg @ ₹${p.ordered_price_per_kg}/kg = ₹${(p.total_amount || 0).toLocaleString('en-IN')} (${p.order_date})`).join('\n')}
+
+OPEN CA AGENT FINDINGS:
+${openFindings || 'None'}
+
+OPEN B2B ORDERS:
+${(b2bR.data || []).map(o => `  ${o.order_no}: ₹${(o.total_value || 0).toLocaleString('en-IN')} — ${o.stage}`).join('\n')}
+
+Provide a structured audit report covering:
+
+1. **BALANCE SHEET INTEGRITY** (2-3 sentences): Are assets, liabilities, and equity in balance? Any concerns about valuation or completeness?
+
+2. **CASH FLOW HEALTH** (2-3 sentences): Is the business generating enough cash? Current burn rate vs revenue. Risk of cash crunch?
+
+3. **TAX COMPLIANCE** (2-3 sentences): GST, TDS, Income Tax risks. Any sections of IT Act that could trigger penalties?
+
+4. **PROCUREMENT EFFICIENCY** (2-3 sentences): Are raw material costs trending up/down? Any concentration risk with vendors?
+
+5. **REVENUE COLLECTION** (2-3 sentences): AR aging, collection efficiency. Any orders at risk of becoming bad debts?
+
+6. **TOP 3 IMMEDIATE ACTIONS** for management with specific amounts and deadlines.
+
+7. **RISK RATING**: Overall business financial risk on scale of 1-10 (1=excellent, 10=critical).`;
+
+    const Anthropic = require('@anthropic-ai/sdk');
+    const client = new Anthropic();
+    const msg = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001', max_tokens: 2000,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const auditText = msg.content?.[0]?.text || 'Audit generation failed';
+
+    // Store audit result
+    await supabase.from('ca_agent_findings').insert({
+      severity: 'info', category: 'DeepAudit',
+      title: 'Deep Audit Report — ' + new Date().toLocaleDateString('en-IN'),
+      detail: auditText, amount: 0, resolved: false,
+      run_id: 'deep-audit-' + Date.now(),
+      ai_analysis: auditText,
+    });
+
+    res.json({
+      audit: auditText,
+      snapshot: { cashTotal, apTotal, arTotal, revenue30d, expenses30d },
+      generated_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error('[deep-audit]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /ca-agent/monthly-audit — KPMG/Big4-style strategic business audit
+// Comprehensive AI auditor that reviews all financial data and gives
+// strategic advice: cost-cutting, investment recommendations, business
+// growth suggestions, risk assessment, and industry benchmarking.
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/monthly-audit', auth, roleGuard, async (req, res) => {
+  try {
+    const r2 = n => Math.round((parseFloat(n) || 0) * 100) / 100;
+    const now = new Date();
+    const thisMonth = now.toISOString().slice(0, 7);
+    const lastMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1).toISOString().slice(0, 7);
+    const d30 = new Date(now - 30 * 86400000).toISOString().slice(0, 10);
+    const d90 = new Date(now - 90 * 86400000).toISOString().slice(0, 10);
+    const d180 = new Date(now - 180 * 86400000).toISOString().slice(0, 10);
+    const fyStart = now.getMonth() >= 3 ? `${now.getFullYear()}-04-01` : `${now.getFullYear() - 1}-04-01`;
+
+    // Gather comprehensive data across all modules
+    const [
+      bankR, apR, arB2bR, wsOrdersR, salesR, expR, procR, payrollR,
+      productsR, b2bOrdersR, recurringR, stockR, batchesR, findingsR
+    ] = await Promise.all([
+      supabase.from('bank_accounts').select('name,current_balance,type').eq('is_active', true),
+      supabase.from('vendor_bills').select('vendor_name,amount,gst_amount,paid_amount,status,due_date,bill_date,category').is('deleted_at', null),
+      supabase.from('b2b_orders').select('order_no,total_value,stage,buyer_name,created_at,currency'),
+      supabase.from('webstore_orders').select('total,subtotal,gst_amount,shipping,status,payment_status,date,items').gte('date', d180),
+      supabase.from('sales').select('final_amount,date,status,items').gte('date', d180),
+      supabase.from('company_expenses').select('category,amount,date,description').gte('date', d180),
+      supabase.from('procurements').select('commodity_name,total_amount,ordered_qty,ordered_price_per_kg,order_date,supplier,gst').gte('order_date', d180),
+      supabase.from('employees').select('name,monthly_salary,daily_rate,designation,active').eq('active', true),
+      supabase.from('products').select('name,website_price,retail_price,price,active').eq('active', true),
+      supabase.from('b2b_orders').select('order_no,total_value,stage,buyer_name,created_at,currency').order('created_at', { ascending: false }).limit(30),
+      supabase.from('recurring_expenses').select('description,amount,frequency,category'),
+      supabase.from('stock_ledger').select('product_id,type,qty,rate').limit(1000),
+      supabase.from('batches').select('date,oil_type,raw_input_kg,oil_output,cake_output').gte('date', d90),
+      supabase.from('ca_agent_findings').select('severity,category,title,amount').eq('resolved', false),
+    ]);
+
+    // Compute financials
+    const cashTotal = r2((bankR.data || []).reduce((s, a) => s + (a.current_balance || 0), 0));
+    const apAll = apR.data || [];
+    const apOverdue = apAll.filter(b => b.status === 'overdue');
+    const apTotal = r2(apAll.reduce((s, b) => s + (b.amount || 0) + (b.gst_amount || 0) - (b.paid_amount || 0), 0));
+
+    // Revenue by month (last 6 months)
+    const wsOrders = wsOrdersR.data || [];
+    const posSales = salesR.data || [];
+    const monthlyRevenue = {};
+    wsOrders.filter(o => o.payment_status === 'paid').forEach(o => {
+      const m = (o.date || '').slice(0, 7);
+      if (m) monthlyRevenue[m] = (monthlyRevenue[m] || 0) + (parseFloat(o.total) || 0);
+    });
+    posSales.filter(s => s.status === 'paid').forEach(s => {
+      const m = (s.date || '').slice(0, 7);
+      if (m) monthlyRevenue[m] = (monthlyRevenue[m] || 0) + (parseFloat(s.final_amount) || 0);
+    });
+
+    // Expenses by category (last 6 months)
+    const expenses = expR.data || [];
+    const expByCategory = {};
+    expenses.forEach(e => {
+      const cat = e.category || 'Other';
+      expByCategory[cat] = (expByCategory[cat] || 0) + (parseFloat(e.amount) || 0);
+    });
+    const totalExpenses6m = r2(expenses.reduce((s, e) => s + (parseFloat(e.amount) || 0), 0));
+
+    // Procurement analysis
+    const procs = procR.data || [];
+    const procByVendor = {};
+    const procByCommodity = {};
+    procs.forEach(p => {
+      const v = p.supplier || 'Unknown';
+      const c = p.commodity_name || 'Other';
+      procByVendor[v] = (procByVendor[v] || 0) + (parseFloat(p.total_amount) || 0);
+      procByCommodity[c] = (procByCommodity[c] || 0) + (parseFloat(p.total_amount) || 0);
+    });
+    const totalProcurement6m = r2(procs.reduce((s, p) => s + (parseFloat(p.total_amount) || 0), 0));
+
+    // Payroll
+    const employees = payrollR.data || [];
+    const monthlyPayroll = r2(employees.reduce((s, e) => s + (parseFloat(e.monthly_salary) || (parseFloat(e.daily_rate) || 0) * 26), 0));
+
+    // Product count and pricing
+    const products = productsR.data || [];
+    const avgPrice = products.length > 0 ? r2(products.reduce((s, p) => s + (parseFloat(p.website_price) || 0), 0) / products.length) : 0;
+
+    // B2B pipeline
+    const b2bOrders = b2bOrdersR.data || [];
+    const b2bOpen = b2bOrders.filter(o => !['delivered', 'cancelled', 'invoice_paid'].includes(o.stage));
+    const b2bRevenue = r2(b2bOrders.filter(o => o.stage === 'delivered' || o.stage === 'invoice_paid').reduce((s, o) => s + (parseFloat(o.total_value) || 0), 0));
+
+    // Recurring expenses
+    const recurring = (recurringR.data || []);
+    const monthlyRecurring = r2(recurring.reduce((s, r) => {
+      const amt = parseFloat(r.amount) || 0;
+      if (r.frequency === 'monthly') return s + amt;
+      if (r.frequency === 'quarterly') return s + amt / 3;
+      if (r.frequency === 'yearly') return s + amt / 12;
+      return s + amt;
+    }, 0));
+
+    // Production efficiency
+    const batches = batchesR.data || [];
+    const avgYield = batches.length > 0 ? r2(batches.reduce((s, b) => s + ((parseFloat(b.oil_output) || 0) / Math.max(1, parseFloat(b.raw_input_kg) || 1)), 0) / batches.length * 100) : 0;
+
+    // Open findings
+    const findings = findingsR.data || [];
+    const criticalFindings = findings.filter(f => f.severity === 'critical');
+
+    // Monthly revenue trend
+    const sortedMonths = Object.entries(monthlyRevenue).sort((a, b) => a[0].localeCompare(b[0]));
+    const revenueTrend = sortedMonths.map(([m, v]) => `${m}: ₹${Math.round(v).toLocaleString('en-IN')}`).join(' | ');
+
+    // Top expense categories
+    const topExpenses = Object.entries(expByCategory).sort((a, b) => b[1] - a[1]).slice(0, 8).map(([c, v]) => `${c}: ₹${Math.round(v).toLocaleString('en-IN')}`).join('\n');
+
+    // Top vendors
+    const topVendors = Object.entries(procByVendor).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([v, a]) => `${v}: ₹${Math.round(a).toLocaleString('en-IN')}`).join('\n');
+
+    // Build the comprehensive prompt
+    const prompt = `You are a senior partner at a Big 4 accounting firm (KPMG/Deloitte/EY/PwC level) conducting a comprehensive monthly business audit for SATHVAM OILS AND SPICES PRIVATE LIMITED — a cold-pressed oil manufacturing and e-commerce company based in Karur, Tamil Nadu (GSTIN: 33ABFCS9387K1ZN).
+
+═══ FINANCIAL SNAPSHOT ═══
+Cash & Bank: ₹${cashTotal.toLocaleString('en-IN')}
+Accounts Payable (outstanding): ₹${apTotal.toLocaleString('en-IN')} (${apOverdue.length} overdue bills)
+Monthly Payroll: ₹${monthlyPayroll.toLocaleString('en-IN')} (${employees.length} employees)
+Monthly Recurring: ₹${monthlyRecurring.toLocaleString('en-IN')}
+Avg Product Price: ₹${avgPrice} across ${products.length} SKUs
+
+═══ REVENUE (6-MONTH TREND) ═══
+${revenueTrend || 'No data'}
+B2B Export Revenue (delivered): ₹${b2bRevenue.toLocaleString('en-IN')}
+B2B Pipeline (open orders): ${b2bOpen.length} orders worth ₹${r2(b2bOpen.reduce((s, o) => s + (parseFloat(o.total_value) || 0), 0)).toLocaleString('en-IN')}
+
+═══ EXPENSES (LAST 6 MONTHS) ═══
+Total: ₹${totalExpenses6m.toLocaleString('en-IN')}
+By Category:
+${topExpenses || 'No data'}
+
+═══ PROCUREMENT (LAST 6 MONTHS) ═══
+Total: ₹${totalProcurement6m.toLocaleString('en-IN')}
+Top Vendors:
+${topVendors || 'No data'}
+Top Commodities:
+${Object.entries(procByCommodity).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([c, v]) => `${c}: ₹${Math.round(v).toLocaleString('en-IN')}`).join('\n') || 'No data'}
+
+═══ PRODUCTION ═══
+Batches (last 90 days): ${batches.length}
+Average Oil Yield: ${avgYield}% (input→output ratio)
+
+═══ OPEN RISK ITEMS ═══
+${criticalFindings.length > 0 ? criticalFindings.map(f => `CRITICAL: ${f.title} (₹${f.amount || 0})`).join('\n') : 'No critical items'}
+Total open findings: ${findings.length} (${findings.filter(f => f.severity === 'critical').length} critical, ${findings.filter(f => f.severity === 'high').length} high)
+
+═══ BANK ACCOUNTS ═══
+${(bankR.data || []).map(a => `${a.name} (${a.type}): ₹${(a.current_balance || 0).toLocaleString('en-IN')}`).join('\n')}
+
+Provide your monthly audit report in this EXACT structure:
+
+## 1. EXECUTIVE SUMMARY (3-4 sentences)
+Overall financial health assessment. Is the business sustainable? Key headline.
+
+## 2. PROFITABILITY ANALYSIS
+- Gross margin trend and what's driving it
+- Revenue per employee metric
+- Whether pricing covers true cost of production
+
+## 3. COST OPTIMIZATION — WHERE TO CUT (Top 5)
+For EACH recommendation:
+- Specific area to cut
+- Estimated monthly savings (₹ amount)
+- Implementation difficulty (Easy/Medium/Hard)
+- Risk if not addressed
+
+## 4. INVESTMENT RECOMMENDATIONS — WHERE TO SPEND (Top 5)
+For EACH recommendation:
+- What to invest in
+- Estimated cost
+- Expected ROI timeline
+- Why now
+
+## 5. CASH FLOW & WORKING CAPITAL
+- Cash runway (months at current burn)
+- Working capital cycle analysis
+- Recommendations for improving cash position
+
+## 6. TAX & COMPLIANCE RISKS
+- Specific IT Act / GST sections at risk
+- Estimated penalty exposure
+- Remediation priority
+
+## 7. BUSINESS GROWTH STRATEGY (Next 3-6 months)
+- Market expansion opportunities
+- Product line recommendations
+- Channel strategy (B2B vs D2C mix)
+- Pricing strategy suggestions
+
+## 8. KEY PERFORMANCE INDICATORS TO TRACK
+- 5 KPIs the management should monitor weekly
+- Current value vs target for each
+
+## 9. RISK REGISTER (Top 5 business risks)
+For each: Risk description, Likelihood (H/M/L), Impact (H/M/L), Mitigation
+
+## 10. AUDITOR'S OVERALL RATING
+Rate 1-10 (10=excellent) with one-line justification for: Financial Health, Growth Potential, Risk Management, Operational Efficiency, Compliance.
+
+Be specific with numbers. Reference actual data from above. Give actionable advice, not generic platitudes. Think like a ₹50 lakh/year consulting engagement.`;
+
+    const Anthropic = require('@anthropic-ai/sdk');
+    const client = new Anthropic();
+    const msg = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001', max_tokens: 4000,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    const auditReport = msg.content?.[0]?.text || 'Audit generation failed';
+
+    // Store the monthly audit
+    const auditId = 'monthly-audit-' + thisMonth;
+    await supabase.from('settings').upsert({
+      key: auditId,
+      value: {
+        report: auditReport,
+        snapshot: { cashTotal, apTotal, b2bRevenue, totalExpenses6m, totalProcurement6m, monthlyPayroll, employees: employees.length, products: products.length },
+        generated_at: new Date().toISOString(),
+        generated_by: req.user?.name || req.user?.username,
+      },
+      updated_at: new Date().toISOString(),
+    });
+
+    // Also save to findings for tracking
+    await supabase.from('ca_agent_findings').insert({
+      severity: 'info', category: 'MonthlyAudit',
+      title: `Monthly AI Audit — ${now.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })}`,
+      detail: auditReport.slice(0, 2000), amount: 0, resolved: false,
+      run_id: auditId, ai_analysis: auditReport,
+    });
+
+    res.json({
+      report: auditReport,
+      snapshot: { cashTotal, apTotal, b2bRevenue, totalExpenses6m, totalProcurement6m, monthlyPayroll, monthlyRecurring },
+      month: thisMonth,
+      generated_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error('[monthly-audit]', e);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /ca-agent/monthly-audit/history — Past monthly audit reports
+router.get('/monthly-audit/history', auth, roleGuard, async (req, res) => {
+  try {
+    const { data } = await supabase.from('settings')
+      .select('key,value,updated_at')
+      .like('key', 'monthly-audit-%')
+      .order('updated_at', { ascending: false })
+      .limit(12);
+    const reports = (data || []).map(r => ({
+      month: r.key.replace('monthly-audit-', ''),
+      report: r.value?.report,
+      snapshot: r.value?.snapshot,
+      generated_at: r.value?.generated_at,
+      generated_by: r.value?.generated_by,
+    }));
+    res.json({ reports });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 module.exports = router;

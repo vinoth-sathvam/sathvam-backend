@@ -729,6 +729,7 @@ procurement.post('/', auth, requireRole('admin','manager'), async (req, res) => 
     payment_ref:    p.paymentRef||null,
     advance_paid:   parseFloat(p.advancePaid)||null,
     final_paid:     parseFloat(p.finalPaid)||null,
+    b2b_order_id:   p.b2bOrderId || p.b2b_order_id || null,
   }).select().single();
   if (error) return res.status(400).json({ error: error.message });
 

@@ -28,6 +28,73 @@ const router  = express.Router();
 
 const SESSIONS_KEY = 'checkout_sessions';
 const CONFIG_KEY   = 'checkout_recovery_config';
+
+// ── Helper: refresh session cart with current DB prices ─────────────────────
+// Looks up the customer's saved cart in abandoned_carts (by phone → customer_id)
+// and fetches current product prices from products table. Returns updated
+// { cart, cart_total } or null if no fresh data found.
+async function refreshCartFromDB(phone) {
+  try {
+    if (!phone) return null;
+    // Normalize phone to 10-digit for matching
+    const clean = String(phone).replace(/\D/g, '');
+    const last10 = clean.length > 10 ? clean.slice(-10) : clean;
+
+    // Find customer by phone
+    const { data: customers } = await supabase
+      .from('customers')
+      .select('id, name')
+      .like('phone', `%${last10}`)
+      .limit(1);
+    if (!customers?.length) return null;
+
+    const custId = customers[0].id;
+    const sessionId = 'cust_' + custId;
+
+    // Fetch saved cart
+    const { data: cartRow } = await supabase
+      .from('abandoned_carts')
+      .select('items')
+      .eq('session_id', sessionId)
+      .maybeSingle();
+    if (!cartRow?.items?.length) return null;
+
+    // Fetch current prices for all products in cart
+    const productIds = cartRow.items.map(i => i.id).filter(Boolean);
+    if (!productIds.length) return null;
+
+    const { data: products } = await supabase
+      .from('products')
+      .select('id, website_price, price, offer_price, offer_ends_at, name')
+      .in('id', productIds);
+    if (!products?.length) return null;
+
+    const priceMap = {};
+    for (const p of products) priceMap[p.id] = p;
+
+    // Recalculate with current prices
+    let total = 0;
+    const freshCart = cartRow.items.map(item => {
+      const dbProd = priceMap[item.id];
+      if (!dbProd) return item;
+      let currentPrice = parseFloat(dbProd.website_price || dbProd.price || 0);
+      if (dbProd.offer_price && dbProd.offer_ends_at) {
+        const offerEnd = new Date(dbProd.offer_ends_at);
+        if (offerEnd > new Date() && parseFloat(dbProd.offer_price) < currentPrice) {
+          currentPrice = parseFloat(dbProd.offer_price);
+        }
+      }
+      const qty = item.qty || 1;
+      total += currentPrice * qty;
+      return { ...item, name: dbProd.name || item.name, price: currentPrice };
+    });
+
+    return { cart: freshCart, cart_total: Math.round(total) };
+  } catch (e) {
+    console.error('[checkoutRecovery] refreshCartFromDB error:', e.message);
+    return null;
+  }
+}
 const SESSION_TTL  = 48 * 60 * 60 * 1000; // 48 hours
 
 // ── Persistent log helper ────────────────────────────────────────────────────
@@ -130,6 +197,12 @@ async function processAbandoned(dryRun = false) {
     if (age < delayMs) { skipped++; continue; }
 
     if (!dryRun) {
+      // Refresh cart with current DB prices before sending
+      const fresh = await refreshCartFromDB(s.phone);
+      if (fresh) {
+        s.cart       = fresh.cart;
+        s.cart_total = fresh.cart_total;
+      }
       const msg = buildMessage(config.message_template, s);
       const ok  = await sendText(s.phone, msg, { priority: true });
       s.wa_sent    = true;
@@ -238,6 +311,12 @@ router.post('/sessions/:id/send-wa', auth, async (req, res) => {
     const s = sessions.find(x => x.id === id);
     if (!s) return res.status(404).json({ error: 'session not found' });
 
+    // Refresh cart with current DB prices before sending
+    const fresh = await refreshCartFromDB(s.phone);
+    if (fresh) {
+      s.cart       = fresh.cart;
+      s.cart_total = fresh.cart_total;
+    }
     const msg = buildMessage(config.message_template, s);
     const ok  = await sendText(s.phone, msg);
     s.wa_sent    = true;

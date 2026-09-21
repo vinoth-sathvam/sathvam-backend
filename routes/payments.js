@@ -4,7 +4,7 @@ const crypto       = require('crypto');
 const nodemailer   = require('nodemailer');
 const supabase     = require('../config/supabase');
 const { createInvoice, recordPayment, zoho: zohoApi, findOrCreateContact: zohoFindOrCreateContact } = require('../config/zoho');
-const { sendCustomerInvoice, sendInvoiceWhatsApp } = require('./webstoreOrders');
+const { sendCustomerInvoice, sendInvoiceWhatsApp, sendStatusWhatsApp, sendStatusEmail, decryptOrder } = require('./webstoreOrders');
 const { auth, requireRole } = require('../middleware/auth');
 const { encrypt, hmac, encryptCustomer } = require('../config/crypto');
 const { insertLedger } = require('../utils/ledger');
@@ -493,6 +493,15 @@ async function executeRefund(order, reason, approvedBy) {
 
   console.log(`Refund initiated: ${refund.id} for order ${order.order_no} ₹${order.total} by ${approvedBy}`);
 
+  // Send WA + email notification for refund status change
+  setImmediate(async () => {
+    try {
+      const decrypted = decryptOrder(order);
+      await sendStatusEmail(decrypted, orderStatus, reason);
+      await sendStatusWhatsApp(decrypted, orderStatus, reason);
+    } catch (e) { console.error('[refund] Status notification error:', e.message); }
+  });
+
   // Zoho Books: create credit note for full refund
   if (zohoApi && process.env.ZOHO_ORG_ID) {
     try {
@@ -694,6 +703,15 @@ router.post('/partial-refund', auth, async (req, res) => {
 
     console.log(`Partial refund ${refund.id} ₹${refundAmount} for order ${order.order_no} by ${byName}`);
 
+    // Send WA + email notification for partial refund
+    setImmediate(async () => {
+      try {
+        const decrypted = decryptOrder(order);
+        await sendStatusEmail(decrypted, newStatus, reason);
+        await sendStatusWhatsApp(decrypted, newStatus, reason);
+      } catch (e) { console.error('[partial-refund] Notification error:', e.message); }
+    });
+
     // Zoho Books: create credit note for partial refund
     if (zohoApi && process.env.ZOHO_ORG_ID) {
       try {
@@ -748,6 +766,17 @@ router.get('/refund-status/:orderId', async (req, res) => {
         refund_status: refund.status,
         status:        orderStatus,
       }).eq('id', order.id);
+      // Send WA + email notification on status change
+      setImmediate(async () => {
+        try {
+          const { data: fullOrder } = await supabase.from('webstore_orders').select('*').eq('id', order.id).single();
+          if (fullOrder) {
+            const decrypted = decryptOrder(fullOrder);
+            await sendStatusEmail(decrypted, orderStatus);
+            await sendStatusWhatsApp(decrypted, orderStatus);
+          }
+        } catch (e) { console.error('[refund-status-check] Notification error:', e.message); }
+      });
     }
 
     res.json({ refund_id: refund.id, status: refund.status, amount: refund.amount / 100, speed: refund.speed_processed || refund.speed_requested });
@@ -1083,15 +1112,26 @@ async function handleRazorpayWebhook(req, res) {
       // Find order by refund_id and mark as refunded
       const { data: order } = await supabase
         .from('webstore_orders')
-        .select('id, order_no')
+        .select('*')
         .eq('refund_id', refund.id)
         .single();
       if (order) {
+        const prevStatus = order.status;
         await supabase.from('webstore_orders').update({
           status:        'refunded',
           refund_status: 'processed',
         }).eq('id', order.id);
         console.log(`Order ${order.order_no} marked as refunded via webhook`);
+        // Send WA + email notification if status actually changed
+        if (prevStatus !== 'refunded') {
+          setImmediate(async () => {
+            try {
+              const decrypted = decryptOrder(order);
+              await sendStatusEmail(decrypted, 'refunded');
+              await sendStatusWhatsApp(decrypted, 'refunded');
+            } catch (e) { console.error('[webhook-refund] Notification error:', e.message); }
+          });
+        }
       }
     }
 
