@@ -463,7 +463,7 @@ router.post('/verify', async (req, res) => {
     supabase.from('settings').delete().eq('key', `pending_order_${razorpay_order_id}`)
       .then(() => {}).catch(() => {});
 
-    res.json({ success: true, paymentId: razorpay_payment_id, orderNo: generatedOrderNo });
+    res.json({ success: true, paymentId: razorpay_payment_id, orderNo: generatedOrderNo, orderId: dbId });
   } catch (err) {
     console.error('Payment verify error:', err.message);
     res.status(500).json({ error: err.message });
@@ -539,7 +539,7 @@ router.post('/refund', auth, async (req, res) => {
 
     const { data: order, error: fetchErr } = await supabase
       .from('webstore_orders')
-      .select('id, order_no, total, status, notes, refund_id, refund_approval_status')
+      .select('*')
       .eq('id', orderId)
       .single();
 
@@ -577,7 +577,7 @@ router.post('/approve-refund/:orderId', auth, requireRole('admin', 'ceo'), async
   try {
     const { data: order, error: fetchErr } = await supabase
       .from('webstore_orders')
-      .select('id, order_no, total, status, notes, refund_id, cancel_reason')
+      .select('*')
       .eq('id', req.params.orderId)
       .single();
 
@@ -635,7 +635,7 @@ router.post('/partial-refund', auth, async (req, res) => {
 
     const { data: order, error: fetchErr } = await supabase
       .from('webstore_orders')
-      .select('id, order_no, total, status, notes, items, refund_id')
+      .select('*')
       .eq('id', orderId)
       .single();
 

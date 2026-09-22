@@ -922,6 +922,7 @@ async function sendStatusWhatsApp(order, newStatus, cancelReason) {
 // Admin: update order status + dispatch info
 async function updateOrder(req, res) {
   const { status, notes, courier, awb_number, dispatch_date, delivered_date, cancel_reason,
+          items, subtotal, gst_amount, total,
           carton_box_id, carton_box_name, carton_box_cost, carton_box_qty, carton_box_unit_cost, carton_box_deducted,
           actual_courier_cost, courier_provider } = req.body;
   const updates = {};
@@ -932,6 +933,10 @@ async function updateOrder(req, res) {
   if (dispatch_date        !== undefined) updates.dispatch_date        = dispatch_date;
   if (delivered_date       !== undefined) updates.delivered_date       = delivered_date;
   if (cancel_reason        !== undefined) updates.cancel_reason        = cancel_reason;
+  if (items                !== undefined) updates.items                = items;
+  if (subtotal             !== undefined) updates.subtotal             = subtotal;
+  if (gst_amount           !== undefined) updates.gst_amount           = gst_amount;
+  if (total                !== undefined) updates.total                = total;
   if (carton_box_id        !== undefined) updates.carton_box_id        = carton_box_id;
   if (carton_box_name      !== undefined) updates.carton_box_name      = carton_box_name;
   if (carton_box_cost      !== undefined) updates.carton_box_cost      = carton_box_cost;
