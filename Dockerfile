@@ -4,7 +4,7 @@ WORKDIR /app
 COPY package*.json ./
 # Skip Puppeteer's bundled Chromium (~300MB) — use system chromium at runtime
 ENV PUPPETEER_SKIP_DOWNLOAD=true
-RUN npm ci --omit=dev
+RUN npm ci --omit=dev --legacy-peer-deps
 
 # ─── Stage 2: runtime ────────────────────────────────────────────────────────
 FROM node:20-alpine AS runtime
