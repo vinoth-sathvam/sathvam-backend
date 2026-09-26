@@ -8,7 +8,7 @@
 const { Router } = require('express');
 const { spawn } = require('child_process');
 const path = require('path');
-const auth = require('../middleware/auth');
+const { auth } = require('../middleware/auth');
 
 const router = Router();
 let activeAgent = null;
