@@ -118,6 +118,17 @@ const TOOLS = [
       properties: {},
     },
   },
+  {
+    name: 'server_health',
+    description: 'Check server health — CPU usage, memory, disk, Docker containers, systemd services status, SSL certificates.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        check: { type: 'string', enum: ['overview', 'cpu', 'memory', 'disk', 'docker', 'services', 'ssl'], description: 'What to check' },
+      },
+      required: ['check'],
+    },
+  },
 ];
 
 // ── Tool Implementations ─────────────────────────────────────────────────────
@@ -297,6 +308,39 @@ async function executeTool(name, input) {
         return `🏦 *Bank Balances*\n\n` + accounts.map(a =>
           `*${a.name}* (${a.bank_name})\n${a.type} | ₹${parseFloat(a.current_balance || 0).toLocaleString('en-IN')}`
         ).join('\n\n') + `\n\n💰 *Total: ₹${total.toLocaleString('en-IN')}*`;
+      }
+
+      case 'server_health': {
+        const { execSync } = require('child_process');
+        let cmd;
+        switch (input.check) {
+          case 'cpu':
+            cmd = `top -bn1 | head -5 && echo "\\nLoad avg:" && cat /proc/loadavg`;
+            break;
+          case 'memory':
+            cmd = 'free -h';
+            break;
+          case 'disk':
+            cmd = 'df -h /';
+            break;
+          case 'docker':
+            cmd = 'sudo docker ps --format "{{.Names}}: {{.Status}}" 2>&1';
+            break;
+          case 'services':
+            cmd = 'systemctl list-units --type=service --all 2>&1 | grep sathvam | head -30';
+            break;
+          case 'ssl':
+            cmd = 'sudo /home/ubuntu/sathvam-frontend/sathvam-vercel/scripts/ssl-cert-monitor.sh --check-only 2>&1 | tail -10';
+            break;
+          default: // overview
+            cmd = `echo "=== CPU ===" && top -bn1 | grep "Cpu\\|load" | head -2 && echo "\\n=== Memory ===" && free -h | head -2 && echo "\\n=== Disk ===" && df -h / | tail -1 && echo "\\n=== Docker ===" && sudo docker ps --format "{{.Names}}: {{.Status}}" 2>&1`;
+        }
+        try {
+          const output = execSync(cmd, { timeout: 15000, encoding: 'utf8' });
+          return output;
+        } catch (e) {
+          return `Error: ${e.message}`;
+        }
       }
 
       default:
