@@ -1119,24 +1119,28 @@ router.post('/zoho/sync-bank-transactions', auth, async (req, res) => {
             .eq('id', existing.id);
           updated++;
         } else {
-          // Check if this transaction already exists from CSV/manual upload
-          // (same date, amount, type, same bank account — but no zoho_txn_id)
-          // This prevents duplicates when CSV bank statement is uploaded before Zoho sync
-          const { data: csvMatch } = await supabase
+          // Check if this transaction already exists from CSV/manual upload or previous sync
+          // Match by: same account + date + type + amount (±₹1 tolerance)
+          // Check ALL existing rows (not just zoho_txn_id=null) to catch every duplicate source
+          const { data: dupeMatches } = await supabase
             .from('bank_transactions')
-            .select('id, zoho_txn_id')
+            .select('id, zoho_txn_id, description')
             .eq('bank_account_id', local_account_id)
             .eq('date', rec.date)
             .eq('type', rec.type)
-            .eq('amount', rec.amount)
-            .is('zoho_txn_id', null)
-            .limit(1)
-            .maybeSingle();
+            .gte('amount', rec.amount - 1)
+            .lte('amount', rec.amount + 1);
+
+          // Prefer matching a row without zoho_txn_id (CSV/manual entry)
+          const csvMatch = (dupeMatches || []).find(m => !m.zoho_txn_id) || (dupeMatches || [])[0];
 
           if (csvMatch) {
-            // Link the existing CSV entry to this Zoho transaction (don't insert a duplicate)
+            // Link/update the existing entry with this Zoho transaction (don't insert a duplicate)
+            const updateFields = { zoho_txn_id: zohoTxnId, reconciled: rec.reconciled, updated_at: new Date().toISOString() };
+            // If existing row has no zoho_txn_id, also update description to cleaner Zoho version
+            if (!csvMatch.zoho_txn_id && rec.description) updateFields.description = rec.description;
             await supabase.from('bank_transactions')
-              .update({ zoho_txn_id: zohoTxnId, reconciled: rec.reconciled, updated_at: new Date().toISOString() })
+              .update(updateFields)
               .eq('id', csvMatch.id);
             updated++;
           } else {

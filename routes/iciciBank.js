@@ -172,12 +172,21 @@ router.post('/statement/sync', auth, requireRole('admin', 'ceo', 'manager'), ens
       .gte('date', from)
       .lte('date', to);
 
-    const existingSet = new Set((existing || []).map(e => `${e.date}_${e.type}_${parseFloat(e.amount).toFixed(2)}`));
+    // Count occurrences of each date+type+amount combo for proper dedup
+    // (handles multiple legitimate transactions with same date+type+amount)
+    const existingCounts = {};
+    for (const e of (existing || [])) {
+      const key = `${e.date}_${e.type}_${parseFloat(e.amount).toFixed(2)}`;
+      existingCounts[key] = (existingCounts[key] || 0) + 1;
+    }
 
     let inserted = 0, skipped = 0;
+    const inputCounts = {};
     for (const t of transactions) {
       const key = `${t.date}_${t.type}_${parseFloat(t.amount).toFixed(2)}`;
-      if (existingSet.has(key)) { skipped++; continue; }
+      inputCounts[key] = (inputCounts[key] || 0) + 1;
+      // Skip if DB already has enough of this combo
+      if (inputCounts[key] <= (existingCounts[key] || 0)) { skipped++; continue; }
 
       await supabase.from('bank_transactions').insert({
         bank_account_id: bankAccountId,
