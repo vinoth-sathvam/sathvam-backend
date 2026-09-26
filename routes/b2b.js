@@ -2574,7 +2574,17 @@ projects.post('/:id/logistics-agent/send-to-buyer', auth, requireRole('admin','c
     const pendingEmail = full.logistics?.pendingBuyerEmail;
     if (!pendingEmail) return res.status(400).json({ error: 'No pending buyer email to send' });
 
-    const buyerEmail = full.buyerEmail || req.body.buyerEmail || '';
+    let buyerEmail = full.buyerEmail || req.body.buyerEmail || '';
+    // Fallback: look up email from linked B2B customer
+    if (!buyerEmail && full.b2bOrderId) {
+      try {
+        const { data: ord } = await supabase.from('b2b_orders').select('customer_id').eq('id', full.b2bOrderId).single();
+        if (ord?.customer_id) {
+          const { data: cust } = await supabase.from('b2b_customers').select('email').eq('id', ord.customer_id).single();
+          if (cust?.email) buyerEmail = cust.email;
+        }
+      } catch (_) {}
+    }
     if (!buyerEmail) return res.status(400).json({ error: 'No buyer email configured' });
 
     const nodemailer = require('nodemailer');

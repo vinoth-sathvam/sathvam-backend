@@ -81,12 +81,15 @@ async function loadActiveProjects() {
     if (logistics.agentPaused) continue;
     // Extract project ID from key
     const projectId = row.key.replace('project_full_', '');
+    // Support multiple vendor emails (comma-separated)
+    const vendorEmails = logistics.vendorEmail.toLowerCase().split(',').map(e => e.trim()).filter(Boolean);
     projects.push({
       id: projectId,
       key: row.key,
       full,
       logistics,
-      vendorEmail: logistics.vendorEmail.toLowerCase().trim(),
+      vendorEmail: vendorEmails[0], // primary email for backward compat
+      vendorEmails, // all emails for matching
       vendorName: logistics.vendorName || 'Logistics Vendor',
       projectName: full.projectName || '',
       buyerName: full.buyerName || '',
@@ -174,8 +177,8 @@ async function fetchUnreadEmails(vendorEmails) {
 
 // ── Match email to project ──────────────────────────────────────────────────────
 function matchEmailToProject(email, projects) {
-  // First try exact sender match
-  const byVendor = projects.filter(p => p.vendorEmail === email.from);
+  // First try sender match against all vendor emails per project
+  const byVendor = projects.filter(p => p.vendorEmails.includes(email.from));
   if (byVendor.length === 1) return byVendor[0];
 
   // Multiple projects with same vendor — match by subject keywords
@@ -686,8 +689,17 @@ async function checkPendingApprovals(projects) {
           auth: { user: IMAP_USER, pass: IMAP_PASS },
         });
 
-        // Get buyer email from B2B customer
-        const buyerEmail = full.buyerEmail || '';
+        // Get buyer email from project or B2B customer
+        let buyerEmail = full.buyerEmail || '';
+        if (!buyerEmail && full.b2bOrderId) {
+          try {
+            const { data: ord } = await supabase.from('b2b_orders').select('customer_id').eq('id', full.b2bOrderId).single();
+            if (ord?.customer_id) {
+              const { data: cust } = await supabase.from('b2b_customers').select('email').eq('id', ord.customer_id).single();
+              if (cust?.email) buyerEmail = cust.email;
+            }
+          } catch (_) {}
+        }
         if (!buyerEmail) {
           warn('No buyer email for project', project.projectName);
           continue;
@@ -762,8 +774,8 @@ async function main() {
   // 2. Check pending approvals first
   await checkPendingApprovals(projects);
 
-  // 3. Collect unique vendor emails
-  const vendorEmails = [...new Set(projects.map(p => p.vendorEmail))];
+  // 3. Collect unique vendor emails (flatten all per-project emails)
+  const vendorEmails = [...new Set(projects.flatMap(p => p.vendorEmails))];
   log(`Checking emails from ${vendorEmails.length} vendor(s):`, vendorEmails.join(', '));
 
   // 4. Fetch unread emails
