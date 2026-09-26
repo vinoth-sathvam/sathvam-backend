@@ -2619,6 +2619,23 @@ projects.post('/:id/logistics-agent/send-to-buyer', auth, requireRole('admin','c
       attachments,
     });
 
+    // Send to WhatsApp group (Sathvam Oils and Spices)
+    try {
+      const { sendText } = require('../lib/greenapi');
+      const WA_GROUP = '918144803555-1613471362@g.us';
+      const vessel = pendingEmail.vesselSchedule || {};
+      const vesselName = vessel.vesselName || 'TBD';
+      const voyageNo = vessel.voyageNo || '';
+      const etd = vessel.etdDate || 'TBD';
+      const eta = vessel.etaDate || 'TBD';
+      const etdPort = vessel.etdPort || full.portOfLoading || '';
+      const etaPort = vessel.etaPort || full.portOfDischarge || '';
+      const mfgInv = full.mfg?.invoiceNo || '';
+      const merchInv = full.merch?.invoiceNo || '';
+      const waMsg = `🚢 *Vessel Schedule — ${full.buyerName || 'Buyer'}*\n_From SATHVAM OILS AND SPICES PVT LTD_\n\nDear ${full.buyerName || 'Customer'},\n\nShipping documents sent via email:\n\n1. Seaway BL\n2. Shipping Bill\n3. Insurance Policy\n4. Fumigation Certificate\n\n📋 *Vessel Schedule*\n*Vessel:* ${vesselName}${voyageNo ? ' Voy.' + voyageNo : ''}\n*ETD ${etdPort}:* ${etd}\n*ETA ${etaPort}:* ${eta}\n\n${mfgInv ? '*MFG Invoice:* ' + mfgInv + '\n' : ''}${merchInv ? '*MERCH Invoice:* ' + merchInv + '\n' : ''}*Port of Loading:* ${full.portOfLoading || ''}\n*Port of Discharge:* ${full.portOfDischarge || ''}\n\n*SATHVAM OILS AND SPICES PVT LTD*\nMOB: +917092177092 | EMAIL: SALES@SATHVAM.IN`;
+      await sendText(WA_GROUP, waMsg);
+    } catch (waErr) { console.error('WA group send error:', waErr.message); }
+
     // Update project
     full.logistics.agentStage = 'buyer_notified';
     full.logistics.blSharedToCustomerDate = new Date().toISOString().slice(0, 10);
@@ -2632,7 +2649,7 @@ projects.post('/:id/logistics-agent/send-to-buyer', auth, requireRole('admin','c
       ts: new Date().toISOString(),
       phase: 'buyer_update',
       action: 'Vessel schedule + shipping docs sent to buyer',
-      detail: `Sent to: ${buyerEmail}\nSubject: ${pendingEmail.subject}`,
+      detail: `Sent to: ${buyerEmail} (CC: udaya@sathvam.in)\nWhatsApp: Sathvam Oils group\nSubject: ${pendingEmail.subject}`,
       autoAction: false,
       sentBy: req.user?.name || req.user?.username,
     });

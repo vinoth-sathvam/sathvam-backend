@@ -617,6 +617,7 @@ function buildBuyerVesselEmail(project, vessel, docs, attachments) {
     blAttachments: attachments.filter(a =>
       /\b(bl|bill.of.lading|seaway|shipping.?bill|insurance|fumigat|sb\b)/i.test(a.filename)
     ),
+    vesselSchedule: vessel,
   };
 }
 
