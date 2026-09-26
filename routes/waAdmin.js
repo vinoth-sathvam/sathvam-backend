@@ -372,10 +372,10 @@ CONTEXT:
       if (reply.length > 4000) {
         const parts = reply.match(/.{1,3900}/gs) || [reply];
         for (const part of parts) {
-          await gaSendText(phone, part);
+          await gaSendText(phone, part, { priority: true });
         }
       } else {
-        await gaSendText(phone, reply);
+        await gaSendText(phone, reply, { priority: true });
       }
     }
 
@@ -383,7 +383,7 @@ CONTEXT:
   } catch (e) {
     console.error('[wa-admin-agent] Error:', e.message);
     const errMsg = '❌ Agent error: ' + e.message.slice(0, 200);
-    await gaSendText(phone, errMsg).catch(() => {});
+    await gaSendText(phone, errMsg, { priority: true }).catch(() => {});
     return errMsg;
   }
 }
