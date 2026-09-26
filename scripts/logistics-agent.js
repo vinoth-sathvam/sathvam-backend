@@ -613,9 +613,9 @@ function buildBuyerVesselEmail(project, vessel, docs, attachments) {
           </div>
         </div>
       </div>`,
-    // Attach BL if found
+    // Attach all shipping documents (BL, shipping bill, insurance, fumigation)
     blAttachments: attachments.filter(a =>
-      /\b(bl|bill.of.lading|seaway)\b/i.test(a.filename)
+      /\b(bl|bill.of.lading|seaway|shipping.?bill|insurance|fumigat|sb\b)/i.test(a.filename)
     ),
   };
 }
