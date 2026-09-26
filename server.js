@@ -174,6 +174,7 @@ app.use('/api/stock-counts',      require('./routes/stockCounts'));
 app.use('/api/tasks',             require('./routes/tasks'));
 app.use('/api/ai-command',        require('./routes/aiCommand'));
 app.use('/api/ai-ops',            require('./routes/aiOps'));
+app.use('/api/agent',             require('./routes/agentRoute'));
 app.use('/api/compliance',        require('./routes/compliance'));
 app.use('/api/payouts',           require('./routes/payouts'));
 app.use('/api/campaigns',         require('./routes/campaigns'));
