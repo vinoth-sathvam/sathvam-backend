@@ -801,6 +801,19 @@ router.post('/green-webhook', express.json(), async (req, res) => {
 
       // AI auto-reply for text messages
       if (AI_REPLIES_ENABLED && (msgType === 'textMessage' || msgType === 'extendedTextMessage') && content.trim()) {
+        // Admin WhatsApp Agent — route admin messages to AI agent with tools
+        const adminPhoneList2 = [process.env.WA_ADMIN_PHONE1, process.env.WA_ADMIN_PHONE2].filter(Boolean).map(p => {
+          const d = (p || '').replace(/\D/g, '');
+          return d.length === 10 ? '91' + d : d;
+        });
+        if (adminPhoneList2.includes(phone)) {
+          try {
+            const { handleAdminWhatsApp } = require('./waAdmin');
+            await handleAdminWhatsApp(phone, content);
+          } catch (e) { console.error('[wa-admin-agent]', e.message); }
+          return; // skip regular AI reply for admin
+        }
+
         // Check auto-reply schedule — send away message outside business hours
         try {
           const { data: arRow } = await supabase.from('settings').select('value').eq('key', 'wa_auto_reply').maybeSingle();
