@@ -54,18 +54,49 @@ const POSTGREST_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 
 // ── Custom Tools ─────────────────────────────────────────────────────────────
 
-// 1. Database Query Tool
+// 1. Database Query Tool (READ-ONLY by default, writes restricted)
+const DB_READONLY_TABLES = ['users', 'customers', 'webauthn_credentials', 'webauthn_challenges'];
+const DB_NO_DELETE_TABLES = ['products', 'webstore_orders', 'sales', 'sale_items', 'b2b_orders', 'b2b_customers',
+  'bank_accounts', 'bank_transactions', 'vendor_bills', 'procurements', 'batches', 'flour_batches',
+  'raw_materials', 'packing_materials', 'stock_ledger', 'attendance', 'leave_requests', 'blog_posts',
+  'push_subscriptions', 'whatsapp_messages', 'users', 'customers'];
+const DB_WRITE_ALLOWED_TABLES = ['settings', 'bank_transactions', 'webstore_orders', 'sales', 'procurements',
+  'stock_ledger', 'products', 'b2b_orders'];
+
 const queryDatabase = tool(
   'query_database',
-  'Query PostgreSQL via PostgREST. Supports SELECT with filters, INSERT, UPDATE, DELETE. Use PostgREST query syntax for filters (eq, gt, lt, like, ilike, in, is, etc). Examples: table="products" method="GET" query="select=name,price&active=eq.true&order=name.asc" or table="settings" method="GET" query="key=eq.my_key"',
+  'Query PostgreSQL via PostgREST. Primarily for READ (GET). Writes (POST/PATCH) allowed on specific tables only. DELETE only on bank_transactions and settings. Use PostgREST query syntax for filters (eq, gt, lt, like, ilike, in, is, etc). Examples: table="products" method="GET" query="select=name,price&active=eq.true&order=name.asc"',
   {
-    table: z.string().describe('Table name (e.g., products, webstore_orders, bank_transactions, settings, b2b_orders, customers)'),
+    table: z.string().describe('Table name (e.g., products, webstore_orders, bank_transactions, settings, b2b_orders)'),
     method: z.enum(['GET', 'POST', 'PATCH', 'DELETE']).describe('HTTP method: GET=select, POST=insert, PATCH=update, DELETE=delete'),
-    query: z.string().optional().describe('PostgREST query string for GET (e.g., "select=id,name&active=eq.true&limit=10"). For PATCH/DELETE, use filters (e.g., "id=eq.123")'),
-    body: z.string().optional().describe('JSON body for POST/PATCH (e.g., \'{"name":"test","active":true}\')'),
+    query: z.string().optional().describe('PostgREST query string for GET (e.g., "select=id,name&active=eq.true&limit=10"). For PATCH/DELETE, must include filters (e.g., "id=eq.123")'),
+    body: z.string().optional().describe('JSON body for POST/PATCH'),
   },
   async ({ table, method, query: qs, body }) => {
     try {
+      // Security: block writes to sensitive tables
+      if (DB_READONLY_TABLES.includes(table) && method !== 'GET') {
+        return { content: [{ type: 'text', text: `⛔ Security: ${table} is read-only. Cannot ${method}.` }] };
+      }
+      // Security: block DELETE on critical tables
+      if (method === 'DELETE' && DB_NO_DELETE_TABLES.includes(table)) {
+        if (table !== 'bank_transactions' && table !== 'settings') {
+          return { content: [{ type: 'text', text: `⛔ Security: DELETE not allowed on ${table}. Use the admin panel for deletions.` }] };
+        }
+      }
+      // Security: block writes to tables not in allowlist
+      if ((method === 'POST' || method === 'PATCH') && !DB_WRITE_ALLOWED_TABLES.includes(table)) {
+        return { content: [{ type: 'text', text: `⛔ Security: Write not allowed on ${table}. Read-only access.` }] };
+      }
+      // Security: DELETE/PATCH must have filters — block unfiltered bulk operations
+      if ((method === 'DELETE' || method === 'PATCH') && (!qs || !qs.includes('eq.'))) {
+        return { content: [{ type: 'text', text: `⛔ Security: ${method} requires specific filters (e.g., id=eq.123). Bulk ${method} without filters is blocked.` }] };
+      }
+      // Security: limit results to prevent memory issues
+      if (method === 'GET' && qs && !qs.includes('limit=')) {
+        qs = (qs ? qs + '&' : '') + 'limit=100';
+      }
+
       const url = `${POSTGREST_URL}/${table}${qs ? '?' + qs : ''}`;
       const headers = {
         'Authorization': `Bearer ${POSTGREST_KEY}`,
@@ -78,7 +109,6 @@ const queryDatabase = tool(
       const resp = await fetch(url, opts);
       const text = await resp.text();
       if (!resp.ok) return { content: [{ type: 'text', text: `Error ${resp.status}: ${text}` }] };
-      // Truncate large results
       const result = text.length > 5000 ? text.slice(0, 5000) + '\n... (truncated)' : text;
       return { content: [{ type: 'text', text: result }] };
     } catch (e) {
@@ -88,9 +118,10 @@ const queryDatabase = tool(
 );
 
 // 2. Service Management Tool
+const PROTECTED_SERVICES = ['postgresql', 'postgres', 'sathvam-postgres', 'docker', 'ssh', 'sshd', 'traefik', 'postgrest', 'sathvam-postgrest', 'nginx', 'systemd'];
 const manageService = tool(
   'manage_service',
-  'Manage systemd services on the server. Check status, start, stop, restart, or list all sathvam services and timers.',
+  'Manage systemd services on the server. Check status, start, stop, restart, or list all sathvam services and timers. CANNOT stop/restart critical infrastructure (postgres, docker, traefik, ssh).',
   {
     action: z.enum(['status', 'start', 'stop', 'restart', 'list-services', 'list-timers', 'journal']).describe('Action to perform'),
     service: z.string().optional().describe('Service name (e.g., sathvam-auto-po, sathvam-monitor-api). Not needed for list-* actions'),
@@ -98,6 +129,18 @@ const manageService = tool(
   },
   async ({ action, service, lines }) => {
     try {
+      // Security: block stop/restart on critical infrastructure
+      if (['stop', 'restart'].includes(action) && service && PROTECTED_SERVICES.some(p => service.toLowerCase().includes(p))) {
+        return { content: [{ type: 'text', text: `⛔ Security: Cannot ${action} ${service} — critical infrastructure service. Use SSH directly.` }] };
+      }
+      // Security: only allow sathvam-* services for start/stop/restart
+      if (['start', 'stop', 'restart'].includes(action) && service && !service.startsWith('sathvam-')) {
+        return { content: [{ type: 'text', text: `⛔ Security: Can only manage sathvam-* services. Cannot ${action} ${service}.` }] };
+      }
+      // Security: sanitize service name (prevent command injection)
+      if (service && !/^[a-zA-Z0-9_-]+$/.test(service)) {
+        return { content: [{ type: 'text', text: `⛔ Security: Invalid service name.` }] };
+      }
       let cmd;
       switch (action) {
         case 'status':
@@ -200,17 +243,29 @@ const sendWhatsApp = tool(
 );
 
 // 5. Docker Tool
+const DOCKER_EXEC_BLOCKED = ['rm ', 'kill', 'drop ', 'truncate ', 'delete from', 'shutdown', 'reboot', 'mkfs', 'dd ', 'format'];
 const dockerOps = tool(
   'docker_ops',
-  'Run Docker operations — view containers, logs, exec commands inside containers.',
+  'Run Docker operations — view containers, logs, exec safe read-only commands inside containers. Cannot run destructive commands (rm, kill, drop, truncate).',
   {
-    action: z.enum(['ps', 'logs', 'exec', 'stats']).describe('ps=list containers, logs=view logs, exec=run command in container, stats=resource usage'),
+    action: z.enum(['ps', 'logs', 'exec', 'stats']).describe('ps=list containers, logs=view logs, exec=run READ-ONLY command in container, stats=resource usage'),
     container: z.string().optional().describe('Container name (e.g., ubuntu-backend-1, traefik, sathvam-store)'),
-    command: z.string().optional().describe('For exec: command to run inside container. For logs: --since flag (e.g., "5m")'),
+    command: z.string().optional().describe('For exec: READ-ONLY command (e.g., "node -e ...", "cat /app/package.json"). For logs: --since flag (e.g., "5m")'),
     lines: z.number().optional().describe('Number of log lines (default 30)'),
   },
   async ({ action, container, command, lines }) => {
     try {
+      // Security: block destructive exec commands
+      if (action === 'exec' && command) {
+        const cmdLower = command.toLowerCase();
+        if (DOCKER_EXEC_BLOCKED.some(b => cmdLower.includes(b))) {
+          return { content: [{ type: 'text', text: `⛔ Security: Destructive command blocked. Only read-only exec allowed.` }] };
+        }
+      }
+      // Security: sanitize container name
+      if (container && !/^[a-zA-Z0-9_.-]+$/.test(container)) {
+        return { content: [{ type: 'text', text: `⛔ Security: Invalid container name.` }] };
+      }
       let cmd;
       switch (action) {
         case 'ps':
@@ -235,15 +290,20 @@ const dockerOps = tool(
 );
 
 // 6. Git Tool
+const GIT_BLOCKED_COMMANDS = ['push --force', 'push -f', 'reset --hard', 'clean -f', 'checkout .', 'restore .', 'branch -D', 'rebase'];
 const gitOps = tool(
   'git_ops',
-  'Run git operations on backend or frontend repos.',
+  'Run git operations on backend or frontend repos. Cannot force-push, reset --hard, or delete branches.',
   {
     repo: z.enum(['backend', 'frontend']).describe('Which repo'),
     command: z.string().describe('Git command to run (e.g., "status", "log --oneline -10", "diff", "add .", "commit -m \\"message\\"", "push origin main")'),
   },
   async ({ repo, command }) => {
     try {
+      // Security: block destructive git commands
+      if (GIT_BLOCKED_COMMANDS.some(b => command.includes(b))) {
+        return { content: [{ type: 'text', text: `⛔ Security: Destructive git command blocked (${command}). Use SSH directly.` }] };
+      }
       const cwd = repo === 'backend' ? BACKEND_DIR : FRONTEND_DIR;
       const output = execSync(`git ${command}`, { cwd, timeout: 30000, encoding: 'utf8' });
       return { content: [{ type: 'text', text: output || '(no output)' }] };
