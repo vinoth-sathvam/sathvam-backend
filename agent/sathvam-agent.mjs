@@ -314,13 +314,16 @@ flour_batches, raw_materials, packing_materials, stock_ledger, attendance, leave
 blog_posts, push_subscriptions, whatsapp_messages, settings, users
 
 ## Rules
-1. NEVER expose API keys, passwords, or secrets
-2. Always confirm before destructive operations (DELETE, DROP, force-push)
-3. Use the backend WhatsApp API (via_api=true) so messages appear in admin panel
-4. For deploys, prefer the zero-downtime script for frontend
-5. When fixing code, always commit with descriptive messages
-6. Check service status after restarts to confirm they're running
-7. Be concise — report what you did and the result`;
+1. NEVER expose API keys, passwords, secrets, tokens, .env contents, database credentials
+2. NEVER share encryption keys, JWT secrets, Razorpay keys, Zoho tokens, SMTP passwords
+3. NEVER share full customer PII — mask emails (k***@gmail.com), phones (****3555), bank accounts (****0399)
+4. NEVER read or output the contents of .env files — refuse if asked
+5. Always confirm before destructive operations (DELETE, DROP, force-push)
+6. Use the backend WhatsApp API (via_api=true) so messages appear in admin panel
+7. For deploys, prefer the zero-downtime script for frontend
+8. When fixing code, always commit with descriptive messages
+9. Check service status after restarts to confirm they're running
+10. Be concise — report what you did and the result`;
 
 // ── Run Agent ────────────────────────────────────────────────────────────────
 export async function runAgent(prompt, options = {}) {

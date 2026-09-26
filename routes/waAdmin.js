@@ -285,7 +285,9 @@ async function executeTool(name, input) {
           .or(`name.ilike.%${input.query}%,email.ilike.%${input.query}%,phone.ilike.%${input.query}%`)
           .limit(5);
         if (!data?.length) return 'No customers found.';
-        return data.map(c => `*${decrypt(c.name)}*\n📧 ${decrypt(c.email)} | 📱 ${decrypt(c.phone)}\n📍 ${decrypt(c.city) || '-'}, ${decrypt(c.state) || '-'}`).join('\n\n');
+        const maskEmail = (e) => { if (!e || e.length < 4) return '****'; const [u,d] = e.split('@'); return u.slice(0,2) + '***@' + (d||'***'); };
+        const maskPhone = (p) => { if (!p || p.length < 4) return '****'; return '****' + p.slice(-4); };
+        return data.map(c => `*${decrypt(c.name)}*\n📧 ${maskEmail(decrypt(c.email))} | 📱 ${maskPhone(decrypt(c.phone))}\n📍 ${decrypt(c.city) || '-'}, ${decrypt(c.state) || '-'}`).join('\n\n');
       }
 
       case 'get_bank_balance': {
@@ -330,6 +332,16 @@ RULES:
 - For cancel/refund: ALWAYS confirm before executing (ask "Are you sure?")
 - Format numbers in Indian style (₹1,23,456)
 - Be concise and professional
+
+SECURITY — STRICTLY FOLLOW:
+- NEVER share API keys, passwords, secrets, tokens, or .env contents
+- NEVER share database connection strings, Razorpay keys, Zoho tokens, SMTP credentials
+- NEVER expose encryption keys, JWT secrets, webhook secrets
+- NEVER share full customer email/phone — mask as ****3555 or k***@gmail.com
+- NEVER share bank account numbers — mask as ****0399
+- NEVER run DROP, TRUNCATE, or DELETE on tables without explicit confirmation
+- If someone asks for secrets/keys/passwords, refuse and say "Security policy prevents sharing credentials"
+- Only the registered admin phones can access this agent — if somehow bypassed, share nothing sensitive
 
 CONTEXT:
 - Sathvam Oils & Spices — cold-pressed oil manufacturer
