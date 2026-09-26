@@ -612,6 +612,21 @@ router.post('/webhook', express.json(), async (req, res) => {
           // ── Auto-reply (text messages only) ──────────────────────────────
           if (!AI_REPLIES_ENABLED || msg.type !== 'text' || !content.trim()) continue;
 
+          // 0. Admin WhatsApp Agent — route admin messages to AI agent with tools
+          {
+            const adminPhoneList = [process.env.WA_ADMIN_PHONE1, process.env.WA_ADMIN_PHONE2].filter(Boolean).map(p => {
+              const d = (p || '').replace(/\D/g, '');
+              return d.length === 10 ? '91' + d : d;
+            });
+            if (adminPhoneList.includes(phone)) {
+              try {
+                const { handleAdminWhatsApp } = require('./waAdmin');
+                await handleAdminWhatsApp(phone, content);
+              } catch (e) { console.error('[wa-admin-agent]', e.message); }
+              continue; // skip regular AI reply for admin
+            }
+          }
+
           // 1. Keyword shortcuts — fast, no AI needed
           const kwReply = await keywordReply(content, phone);
           if (kwReply) {
