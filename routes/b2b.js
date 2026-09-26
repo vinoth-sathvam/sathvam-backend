@@ -2612,6 +2612,7 @@ projects.post('/:id/logistics-agent/send-to-buyer', auth, requireRole('admin','c
     await mailer.sendMail({
       from: process.env.SMTP_FROM || `"Sathvam Export" <${process.env.SMTP_USER}>`,
       to: buyerEmail,
+      cc: 'udaya@sathvam.in',
       replyTo: process.env.SMTP_USER,
       subject: pendingEmail.subject,
       html: pendingEmail.html,
