@@ -1204,7 +1204,6 @@ router.get('/simple-dashboard', auth, roleGuard, async (req, res) => {
     const billsDue30     = r2((bills.data||[]).reduce((s,b)=>s+Math.max(0,r2((b.amount||0)+(b.gst_amount||0)-(b.paid_amount||0))),0));
     const projectedTotal = r2(totalSalary + recurringTotal + actualExpenses + billsDue30);
     const netPosition    = r2(totalCash - projectedTotal);
-    const profitLoss     = r2(totalSales - actualExpenses - totalSalary);
 
     const cashStatus = netPosition >= 50000 ? 'healthy' : netPosition >= 0 ? 'tight' : 'shortage';
 
@@ -1224,6 +1223,10 @@ router.get('/simple-dashboard', auth, roleGuard, async (req, res) => {
         ledgerExpenseTotal += amt;
       }
     }
+
+    // ── P&L (includes procurement/raw material costs from money ledger) ──────
+    const procurementCost = r2(ledgerExpenseTotal);  // all outgoing ledger entries (raw material, logistics, etc.)
+    const profitLoss     = r2(totalSales - actualExpenses - totalSalary - procurementCost);
 
     res.json({
       month: mStr, as_of: today.toISOString().slice(0,10),
@@ -1248,7 +1251,7 @@ router.get('/simple-dashboard', auth, roleGuard, async (req, res) => {
         expense_total: r2(ledgerExpenseTotal),
         expense_by_category: ledgerExpense,
       },
-      bottom_line: { profit_loss: profitLoss, net_cash_after_expenses: netPosition, status: cashStatus },
+      bottom_line: { profit_loss: profitLoss, procurement_cost: procurementCost, net_cash_after_expenses: netPosition, status: cashStatus },
     });
   } catch (e) {
     console.error('[SimpleDashboard]', e);
