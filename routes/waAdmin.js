@@ -1061,15 +1061,18 @@ async function executeTool(name, input) {
         const orderMap = {};
         for (const o of (orders || [])) orderMap[o.id] = o;
         let msg = `📋 *Pending B2B Payment Claims*\n\n`;
+        let idx = 1;
         for (const p of pending) {
           const o = orderMap[p.orderId] || {};
           for (const c of p.claims) {
-            msg += `*${o.order_no || p.orderId}* · ${o.buyer_name || o.customer_name || '?'}\n`;
-            msg += `Type: ${c.type === 'balance' ? '🏦 Balance' : c.type === 'advance' ? '💰 Advance' : '🚛 Logistics'}\n`;
-            msg += `Amount: ₹${fmtINR(c.amount)} | Ref: ${c.txnRef || '—'} | Date: ${c.date || '—'}\n\n`;
+            const orderNo = o.order_no || 'Unknown';
+            const company = o.buyer_name || o.customer_name || '?';
+            const typeEmoji = c.type === 'balance' ? '🏦 Balance' : c.type === 'advance' ? '💰 Advance' : '🚛 Logistics';
+            msg += `${idx}. *${orderNo}* · ${company}\n   ${typeEmoji} · ₹${fmtINR(c.amount)} · Ref: ${c.txnRef || '—'} · ${c.date || '—'}\n\n`;
+            idx++;
           }
         }
-        msg += `_Reply with order number to verify & record._`;
+        msg += `_Reply with the order number (e.g. B2B-829795) or row number to verify & record._`;
         return msg;
       }
 
@@ -1195,8 +1198,44 @@ async function handleAdminWhatsApp(phone, message) {
     const { sendTyping } = require('../lib/greenapi');
     await sendTyping(phone).catch(() => {});
 
-    // Run Claude with tools
-    let messages = [{ role: 'user', content: message }];
+    // Fetch recent conversation history for context (last 6 messages)
+    let conversationHistory = [];
+    try {
+      const { data: recentMsgs } = await supabase
+        .from('whatsapp_messages')
+        .select('direction,content,created_at')
+        .eq('phone', phone)
+        .order('created_at', { ascending: false })
+        .limit(6);
+      if (recentMsgs?.length) {
+        conversationHistory = recentMsgs
+          .reverse()
+          .filter(m => m.content && !m.content.startsWith('❌'))
+          .map(m => ({
+            role: m.direction === 'in' ? 'user' : 'assistant',
+            content: m.content,
+          }));
+      }
+    } catch (_) {}
+
+    // Build messages: conversation history + current message
+    let messages = [...conversationHistory, { role: 'user', content: message }];
+    // Deduplicate: if last history message is same as current, remove it
+    if (conversationHistory.length && conversationHistory[conversationHistory.length - 1].content === message) {
+      messages = [...conversationHistory.slice(0, -1), { role: 'user', content: message }];
+    }
+    // Ensure messages alternate roles (required by Claude API)
+    const cleaned = [];
+    for (const m of messages) {
+      if (cleaned.length && cleaned[cleaned.length - 1].role === m.role) {
+        cleaned[cleaned.length - 1].content += '\n' + m.content;
+      } else {
+        cleaned.push({ ...m });
+      }
+    }
+    messages = cleaned.length ? cleaned : [{ role: 'user', content: message }];
+    // Ensure first message is 'user' role
+    if (messages[0]?.role !== 'user') messages.shift();
 
     const response = await anthropic.messages.create({
       model: 'claude-sonnet-4-6',
@@ -1244,7 +1283,14 @@ AVAILABLE CAPABILITIES — use the right tool for each query:
 - Server: health, docker, services, SSL
 
 PAYMENT CLAIM CONTEXT:
-When the admin replies to a notification like "🏦 Balance Payment Claim / B2B-XXXXXX · COMPANY / Amount: ₹X,XX,XXX", understand that "mark as received", "received", "verify", "confirm" means they want to record that payment. Extract the order number and use record_b2b_payment with type='remaining' for balance claims, type='advance' for advance claims, type='logistics' for logistics claims.`,
+When the admin replies to a notification like "🏦 Balance Payment Claim / B2B-XXXXXX · COMPANY / Amount: ₹X,XX,XXX", understand that "mark as received", "received", "verify", "confirm" means they want to record that payment. Extract the order number and use record_b2b_payment with type='remaining' for balance claims, type='advance' for advance claims, type='logistics' for logistics claims.
+
+CONVERSATION CONTINUITY:
+You have access to recent conversation history. When the admin sends a short follow-up (a number, "yes", "3", an amount like "707181", a row number, an order number), interpret it in the context of your previous response. For example:
+- If you listed pending claims and admin replies with a number/amount → they're selecting that claim to record
+- If you asked for confirmation and admin replies "yes" → proceed with the action
+- If admin sends an amount that matches a claim amount → they're confirming that specific claim
+Always check conversation history before treating a short message as a new standalone query.`,
       tools: TOOLS,
       messages,
     });
