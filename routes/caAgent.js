@@ -1225,8 +1225,17 @@ router.get('/simple-dashboard', auth, roleGuard, async (req, res) => {
     }
 
     // ── P&L (includes procurement/raw material costs from money ledger) ──────
-    const procurementCost = r2(ledgerExpenseTotal);  // all outgoing ledger entries (raw material, logistics, etc.)
-    const profitLoss     = r2(totalSales - actualExpenses - totalSalary - procurementCost);
+    // Ledger outflows include procurement payments (Purchase, logistics, raw materials)
+    // that are NOT in company_expenses. Avoid double-counting: subtract actualExpenses
+    // portion that's already counted, then add the ledger-only costs.
+    const ledgerProcurement = r2(ledgerRows
+      .filter(r => r.direction === 'out' && (
+        (r.subcategory || '').toLowerCase() === 'purchase' ||
+        (r.category || '').toLowerCase() === 'procurement' ||
+        (r.subcategory || '').toLowerCase() === 'b2b_logistics'
+      ))
+      .reduce((s, r) => s + (parseFloat(r.amount) || 0), 0));
+    const profitLoss     = r2(totalSales - actualExpenses - totalSalary - ledgerProcurement);
 
     res.json({
       month: mStr, as_of: today.toISOString().slice(0,10),
@@ -1251,7 +1260,7 @@ router.get('/simple-dashboard', auth, roleGuard, async (req, res) => {
         expense_total: r2(ledgerExpenseTotal),
         expense_by_category: ledgerExpense,
       },
-      bottom_line: { profit_loss: profitLoss, procurement_cost: procurementCost, net_cash_after_expenses: netPosition, status: cashStatus },
+      bottom_line: { profit_loss: profitLoss, procurement_cost: ledgerProcurement, net_cash_after_expenses: netPosition, status: cashStatus },
     });
   } catch (e) {
     console.error('[SimpleDashboard]', e);
