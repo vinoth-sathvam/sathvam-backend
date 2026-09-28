@@ -809,7 +809,10 @@ router.post('/green-webhook', express.json(), async (req, res) => {
         if (adminPhoneList2.includes(phone)) {
           try {
             const { handleAdminWhatsApp } = require('./waAdmin');
-            await handleAdminWhatsApp(phone, content);
+            // Pass quoted message context so agent understands replies to notifications
+            let agentMsg = content;
+            if (quotedContent) agentMsg = `[Replying to: "${quotedContent}"]\n\n${content}`;
+            await handleAdminWhatsApp(phone, agentMsg);
           } catch (e) { console.error('[wa-admin-agent]', e.message); }
           return; // skip regular AI reply for admin
         }
