@@ -16,7 +16,8 @@ const express   = require('express');
 const Anthropic  = require('@anthropic-ai/sdk');
 const crypto     = require('crypto');
 const Razorpay   = require('razorpay');
-const { auth } = require('../middleware/auth');
+const { auth, requireRole } = require('../middleware/auth');
+const { decryptOrder } = require('./webstoreOrders');
 const { sendText: gaSendText, sendFile: gaSendFile, sendFileByUpload: gaSendFileByUpload, sendTyping: gaSendTyping } = require('../lib/greenapi');
 const supabase  = require('../config/supabase');
 const { validateCartPrices } = require('../utils/validateCartPrices');
@@ -821,9 +822,48 @@ router.post('/green-webhook', express.json(), async (req, res) => {
 
       console.log(`[green-webhook] Inbound from ${phone}: ${content.slice(0, 80)}`);
 
+      // ── Auto-tag conversations based on keywords ──────────────────────────────
+      try {
+        const lc = (content || '').toLowerCase();
+        const TAG_MAP = {
+          order_inquiry: /\b(order|track|status|dispatch|ship|deliver|where.?is)\b/,
+          complaint:     /\b(return|refund|damage|broken|wrong|complaint|issue|problem)\b/,
+          pricing:       /\b(price|cost|rate|how\s*much|offer|discount)\b/,
+          new_customer:  /\b(new|first\s*time|never\s*ordered|start|begin)\b/,
+          b2b_inquiry:   /\b(bulk|wholesale|b2b|distributor|dealer|resell)\b/,
+        };
+        const matched = Object.entries(TAG_MAP).filter(([, rx]) => rx.test(lc)).map(([tag]) => tag);
+        if (matched.length) {
+          const { data: labelsRow } = await supabase.from('settings').select('value').eq('key', 'wa_conv_labels').maybeSingle();
+          const labels = labelsRow?.value || {};
+          const existing = Array.isArray(labels[phone]) ? labels[phone] : [];
+          const merged = [...new Set([...existing, ...matched])];
+          if (merged.length !== existing.length) {
+            labels[phone] = merged;
+            await supabase.from('settings').upsert({ key: 'wa_conv_labels', value: labels, updated_at: new Date().toISOString() });
+          }
+        }
+      } catch (tagErr) { console.error('[auto-tag]', tagErr.message); }
+
       // SSE: notify admin panel in real-time
       try { sseNotify({ type: 'new_message', phone, contact_name: contactName, content: content.slice(0, 100), direction: 'inbound', timestamp: new Date().toISOString(), media_type: mediaType }); } catch {}
 
+      // WhatsApp notification to admin phone — "You have a message from <customer>"
+      try {
+        const adminPhones = [process.env.WA_ADMIN_PHONE1, process.env.WA_ADMIN_PHONE2].filter(Boolean).map(p => {
+          const d = (p || '').replace(/\D/g, '');
+          return d.length === 10 ? '91' + d : d;
+        });
+        // Don't notify if the message is FROM an admin phone
+        if (!adminPhones.includes(phone)) {
+          const preview = content.length > 150 ? content.slice(0, 150) + '…' : content;
+          const notifMsg = `📩 New WhatsApp message\n\nFrom: ${contactName || phone}\nPhone: +${phone}\n${mediaType && mediaType !== 'text' ? `Type: ${mediaType}\n` : ''}Message: ${preview}`;
+          const { sendText: gaSend } = require('../lib/greenapi');
+          for (const ap of adminPhones) {
+            gaSend(ap, notifMsg, { priority: true }).catch(() => {});
+          }
+        }
+      } catch (e) { console.error('[wa-admin-notify]', e.message); }
 
       // AI auto-reply for text messages
       if (AI_REPLIES_ENABLED && (msgType === 'textMessage' || msgType === 'extendedTextMessage') && content.trim()) {
@@ -842,6 +882,16 @@ router.post('/green-webhook', express.json(), async (req, res) => {
           } catch (e) { console.error('[wa-admin-agent]', e.message); }
           return; // skip regular AI reply for admin
         }
+
+        // ── Handoff check — skip AI if conversation handed off to human ──────
+        try {
+          const { data: hoRow } = await supabase.from('settings').select('value').eq('key', 'wa_handoff').maybeSingle();
+          const handoff = hoRow?.value || {};
+          if (handoff[phone]) {
+            console.log(`[green-webhook] AI skipped for ${phone} — handed off to human`);
+            return; // human-only mode
+          }
+        } catch (hoErr) { console.error('[handoff-check]', hoErr.message); /* fail open */ }
 
         // Check auto-reply schedule — send away message outside business hours
         try {
@@ -2309,5 +2359,577 @@ setInterval(async () => {
     }
   } catch {}
 }, 60000);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NEW ENDPOINTS — v3.48.0
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. Customer 360 Panel
+// GET /api/whatsapp/customer-360/:phone
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/customer-360/:phone', auth, async (req, res) => {
+  try {
+    const raw = (req.params.phone || '').replace(/\D/g, '');
+    const last10 = raw.slice(-10);
+    const with91 = '91' + last10;
+
+    // Find customer
+    const { data: customers } = await supabase.from('customers')
+      .select('id,name,email,phone,city,state,created_at')
+      .or(`phone.ilike.%${last10},phone.ilike.%${with91}`)
+      .limit(1);
+    const cust = customers?.[0] || null;
+
+    // Fetch orders — search by phone in customer JSONB
+    const { data: orders } = await supabase.from('webstore_orders')
+      .select('id,order_no,date,items,total,status,payment_status,customer,created_at')
+      .or(`customer->>phone.ilike.%${last10},customer->>phone.ilike.%${with91}`)
+      .order('created_at', { ascending: false })
+      .limit(200);
+
+    const decrypted = (orders || []).map(o => {
+      try { return decryptOrder(o); } catch { return o; }
+    });
+
+    const totalOrders = decrypted.length;
+    const totalSpent = decrypted.reduce((s, o) => s + (+o.total || 0), 0);
+    const avgOrderValue = totalOrders > 0 ? Math.round(totalSpent / totalOrders) : 0;
+
+    const dates = decrypted.map(o => new Date(o.date || o.created_at)).filter(d => !isNaN(d)).sort((a, b) => a - b);
+    const firstOrderDate = dates[0]?.toISOString().slice(0, 10) || null;
+    const lastOrderDate = dates[dates.length - 1]?.toISOString().slice(0, 10) || null;
+
+    // Favourite products (top 3 by qty)
+    const prodQty = {};
+    for (const o of decrypted) {
+      for (const it of (o.items || [])) {
+        const name = it.name || it.product_name || 'Unknown';
+        prodQty[name] = (prodQty[name] || 0) + (+it.qty || 1);
+      }
+    }
+    const favouriteProducts = Object.entries(prodQty).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([name, qty]) => ({ name, qty }));
+
+    // Loyalty points
+    let loyaltyPoints = 0;
+    if (cust?.id) {
+      const { data: loyRow } = await supabase.from('settings').select('value').eq('key', `cust_loyalty_${cust.id}`).maybeSingle();
+      loyaltyPoints = loyRow?.value?.points || 0;
+    }
+
+    // Purchase frequency
+    let purchaseFrequencyDays = null;
+    let daysSinceLastOrder = null;
+    let overdue = false;
+    if (dates.length >= 2) {
+      const gaps = [];
+      for (let i = 1; i < dates.length; i++) gaps.push((dates[i] - dates[i - 1]) / 86400000);
+      purchaseFrequencyDays = Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length);
+    }
+    if (dates.length > 0) {
+      daysSinceLastOrder = Math.round((Date.now() - dates[dates.length - 1]) / 86400000);
+      if (purchaseFrequencyDays) overdue = daysSinceLastOrder > purchaseFrequencyDays * 1.5;
+    }
+
+    res.json({
+      customer: cust,
+      total_orders: totalOrders,
+      total_spent: totalSpent,
+      avg_order_value: avgOrderValue,
+      first_order_date: firstOrderDate,
+      last_order_date: lastOrderDate,
+      favourite_products: favouriteProducts,
+      loyalty_points: loyaltyPoints,
+      purchase_frequency_days: purchaseFrequencyDays,
+      days_since_last_order: daysSinceLastOrder,
+      overdue,
+      recent_orders: decrypted.slice(0, 5).map(o => ({ order_no: o.order_no, date: o.date, total: o.total, status: o.status })),
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. Quick Order from Chat
+// POST /api/whatsapp/quick-order
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/quick-order', auth, requireRole('manager'), async (req, res) => {
+  try {
+    const { phone, customer_name, items, notes } = req.body;
+    if (!phone || !items?.length) return res.status(400).json({ error: 'phone and items required' });
+
+    const orderNo = await generateFlowOrderNo();
+    const total = items.reduce((s, it) => s + (+it.qty || 1) * (+it.price || 0), 0);
+    const gstAmount = items.reduce((s, it) => {
+      const gst = +it.gst || 0;
+      return s + (+it.qty || 1) * (+it.price || 0) * (gst / (100 + gst));
+    }, 0);
+
+    const orderData = {
+      order_no: orderNo,
+      date: new Date().toISOString().slice(0, 10),
+      customer: { name: customer_name || 'WhatsApp Customer', phone: phone.replace(/\D/g, '') },
+      items,
+      subtotal: total,
+      gst_amount: Math.round(gstAmount * 100) / 100,
+      total,
+      channel: 'whatsapp',
+      status: 'confirmed',
+      payment_status: 'pending',
+      notes: notes || 'Quick order from WhatsApp chat',
+      created_at: new Date().toISOString(),
+    };
+
+    const { error: insErr } = await supabase.from('webstore_orders').insert(orderData);
+    if (insErr) throw new Error(insErr.message);
+
+    // Stock ledger entries
+    for (const it of items) {
+      if (it.product_id) {
+        await supabase.from('stock_ledger').insert({
+          date: orderData.date,
+          product_id: it.product_id,
+          product_name: it.name,
+          type: 'out',
+          qty: +it.qty || 1,
+          channel: 'whatsapp',
+          reference: orderNo,
+          notes: 'Quick order from WhatsApp chat',
+        });
+      }
+    }
+
+    // Send WhatsApp confirmation
+    const normPhone = phone.replace(/\D/g, '');
+    const itemLines = items.map(it => `• ${it.name} × ${it.qty}`).join('\n');
+    const msg = `✅ *Order Confirmed*\n\nOrder: *${orderNo}*\n\n${itemLines}\n\nTotal: ₹${total.toLocaleString('en-IN')}\n\nThank you! 🙏\n— Sathvam`;
+    gaSendText(normPhone, msg).catch(e => console.error('[quick-order-wa]', e.message));
+
+    res.json({ order_no: orderNo, total });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. Send Payment Link from Chat
+// POST /api/whatsapp/send-payment-link
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/send-payment-link', auth, async (req, res) => {
+  try {
+    const { phone, amount, description, customer_name } = req.body;
+    if (!phone || !amount) return res.status(400).json({ error: 'phone and amount required' });
+
+    const rzp = new Razorpay({
+      key_id: process.env.RAZORPAY_KEY_ID,
+      key_secret: process.env.RAZORPAY_KEY_SECRET,
+    });
+
+    const link = await rzp.paymentLink.create({
+      amount: Math.round(+amount * 100), // paise
+      currency: 'INR',
+      description: description || 'Sathvam Payment',
+      customer: {
+        name: customer_name || 'Customer',
+        contact: '+' + phone.replace(/\D/g, ''),
+      },
+      notify: { sms: true },
+      reminder_enable: true,
+      options: { checkout: { name: 'Sathvam Oils & Spices' } },
+      expire_by: Math.floor(Date.now() / 1000) + 48 * 3600,
+      notes: { source: 'wa_chat', phone: phone.replace(/\D/g, '') },
+    });
+
+    // Send link via WhatsApp
+    const normPhone = phone.replace(/\D/g, '');
+    const msg = `💳 *Payment Link*\n\nAmount: ₹${(+amount).toLocaleString('en-IN')}\n${description ? `For: ${description}\n` : ''}\nPay here: ${link.short_url}\n\nLink valid for 48 hours.\n— Sathvam`;
+    await gaSendText(normPhone, msg);
+
+    res.json({ link_id: link.id, short_url: link.short_url, amount: +amount });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. Cart Recovery Check
+// GET /api/whatsapp/cart-recovery/:phone
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/cart-recovery/:phone', auth, async (req, res) => {
+  try {
+    const raw = (req.params.phone || '').replace(/\D/g, '');
+    const last10 = raw.slice(-10);
+
+    // Check checkout_recovery_log
+    const { data: logs } = await supabase.from('checkout_recovery_log')
+      .select('session_id,phone,cart_items,cart_total,started_at,completed')
+      .or(`phone.ilike.%${last10}`)
+      .eq('completed', false)
+      .order('started_at', { ascending: false })
+      .limit(1);
+
+    if (logs?.[0]) {
+      return res.json({ has_cart: true, cart_items: logs[0].cart_items, cart_total: logs[0].cart_total, started_at: logs[0].started_at });
+    }
+
+    // Check abandoned_carts table
+    const { data: carts } = await supabase.from('abandoned_carts')
+      .select('id,items,total,created_at')
+      .or(`phone.ilike.%${last10}`)
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    if (carts?.[0]) {
+      return res.json({ has_cart: true, cart_items: carts[0].items, cart_total: carts[0].total, started_at: carts[0].created_at });
+    }
+
+    res.json({ has_cart: false });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. Canned Response Categories
+// GET/PUT /api/whatsapp/quick-reply-categories
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/quick-reply-categories', auth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'wa_quick_reply_categories').maybeSingle();
+    res.json(data?.value || []);
+  } catch { res.json([]); }
+});
+
+router.put('/quick-reply-categories', auth, async (req, res) => {
+  try {
+    const { categories } = req.body;
+    await supabase.from('settings').upsert({ key: 'wa_quick_reply_categories', value: categories || [], updated_at: new Date().toISOString() });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. Chatbot Handoff
+// POST/DELETE /api/whatsapp/conversations/:phone/handoff
+// GET /api/whatsapp/handoff-status
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/conversations/:phone/handoff', auth, async (req, res) => {
+  try {
+    const phone = normalisePhone(req.params.phone);
+    const { reason } = req.body;
+    const { data: existing } = await supabase.from('settings').select('value').eq('key', 'wa_handoff').maybeSingle();
+    const handoff = existing?.value || {};
+    handoff[phone] = { disabled_by: req.user?.name || req.user?.username || 'admin', disabled_at: new Date().toISOString(), reason: reason || '' };
+    await supabase.from('settings').upsert({ key: 'wa_handoff', value: handoff, updated_at: new Date().toISOString() });
+    res.json({ ok: true, phone });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.delete('/conversations/:phone/handoff', auth, async (req, res) => {
+  try {
+    const phone = normalisePhone(req.params.phone);
+    const { data: existing } = await supabase.from('settings').select('value').eq('key', 'wa_handoff').maybeSingle();
+    const handoff = existing?.value || {};
+    delete handoff[phone];
+    await supabase.from('settings').upsert({ key: 'wa_handoff', value: handoff, updated_at: new Date().toISOString() });
+    res.json({ ok: true, phone });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get('/handoff-status', auth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'wa_handoff').maybeSingle();
+    const handoff = data?.value || {};
+    const list = Object.entries(handoff).map(([phone, info]) => ({ phone, ...info }));
+    res.json(list);
+  } catch { res.json([]); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. Voice Note Transcription
+// POST /api/whatsapp/transcribe/:messageId
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/transcribe/:messageId', auth, async (req, res) => {
+  try {
+    const { data: msg } = await supabase.from('whatsapp_messages')
+      .select('id,content,media_url,media_type')
+      .eq('id', req.params.messageId)
+      .single();
+    if (!msg) return res.status(404).json({ error: 'Message not found' });
+    if (!msg.media_url) return res.status(400).json({ error: 'No audio attached to this message' });
+
+    // Download audio
+    const audioResp = await fetch(msg.media_url);
+    if (!audioResp.ok) throw new Error('Failed to download audio');
+    const audioBuf = Buffer.from(await audioResp.arrayBuffer());
+    const audioB64 = audioBuf.toString('base64');
+    const mimeType = audioResp.headers.get('content-type') || 'audio/ogg';
+
+    // Transcribe via Claude
+    const aiResp = await anthropic.messages.create({
+      model: 'claude-sonnet-4-6',
+      max_tokens: 1000,
+      messages: [{
+        role: 'user',
+        content: [
+          { type: 'text', text: 'Transcribe this audio message accurately. The speaker may use Tamil, English, or a mix (Tanglish). Return ONLY the transcription text, nothing else.' },
+          { type: 'document', source: { type: 'base64', media_type: mimeType, data: audioB64 } },
+        ],
+      }],
+    });
+
+    const transcription = aiResp.content[0]?.text || '(unable to transcribe)';
+
+    // Update message content with transcription
+    await supabase.from('whatsapp_messages')
+      .update({ content: `[Voice message] ${transcription}` })
+      .eq('id', msg.id);
+
+    res.json({ transcription });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. Broadcast Lists CRUD
+// GET/POST/PUT/DELETE /api/whatsapp/broadcast-lists
+// POST /api/whatsapp/broadcast-lists/:id/send
+// ─────────────────────────────────────────────────────────────────────────────
+async function getBroadcastLists() {
+  const { data } = await supabase.from('settings').select('value').eq('key', 'wa_broadcast_lists').maybeSingle();
+  return data?.value || [];
+}
+async function saveBroadcastLists(lists) {
+  await supabase.from('settings').upsert({ key: 'wa_broadcast_lists', value: lists, updated_at: new Date().toISOString() });
+}
+
+router.get('/broadcast-lists', auth, async (req, res) => {
+  try { res.json(await getBroadcastLists()); } catch { res.json([]); }
+});
+
+router.post('/broadcast-lists', auth, async (req, res) => {
+  try {
+    const { name, phones, description } = req.body;
+    if (!name) return res.status(400).json({ error: 'name required' });
+    const lists = await getBroadcastLists();
+    const newList = { id: crypto.randomUUID(), name, phones: phones || [], description: description || '', created_at: new Date().toISOString(), created_by: req.user?.name || 'admin' };
+    lists.push(newList);
+    await saveBroadcastLists(lists);
+    res.json(newList);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.put('/broadcast-lists/:id', auth, async (req, res) => {
+  try {
+    const lists = await getBroadcastLists();
+    const idx = lists.findIndex(l => l.id === req.params.id);
+    if (idx < 0) return res.status(404).json({ error: 'List not found' });
+    const { name, phones, description } = req.body;
+    if (name !== undefined) lists[idx].name = name;
+    if (phones !== undefined) lists[idx].phones = phones;
+    if (description !== undefined) lists[idx].description = description;
+    lists[idx].updated_at = new Date().toISOString();
+    await saveBroadcastLists(lists);
+    res.json(lists[idx]);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.delete('/broadcast-lists/:id', auth, async (req, res) => {
+  try {
+    let lists = await getBroadcastLists();
+    lists = lists.filter(l => l.id !== req.params.id);
+    await saveBroadcastLists(lists);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post('/broadcast-lists/:id/send', auth, async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message) return res.status(400).json({ error: 'message required' });
+    const lists = await getBroadcastLists();
+    const list = lists.find(l => l.id === req.params.id);
+    if (!list) return res.status(404).json({ error: 'List not found' });
+
+    let sent = 0, failed = 0;
+    for (const phone of (list.phones || [])) {
+      try {
+        const norm = phone.replace(/\D/g, '');
+        const p = norm.length === 10 ? '91' + norm : norm;
+        await gaSendText(p, message);
+        await storeMessage({ phone: p, direction: 'outbound', type: 'text', content: message, status: 'sent', timestamp: new Date().toISOString(), sent_by: req.user?.name || 'broadcast' });
+        sent++;
+      } catch { failed++; }
+      // 2-second delay between sends to avoid rate limits
+      if (sent + failed < list.phones.length) await new Promise(r => setTimeout(r, 2000));
+    }
+
+    res.json({ sent, failed, total: (list.phones || []).length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. Response Time Analytics
+// GET /api/whatsapp/analytics/response-times
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/analytics/response-times', auth, async (req, res) => {
+  try {
+    const since = new Date(Date.now() - 30 * 86400000).toISOString();
+    const { data: msgs } = await supabase.from('whatsapp_messages')
+      .select('phone,direction,timestamp,sent_by')
+      .gte('timestamp', since)
+      .order('timestamp', { ascending: true })
+      .limit(10000);
+
+    if (!msgs?.length) return res.json({ overall_avg_minutes: 0, per_user: [], peak_hours: [] });
+
+    // Group by phone, find inbound→outbound pairs
+    const byPhone = {};
+    for (const m of msgs) {
+      if (!byPhone[m.phone]) byPhone[m.phone] = [];
+      byPhone[m.phone].push(m);
+    }
+
+    const responseTimes = [];
+    const userTimes = {};
+    const hourCounts = new Array(24).fill(0);
+
+    for (const thread of Object.values(byPhone)) {
+      for (let i = 0; i < thread.length; i++) {
+        if (thread[i].direction === 'inbound') {
+          // Count peak hours
+          const h = new Date(thread[i].timestamp).getHours();
+          hourCounts[h]++;
+          // Find next outbound
+          for (let j = i + 1; j < thread.length; j++) {
+            if (thread[j].direction === 'outbound' && thread[j].sent_by !== 'bot') {
+              const diff = (new Date(thread[j].timestamp) - new Date(thread[i].timestamp)) / 60000;
+              if (diff > 0 && diff < 1440) { // max 24h
+                responseTimes.push(diff);
+                const user = thread[j].sent_by || 'unknown';
+                if (!userTimes[user]) userTimes[user] = [];
+                userTimes[user].push(diff);
+              }
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    const overallAvg = responseTimes.length > 0 ? Math.round(responseTimes.reduce((a, b) => a + b, 0) / responseTimes.length * 10) / 10 : 0;
+    const perUser = Object.entries(userTimes).map(([username, times]) => ({
+      username,
+      avg_minutes: Math.round(times.reduce((a, b) => a + b, 0) / times.length * 10) / 10,
+      total_replies: times.length,
+    })).sort((a, b) => a.avg_minutes - b.avg_minutes);
+    const peakHours = hourCounts.map((count, hour) => ({ hour, message_count: count }));
+
+    res.json({ overall_avg_minutes: overallAvg, per_user: perUser, peak_hours: peakHours });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. Conversation Tags Report
+// GET /api/whatsapp/analytics/tags-report
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/analytics/tags-report', auth, async (req, res) => {
+  try {
+    const [{ data: labelsRow }, { data: defsRow }] = await Promise.all([
+      supabase.from('settings').select('value').eq('key', 'wa_conv_labels').maybeSingle(),
+      supabase.from('settings').select('value').eq('key', 'wa_labels').maybeSingle(),
+    ]);
+    const labels = labelsRow?.value || {};
+    const defs = defsRow?.value || [];
+
+    // Count conversations per tag
+    const counts = {};
+    for (const tags of Object.values(labels)) {
+      for (const tag of (Array.isArray(tags) ? tags : [])) {
+        counts[tag] = (counts[tag] || 0) + 1;
+      }
+    }
+
+    const tags = defs.map(d => ({ id: d.id || d.name, name: d.name, color: d.color || '#6b7280', count: counts[d.id || d.name] || 0 }));
+    // Include auto-tags not in defs
+    for (const [tag, count] of Object.entries(counts)) {
+      if (!tags.find(t => t.id === tag || t.name === tag)) {
+        tags.push({ id: tag, name: tag, color: '#6b7280', count });
+      }
+    }
+
+    res.json({ tags: tags.sort((a, b) => b.count - a.count) });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. Peak Hours Heatmap
+// GET /api/whatsapp/analytics/peak-hours
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/analytics/peak-hours', auth, async (req, res) => {
+  try {
+    const since = new Date(Date.now() - 30 * 86400000).toISOString();
+    const { data: msgs } = await supabase.from('whatsapp_messages')
+      .select('timestamp')
+      .eq('direction', 'inbound')
+      .gte('timestamp', since)
+      .limit(10000);
+
+    // 7 rows (day 0=Sun..6=Sat) × 24 cols (hour 0..23)
+    const heatmap = Array.from({ length: 7 }, () => new Array(24).fill(0));
+    for (const m of (msgs || [])) {
+      const d = new Date(m.timestamp);
+      if (!isNaN(d)) heatmap[d.getDay()][d.getHours()]++;
+    }
+
+    res.json({ heatmap });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 13. SLA Escalation Config
+// GET/PUT /api/whatsapp/sla-config
+// ─────────────────────────────────────────────────────────────────────────────
+router.get('/sla-config', auth, async (req, res) => {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'wa_sla_config').maybeSingle();
+    res.json(data?.value || { warning_minutes: 30, escalate_minutes: 60, escalate_phone: process.env.WA_ADMIN_PHONE1 || '', enabled: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.put('/sla-config', auth, async (req, res) => {
+  try {
+    const { config } = req.body;
+    if (!config) return res.status(400).json({ error: 'config required' });
+    await supabase.from('settings').upsert({ key: 'wa_sla_config', value: config, updated_at: new Date().toISOString() });
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 module.exports = router;
