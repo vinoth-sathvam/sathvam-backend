@@ -1066,22 +1066,10 @@ router.post('/zoho/sync-bank-transactions', auth, async (req, res) => {
     const fromDate = from_date || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
     const toDate   = to_date   || new Date().toISOString().slice(0, 10);
 
-    let page = 1, inserted = 0, updated = 0, skipped = 0;
-    while (true) {
-      const data = await zohoApi('get', `/banktransactions`, null, {
-        organization_id: ZOHO_ORG(),
-        account_id:      zoho_account_id,
-        date_start:      fromDate,
-        date_end:        toDate,
-        page,
-        per_page:        200,
-        sort_column:     'date',
-        sort_order:      'D',
-      });
+    let inserted = 0, updated = 0, skipped = 0;
 
-      const txns = data.banktransactions || [];
-      if (!txns.length) break;
-
+    // Helper: process a batch of Zoho transactions into local bank_transactions
+    const processTxns = async (txns) => {
       for (const t of txns) {
         const zohoTxnId = t.transaction_id;
         const amount    = round2(Math.abs(parseFloat(t.amount) || 0));
@@ -1090,7 +1078,7 @@ router.post('/zoho/sync-bank-transactions', auth, async (req, res) => {
         // Skip Zoho accounting splits — only sync real bank feed entries
         const desc = (t.payee || t.description || '').trim();
         const ref = (t.reference_number || '').trim();
-        const isRealBankTxn = ref.length > 0 || /^(UPI|NEFT|RTGS|INF|MMT|ACH|BIL|MIN|MSI|EZY|Mob alrt)/i.test(desc);
+        const isRealBankTxn = ref.length > 0 || /^(UPI|NEFT|RTGS|INF|MMT|ACH|BIL|MIN|MSI|EZY|Mob alrt|CAM|SMS|Dbt card|Cash dep|POSDEC)/i.test(desc);
         if (!isRealBankTxn && t.source !== 'bank_feed') { skipped++; continue; }
 
         const rec = {
@@ -1121,7 +1109,6 @@ router.post('/zoho/sync-bank-transactions', auth, async (req, res) => {
         } else {
           // Check if this transaction already exists from CSV/manual upload or previous sync
           // Match by: same account + date + type + amount (±₹1 tolerance)
-          // Check ALL existing rows (not just zoho_txn_id=null) to catch every duplicate source
           const { data: dupeMatches } = await supabase
             .from('bank_transactions')
             .select('id, zoho_txn_id, description')
@@ -1135,9 +1122,7 @@ router.post('/zoho/sync-bank-transactions', auth, async (req, res) => {
           const csvMatch = (dupeMatches || []).find(m => !m.zoho_txn_id) || (dupeMatches || [])[0];
 
           if (csvMatch) {
-            // Link/update the existing entry with this Zoho transaction (don't insert a duplicate)
             const updateFields = { zoho_txn_id: zohoTxnId, reconciled: rec.reconciled, updated_at: new Date().toISOString() };
-            // If existing row has no zoho_txn_id, also update description to cleaner Zoho version
             if (!csvMatch.zoho_txn_id && rec.description) updateFields.description = rec.description;
             await supabase.from('bank_transactions')
               .update(updateFields)
@@ -1145,15 +1130,54 @@ router.post('/zoho/sync-bank-transactions', auth, async (req, res) => {
             updated++;
           } else {
             await supabase.from('bank_transactions').insert(rec);
-            // Don't adjust balance here — actual balance is set from Zoho at the end
             inserted++;
           }
         }
       }
+    };
 
+    // Pass 1: Fetch categorized transactions (default Zoho behaviour)
+    let page = 1;
+    while (true) {
+      const data = await zohoApi('get', `/banktransactions`, null, {
+        organization_id: ZOHO_ORG(),
+        account_id:      zoho_account_id,
+        date_start:      fromDate,
+        date_end:        toDate,
+        page,
+        per_page:        200,
+        sort_column:     'date',
+        sort_order:      'D',
+      });
+      const txns = data.banktransactions || [];
+      if (!txns.length) break;
+      await processTxns(txns);
       if (!data.page_context?.has_more_page) break;
       page++;
-      if (page > 20) break; // safety cap
+      if (page > 20) break;
+    }
+
+    // Pass 2: Fetch uncategorized bank feed entries (these are real bank transactions
+    // imported from bank feed but not yet categorized in Zoho — previously missed!)
+    page = 1;
+    while (true) {
+      const data = await zohoApi('get', `/banktransactions`, null, {
+        organization_id: ZOHO_ORG(),
+        account_id:      zoho_account_id,
+        date_start:      fromDate,
+        date_end:        toDate,
+        page,
+        per_page:        200,
+        sort_column:     'date',
+        sort_order:      'D',
+        filter_by:       'Status.Uncategorized',
+      });
+      const txns = data.banktransactions || [];
+      if (!txns.length) break;
+      await processTxns(txns);
+      if (!data.page_context?.has_more_page) break;
+      page++;
+      if (page > 20) break;
     }
 
     // Also update the local account balance from Zoho's current balance
