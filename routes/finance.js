@@ -1079,7 +1079,8 @@ router.post('/zoho/sync-bank-transactions', auth, async (req, res) => {
         const desc = (t.payee || t.description || '').trim();
         const ref = (t.reference_number || '').trim();
         const isRealBankTxn = ref.length > 0 || /^(UPI|NEFT|RTGS|INF|MMT|ACH|BIL|MIN|MSI|EZY|Mob alrt|CAM|SMS|Dbt card|Cash dep|POSDEC)/i.test(desc);
-        if (!isRealBankTxn && t.source !== 'bank_feed') { skipped++; continue; }
+        const isTrustedSource = t.source === 'bank_feed' || t.source === 'manually_added' || t.source === 'categorized' || t.source === 'matched';
+        if (!isRealBankTxn && !isTrustedSource) { skipped++; continue; }
 
         const rec = {
           bank_account_id: local_account_id,
