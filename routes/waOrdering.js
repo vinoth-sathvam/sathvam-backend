@@ -32,6 +32,7 @@ const crypto           = require('crypto');
 const { sendText, toChatId, sendButtons, sendListMessage } = require('../lib/greenapi');
 
 const supabase = require('../config/supabase');
+const { validateCartPrices } = require('../utils/validateCartPrices');
 
 const GREENAPI_BASE = 'https://api.green-api.com';
 const PNG_GEN_URL   = process.env.DOCKER_ENV === 'true'
@@ -1257,7 +1258,21 @@ async function handlePaymentLinkPaid(paymentLinkId, razorpayPaymentId) {
   const cart    = session.cart || [];
 
   const orderNo   = await generateWaOrderNo();
-  const subtotal  = cartTotal(cart);
+
+  // Validate cart prices against current DB values (prevents stale session prices)
+  const rawItems = cart.map(item => ({
+    id:         item.id,
+    product_id: item.id,
+    name:       item.name,
+    qty:        item.qty,
+    unit:       item.packStr || '',
+    price:      item.price,
+    gst:        5,
+  }));
+  const validated = await validateCartPrices({ items: rawItems, shipping: 0 });
+  const items     = validated.items;
+
+  const subtotal  = items.reduce((s, i) => s + (i.qty || 1) * (i.price || 0), 0);
   const gstAmount = Math.round(subtotal * 0.05 * 100) / 100;
   const shipping  = subtotal >= 2500 ? 0 : 60;
   const total     = subtotal + gstAmount + shipping;
@@ -1266,14 +1281,6 @@ async function handlePaymentLinkPaid(paymentLinkId, razorpayPaymentId) {
   const dateStr = ist.toISOString().slice(0, 10);
 
   const customer = { name: session.customer_name || '', phone, address: session.address || '' };
-  const items    = cart.map(item => ({
-    product_id: item.id,
-    name:       item.name,
-    qty:        item.qty,
-    unit:       item.packStr || '',
-    price:      item.price,
-    gst:        5,
-  }));
 
   const { error: insertErr } = await supabase
     .from('webstore_orders')

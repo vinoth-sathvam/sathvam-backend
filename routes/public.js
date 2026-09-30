@@ -2,6 +2,7 @@ const express    = require('express');
 const http       = require('http');
 const supabase   = require('../config/supabase');
 const nodemailer = require('nodemailer');
+const { validateCartPrices } = require('../utils/validateCartPrices');
 const router     = express.Router();
 
 // Bot / crawler detection — skip tracking for known bots
@@ -261,17 +262,26 @@ router.post('/orders', async (req, res) => {
     const o = req.body;
     if (!o.id || !o.orderNo || !o.total) return res.status(400).json({ error: 'Missing required fields' });
 
-    // Insert webstore order
+    // Validate prices against current DB values (prevents stale/tampered prices)
+    const validated = await validateCartPrices({
+      items: o.items || [],
+      subtotal: parseFloat(o.subtotal) || 0,
+      gst: parseFloat(o.gst) || 0,
+      shipping: parseFloat(o.shipping) || 0,
+      total: parseFloat(o.total) || 0,
+    });
+
+    // Insert webstore order with validated prices
     const { error: wsErr } = await supabase.from('webstore_orders').insert({
       id:       o.id,
       order_no: o.orderNo,
       date:     o.date || new Date().toISOString().slice(0, 10),
       customer: o.customer || {},
-      items:    o.items || [],
-      subtotal: parseFloat(o.subtotal) || 0,
-      gst:      parseFloat(o.gst) || 0,
+      items:    validated.items,
+      subtotal: validated.subtotal,
+      gst:      validated.gst,
       shipping: parseFloat(o.shipping) || 0,
-      total:    parseFloat(o.total) || 0,
+      total:    validated.total,
       status:   'confirmed',
       channel:  'website',
     });
@@ -286,16 +296,16 @@ router.post('/orders', async (req, res) => {
       status:         'pending',
       customer_name:  customer.name || '',
       customer_phone: customer.phone || '',
-      total_amount:   parseFloat(o.subtotal) || 0,
+      total_amount:   validated.subtotal,
       discount:       0,
-      final_amount:   parseFloat(o.total) || 0,
-      amount_paid:    customer.payment === 'cod' ? 0 : parseFloat(o.total),
+      final_amount:   validated.total,
+      amount_paid:    customer.payment === 'cod' ? 0 : validated.total,
       payment_method: customer.payment || 'cod',
       notes:          `${customer.address || ''}, ${customer.city || ''}, ${customer.state || ''} - ${customer.pincode || ''}`,
     }).select().single();
 
-    if (!saleErr && sale && Array.isArray(o.items) && o.items.length > 0) {
-      await supabase.from('sale_items').insert(o.items.map(i => ({
+    if (!saleErr && sale && validated.items.length > 0) {
+      await supabase.from('sale_items').insert(validated.items.map(i => ({
         sale_id:      sale.id,
         product_id:   i.id || null,
         product_name: i.name || '',

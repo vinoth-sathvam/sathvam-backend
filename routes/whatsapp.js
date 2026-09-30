@@ -19,6 +19,7 @@ const Razorpay   = require('razorpay');
 const { auth } = require('../middleware/auth');
 const { sendText: gaSendText, sendFile: gaSendFile, sendFileByUpload: gaSendFileByUpload, sendTyping: gaSendTyping } = require('../lib/greenapi');
 const supabase  = require('../config/supabase');
+const { validateCartPrices } = require('../utils/validateCartPrices');
 
 const router    = express.Router();
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
@@ -386,8 +387,12 @@ async function handleFlowSubmission(fromPhone, nfmReply) {
       await sendFlowViaBotSailor(fromPhone, `⚠️ *Stock Alert*\n\n${stockIssues.join('\n')}\n\nWe'll process your order and our team will confirm availability shortly. 📞 +91 70923 77092`);
     }
 
-    // Calculate totals
-    const subtotal = items.reduce((sum, i) => sum + i.qty * i.price, 0);
+    // Validate prices against current DB values (prevents stale prices)
+    const validated = await validateCartPrices({ items, shipping: 0 });
+    const validatedItems = validated.items;
+
+    // Calculate totals using validated prices
+    const subtotal = validatedItems.reduce((sum, i) => sum + i.qty * i.price, 0);
     const gst      = Math.round(subtotal * 0.05 * 100) / 100;
     const shipping  = subtotal >= 499 ? 0 : 50;
     const total     = Math.round((subtotal + gst + shipping) * 100) / 100;
@@ -415,7 +420,7 @@ async function handleFlowSubmission(fromPhone, nfmReply) {
       order_no:       orderNo,
       date:           new Date().toISOString().slice(0, 10),
       customer,
-      items,
+      items:          validatedItems,
       subtotal,
       gst,
       shipping,
@@ -588,24 +593,45 @@ router.post('/webhook', express.json(), async (req, res) => {
           }
 
           // ── Blog WA share approval via WhatsApp reply ──────────────────
-          if (msg.type === 'text' && /^(approve|approved|ok|yes)\s*$/i.test(content.trim())) {
-            const adminPhones = [process.env.WA_ADMIN_PHONE1, process.env.WA_ADMIN_PHONE2].filter(Boolean).map(p => {
-              const d = (p || '').replace(/\D/g, '');
-              return d.length === 10 ? '91' + d : d;
-            });
-            if (adminPhones.includes(phone)) {
-              try {
-                const { data: apRow } = await supabase.from('settings').select('value').eq('key', 'blog_wa_approvals').single();
-                const approvals = apRow?.value || {};
-                const pending = Object.entries(approvals).filter(([, v]) => v === 'pending');
-                if (pending.length) {
-                  for (const [blogId] of pending) approvals[blogId] = 'approved';
-                  await supabase.from('settings').upsert({ key: 'blog_wa_approvals', value: approvals, updated_at: new Date().toISOString() });
+          if (msg.type === 'text') {
+            const trimmed = content.trim();
+            const isApprove = /^(approve|approved|ok|yes)\s*$/i.test(trimmed);
+            const isReject = /^(reject|rejected|no|skip)\s*$/i.test(trimmed);
+
+            if (isApprove || isReject) {
+              const adminPhones = [process.env.WA_ADMIN_PHONE1, process.env.WA_ADMIN_PHONE2].filter(Boolean).map(p => {
+                const d = (p || '').replace(/\D/g, '');
+                return d.length === 10 ? '91' + d : d;
+              });
+              if (adminPhones.includes(phone)) {
+                try {
+                  const { data: apRow } = await supabase.from('settings').select('value').eq('key', 'blog_wa_approvals').single();
+                  const approvals = apRow?.value || {};
+                  const pending = Object.entries(approvals).filter(([, v]) => v === 'pending');
                   const { sendText: gaSend } = require('../lib/greenapi');
-                  await gaSend(phone, `✅ ${pending.length} blog(s) approved for WhatsApp sharing! Sending will start within 15 minutes.`);
-                  continue;
-                }
-              } catch (e) { console.error('[blog-approve-wa]', e.message); }
+
+                  if (pending.length) {
+                    const newStatus = isApprove ? 'approved' : 'rejected';
+                    // Get blog titles for confirmation
+                    const blogIds = pending.map(([id]) => id);
+                    const { data: blogs } = await supabase.from('blog_posts').select('id, title').in('id', blogIds);
+                    const titleMap = {};
+                    if (blogs) blogs.forEach(b => { titleMap[b.id] = b.title; });
+
+                    for (const [blogId] of pending) approvals[blogId] = newStatus;
+                    await supabase.from('settings').upsert({ key: 'blog_wa_approvals', value: approvals, updated_at: new Date().toISOString() });
+
+                    if (isApprove) {
+                      const titles = pending.map(([id]) => '• ' + (titleMap[id] || id).slice(0, 50)).join('\n');
+                      await gaSend(phone, `✅ ${pending.length} blog(s) approved!\n\n${titles}\n\nSending to customers will start within 1 hour.`);
+                    } else {
+                      const titles = pending.map(([id]) => '• ' + (titleMap[id] || id).slice(0, 50)).join('\n');
+                      await gaSend(phone, `🚫 ${pending.length} blog(s) rejected.\n\n${titles}\n\nThese will NOT be sent to customers.`);
+                    }
+                    continue;
+                  }
+                } catch (e) { console.error('[blog-approve-wa]', e.message); }
+              }
             }
           }
 

@@ -14,6 +14,7 @@ const { auth }     = require('../middleware/auth');
 const rateLimit    = require('express-rate-limit');
 const { decryptCustomer, hmac, encryptCustomer } = require('../config/crypto');
 const { sendText: gaSendText, sendFile: gaSendFile, sendContact: gaSendContact, isAutomationDisabled } = require('../lib/greenapi');
+const { validateCartPrices } = require('../utils/validateCartPrices');
 const router       = express.Router();
 
 // Embed logo as base64 so wkhtmltoimage doesn't need network access
@@ -933,10 +934,26 @@ async function updateOrder(req, res) {
   if (dispatch_date        !== undefined) updates.dispatch_date        = dispatch_date;
   if (delivered_date       !== undefined) updates.delivered_date       = delivered_date;
   if (cancel_reason        !== undefined) updates.cancel_reason        = cancel_reason;
-  if (items                !== undefined) updates.items                = items;
-  if (subtotal             !== undefined) updates.subtotal             = subtotal;
-  if (gst_amount           !== undefined) updates.gst_amount           = gst_amount;
-  if (total                !== undefined) updates.total                = total;
+  // Validate prices when items are being updated
+  if (items !== undefined) {
+    try {
+      const validated = await validateCartPrices({ items, subtotal, gst: gst_amount, total, shipping: 0 });
+      updates.items    = validated.items;
+      updates.subtotal = validated.subtotal;
+      updates.gst_amount = validated.gst;
+      updates.total    = validated.total;
+    } catch (e) {
+      console.error('[updateOrder] Price validation failed, using submitted prices:', e.message);
+      updates.items = items;
+      if (subtotal  !== undefined) updates.subtotal  = subtotal;
+      if (gst_amount !== undefined) updates.gst_amount = gst_amount;
+      if (total     !== undefined) updates.total     = total;
+    }
+  } else {
+    if (subtotal             !== undefined) updates.subtotal             = subtotal;
+    if (gst_amount           !== undefined) updates.gst_amount           = gst_amount;
+    if (total                !== undefined) updates.total                = total;
+  }
   if (carton_box_id        !== undefined) updates.carton_box_id        = carton_box_id;
   if (carton_box_name      !== undefined) updates.carton_box_name      = carton_box_name;
   if (carton_box_cost      !== undefined) updates.carton_box_cost      = carton_box_cost;
@@ -955,6 +972,16 @@ async function updateOrder(req, res) {
   const data = rows[0];
 
   const decrypted = decryptOrder(data);
+
+  // Sync status to paired sales table record (fire-and-forget)
+  if (status && decrypted) {
+    const orderNo = decrypted.order_no || '';
+    if (orderNo) {
+      supabase.from('sales').update({ status }).eq('order_no', orderNo)
+        .then(() => {})
+        .catch(e => console.error('[SALES-SYNC] Failed to sync status:', e.message));
+    }
+  }
 
   // Fire-and-forget notifications + stock automations on status change
   if (status && decrypted) {
