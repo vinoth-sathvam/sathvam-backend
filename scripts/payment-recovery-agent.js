@@ -252,21 +252,7 @@ async function recoverPayment(payment) {
     created_by:   'system',
   }).catch(() => {});
 
-  // Finished goods deduction
-  try {
-    const fgItems = (o.items || []).filter(i => parseFloat(i.qty) > 0);
-    if (fgItems.length) {
-      await supabase.from('finished_goods').insert(fgItems.map(i => ({
-        product_name: i.name || '', category: 'other', unit: 'pcs',
-        qty: parseFloat(i.qty), type: 'out',
-        date: orderDate,
-        notes: `Auto: Webstore order ${orderNo} (agent-recovered)`,
-        batch_ref: orderNo, created_by: 'system',
-        created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-      })));
-      log('✅', 'Finished goods deducted');
-    }
-  } catch (fgErr) { log('⚠️', 'FG deduction error:', fgErr.message); }
+  // Stock deducted at shipped status in webstoreOrders.js (single source of truth)
 
   // Zoho invoice
   try {

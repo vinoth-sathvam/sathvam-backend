@@ -354,29 +354,7 @@ router.post('/verify', async (req, res) => {
         console.error('Zoho invoice error:', ze.message);
       }
 
-      // Auto-deduct from finished goods
-      try {
-        const fgItems = (o.items || []).filter(i => parseFloat(i.qty) > 0);
-        if (fgItems.length) {
-          await supabase.from('finished_goods').insert(
-            fgItems.map(i => ({
-              product_name: i.name || '',
-              category:     'other',
-              unit:         'pcs',
-              qty:          parseFloat(i.qty),
-              type:         'out',
-              date:         o.date || new Date().toISOString().slice(0, 10),
-              notes:        `Auto: Webstore order ${o.orderNo}`,
-              batch_ref:    o.orderNo || '',
-              created_by:   'system',
-              created_at:   new Date().toISOString(),
-              updated_at:   new Date().toISOString(),
-            }))
-          );
-        }
-      } catch (fgErr) {
-        console.error('Finished goods webstore deduction error:', fgErr.message);
-      }
+      // Stock deducted at shipped status in webstoreOrders.js (single source of truth)
     });
 
     // Clean up stashed pending order data
@@ -827,19 +805,7 @@ async function handleRazorpayWebhook(req, res) {
                   await supabase.from('webstore_orders').update({ zoho_invoice_id: invoice.invoice_id }).eq('order_no', generatedOrderNo);
                 }
               } catch (ze) { console.error('[webhook-recovery] Zoho error:', ze.message); }
-              try {
-                const fgItems = (o.items || []).filter(i => parseFloat(i.qty) > 0);
-                if (fgItems.length) {
-                  await supabase.from('finished_goods').insert(fgItems.map(i => ({
-                    product_name: i.name || '', category: 'other', unit: 'pcs',
-                    qty: parseFloat(i.qty), type: 'out',
-                    date: o.date || new Date().toISOString().slice(0, 10),
-                    notes: `Auto: Webstore order ${generatedOrderNo} (webhook)`,
-                    batch_ref: generatedOrderNo, created_by: 'system',
-                    created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
-                  })));
-                }
-              } catch (fgErr) { console.error('[webhook-recovery] FG deduction error:', fgErr.message); }
+              // Stock deducted at shipped status in webstoreOrders.js (single source of truth)
             });
 
             // Clean up stashed data

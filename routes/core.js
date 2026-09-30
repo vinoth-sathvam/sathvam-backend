@@ -1522,17 +1522,31 @@ sales.post('/', auth, async (req, res) => {
       }
     }
 
-    // Auto-deduct from finished goods + stock_ledger
+    // Auto-deduct from finished goods + stock_ledger (with duplicate guard)
     try {
       const fgItems = (s.items || []).filter(i => parseFloat(i.qty) > 0);
       const saleDate = s.date || new Date().toISOString().slice(0, 10);
       if (fgItems.length) {
-        await supabase.from('finished_goods').insert(
-          fgItems.map(i => ({
-            product_name: i.productName || '',
+        // Duplicate guard: check if finished_goods OUT rows already exist for this order
+        const { data: existingFG } = await supabase.from('finished_goods')
+          .select('product_name,qty').eq('type', 'out').eq('batch_ref', s.orderNo || '');
+        const existingMap = {};
+        for (const r of (existingFG || [])) existingMap[r.product_name] = (existingMap[r.product_name] || 0) + parseFloat(r.qty || 0);
+
+        const fgRows = [];
+        const ledgerRows = [];
+        for (const i of fgItems) {
+          const pname = i.productName || '';
+          const needed = parseFloat(i.qty) || 0;
+          const already = existingMap[pname] || 0;
+          const gap = needed - already;
+          if (gap <= 0) continue;
+
+          fgRows.push({
+            product_name: pname,
             category:     'other',
             unit:         i.unit || 'pcs',
-            qty:          parseFloat(i.qty),
+            qty:          gap,
             type:         'out',
             date:         saleDate,
             notes:        `Auto: POS sale ${s.orderNo}`,
@@ -1540,25 +1554,28 @@ sales.post('/', auth, async (req, res) => {
             created_by:   'system',
             created_at:   new Date().toISOString(),
             updated_at:   new Date().toISOString(),
-          }))
-        );
+          });
 
-        // Also decrement stock_ledger so StockProfitForecast stays accurate
-        const ledgerRows = fgItems
-          .filter(i => i.productId)
-          .map(i => ({
-            product_id:   i.productId,
-            product_name: i.productName || '',
-            date:         saleDate,
-            type:         'out',
-            qty:          parseFloat(i.qty),
-            unit:         i.unit || 'pcs',
-            rate:         parseFloat(i.rate) || 0,
-            total_value:  parseFloat(i.total) || 0,
-            channel:      'sale',
-            reference:    s.orderNo || '',
-            notes:        `POS sale — ${s.orderNo}`,
-          }));
+          if (i.productId) {
+            ledgerRows.push({
+              product_id:   i.productId,
+              product_name: pname,
+              date:         saleDate,
+              type:         'out',
+              qty:          gap,
+              unit:         i.unit || 'pcs',
+              rate:         parseFloat(i.rate) || 0,
+              total_value:  (parseFloat(i.rate) || 0) * gap,
+              channel:      'sale',
+              reference:    s.orderNo || '',
+              notes:        `POS sale — ${s.orderNo}`,
+            });
+          }
+        }
+
+        if (fgRows.length) {
+          await supabase.from('finished_goods').insert(fgRows);
+        }
         if (ledgerRows.length) {
           await supabase.from('stock_ledger').insert(ledgerRows);
         }
@@ -1714,7 +1731,7 @@ settings.put('/:key', auth, requireRole('admin','manager'), async (req, res) => 
 
 const users = express.Router();
 users.get('/', auth, requireRole('admin'), async (req, res) => {
-  const { data, error } = await supabase.from('users').select('id,name,username,email,role,active,created_at');
+  const { data, error } = await supabase.from('users').select('id,name,username,email,role,active,created_at,force_password_change,force_2fa');
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -1722,10 +1739,13 @@ users.post('/', auth, requireRole('admin'), async (req, res) => {
   const u = req.body;
   if (!u.password || u.password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   const hash = await bcrypt.hash(u.password, 12);
-  const { data, error } = await supabase.from('users').insert({
+  const insert = {
     username:u.username, name:u.name, email:u.email,
     password:hash, role:u.role||'manager', active:true
-  }).select('id,name,username,email,role,active').single();
+  };
+  if (u.force_password_change) insert.force_password_change = true;
+  if (u.force_2fa) insert.force_2fa = true;
+  const { data, error } = await supabase.from('users').insert(insert).select('id,name,username,email,role,active').single();
   if (error) return res.status(400).json({ error: error.message });
   res.status(201).json(data);
 });
@@ -1733,7 +1753,7 @@ users.put('/:id', auth, requireRole('admin'), async (req, res) => {
   const u = req.body;
   const updates = { name:u.name, email:u.email, role:u.role, active:u.active };
   if (u.password) updates.password = await bcrypt.hash(u.password, 12);
-  const { data, error } = await supabase.from('users').update(updates).eq('id', req.params.id).select('id,name,username,role,active').single();
+  const { data, error } = await supabase.from('users').update(updates).eq('id', req.params.id).select('id,name,username,email,role,active').single();
   if (error) return res.status(400).json({ error: error.message });
   res.json(data);
 });
