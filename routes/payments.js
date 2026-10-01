@@ -11,6 +11,19 @@ const { insertLedger } = require('../utils/ledger');
 const { validateCartPrices } = require('../utils/validateCartPrices');
 const { sendText: gaSendText, sendFile: gaSendFile, sendToGroup, isAutomationDisabled } = require('../lib/greenapi');
 
+// ── Blocked customer check ──────────────────────────────────────────────────
+async function isCustomerBlocked(email, phone) {
+  try {
+    const { data } = await supabase.from('settings').select('value').eq('key', 'blocked_customers').maybeSingle();
+    const list = data?.value || { emails: [], phones: [] };
+    const normEmail = (email || '').toLowerCase().trim();
+    const normPhone = (phone || '').replace(/\D/g, '').slice(-10);
+    if (normEmail && list.emails.some(e => e.toLowerCase() === normEmail)) return true;
+    if (normPhone && list.phones.some(p => p.replace(/\D/g, '').slice(-10) === normPhone)) return true;
+    return false;
+  } catch { return false; } // fail open
+}
+
 // ── Email transporter ─────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST || 'smtp.gmail.com',
@@ -178,6 +191,14 @@ router.post('/create-order', async (req, res) => {
     const { amount, orderNo, orderData } = req.body;
     if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid amount' });
 
+    // Block banned customers before payment
+    if (orderData?.customer) {
+      const c = orderData.customer;
+      if (await isCustomerBlocked(c.email, c.phone)) {
+        return res.status(403).json({ error: 'We are unable to process your order at this time. Please contact support.' });
+      }
+    }
+
     // Validate cart prices against current DB prices
     let validatedOrder = orderData;
     let chargeAmount = parseFloat(amount);
@@ -247,6 +268,12 @@ router.post('/verify', async (req, res) => {
     // Re-validate cart prices against current DB before saving
     const o = await validateCartPrices(order);
     const rawCustomer = o.customer || {};
+
+    // Block banned customers
+    if (await isCustomerBlocked(rawCustomer.email, rawCustomer.phone)) {
+      return res.status(403).json({ error: 'We are unable to process your order at this time. Please contact support.' });
+    }
+
     const encCustomer = encryptCustomer(rawCustomer);
     const custEmailHash = hmac(rawCustomer.email || '');
     const dbId = crypto.randomUUID(); // always use a proper UUID for the DB row
@@ -1043,6 +1070,12 @@ router.post('/place-cod', async (req, res) => {
     // Validate cart prices against current DB before saving
     const order = await validateCartPrices(rawOrder);
     const rawCustomer = order.customer || {};
+
+    // Block banned customers
+    if (await isCustomerBlocked(rawCustomer.email, rawCustomer.phone)) {
+      return res.status(403).json({ error: 'We are unable to process your order at this time. Please contact support.' });
+    }
+
     const encCustomer = encryptCustomer(rawCustomer);
     const custEmailHash = hmac(rawCustomer.email || '');
     const dbId = crypto.randomUUID();
