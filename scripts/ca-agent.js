@@ -33,7 +33,7 @@ const supabase  = require('../config/supabase');
 const Anthropic        = require('@anthropic-ai/sdk');
 const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY }) : null;
 
-const ADMIN_PHONE = process.env.ADMIN_WHATSAPP_PHONE || process.env.WA_ADMIN_PHONE;
+const ADMIN_PHONE = process.env.ADMIN_WHATSAPP_PHONE || process.env.WA_ADMIN_PHONE || process.env.WA_ADMIN_PHONE1;
 const round2      = n => Math.round((parseFloat(n) || 0) * 100) / 100;
 
 // Current Indian financial year: April 1 to March 31
@@ -857,6 +857,61 @@ async function checkExpenses() {
   return findings;
 }
 
+async function checkProduction() {
+  const findings = [];
+  const today = new Date();
+  const ago30 = new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10);
+  const ago7  = new Date(Date.now() -  7 * 864e5).toISOString().slice(0, 10);
+
+  const [batches30, flour30, batches7] = await Promise.all([
+    supabase.from('batches').select('id,oil_type,oil_output,raw_input_kg,date').gte('date', ago30),
+    supabase.from('flour_batches').select('id,commodity,flour_received_kg,input_kg,date').gte('date', ago30),
+    supabase.from('batches').select('id').gte('date', ago7),
+  ]);
+
+  const oilBatches  = batches30.data || [];
+  const flourBatch  = flour30.data || [];
+  const recentOil   = batches7.data || [];
+
+  // No production in 7 days
+  if (recentOil.length === 0 && flourBatch.filter(f => f.date >= ago7).length === 0) {
+    findings.push(finding('Production', 'high',
+      'No production batches in the last 7 days',
+      `Neither oil pressing nor flour/spice processing recorded. Check if factory is idle. Last 30 days: ${oilBatches.length} oil batches, ${flourBatch.length} flour/spice batches.`
+    ));
+  }
+
+  // Oil yield analysis
+  if (oilBatches.length > 0) {
+    const byType = {};
+    for (const b of oilBatches) {
+      if (!byType[b.oil_type]) byType[b.oil_type] = { input: 0, output: 0, count: 0 };
+      byType[b.oil_type].input  += parseFloat(b.raw_input_kg || 0);
+      byType[b.oil_type].output += parseFloat(b.oil_output || 0);
+      byType[b.oil_type].count++;
+    }
+    for (const [type, d] of Object.entries(byType)) {
+      const yieldPct = d.input > 0 ? (d.output / d.input * 100) : 0;
+      if (yieldPct < 25 && d.input > 50) {
+        findings.push(finding('Production', 'medium',
+          `Low oil yield for ${type}: ${yieldPct.toFixed(1)}%`,
+          `${d.count} batches, ${d.input.toFixed(0)} kg input → ${d.output.toFixed(1)} L output. Expected ~30-45%. Check pressing efficiency.`
+        ));
+      }
+    }
+  }
+
+  // No production at all in 30 days
+  if (oilBatches.length === 0 && flourBatch.length === 0) {
+    findings.push(finding('Production', 'critical',
+      'Zero production in 30 days — factory appears idle',
+      'No oil batches or flour/spice batches recorded. Verify operations status. Raw material costs continue but no output.',
+    ));
+  }
+
+  return findings;
+}
+
 async function checkRevenue() {
   const findings  = [];
   const today     = new Date();
@@ -865,20 +920,27 @@ async function checkRevenue() {
   const lastMonthEnd   = new Date(today.getFullYear(), today.getMonth(), 0).toISOString().slice(0, 10);
   const daysInMonth    = new Date(today.getFullYear(), today.getMonth() + 1, 0).getDate();
 
-  const [salesThis, wsThis, salesLast, wsLast] = await Promise.all([
-    supabase.from('sales').select('final_amount').in('status',['delivered','dispatched']).gte('date', thisMonthStart),
-    supabase.from('webstore_orders').select('total').in('status', ['confirmed', 'packed', 'shipped', 'delivered']).gte('date', thisMonthStart),
-    supabase.from('sales').select('final_amount').in('status',['delivered','dispatched']).gte('date', lastMonthStart).lte('date', lastMonthEnd),
-    supabase.from('webstore_orders').select('total').in('status', ['confirmed', 'packed', 'shipped', 'delivered']).gte('date', lastMonthStart).lte('date', lastMonthEnd),
+  // Include all non-cancelled statuses for accurate revenue
+  const salesStatuses = ['confirmed','pending','dispatched','delivered','paid'];
+  const wsStatuses    = ['new','confirmed','packed','shipped','delivered'];
+  const [salesThis, wsThis, salesLast, wsLast, b2bThis, b2bLast] = await Promise.all([
+    supabase.from('sales').select('final_amount').in('status', salesStatuses).gte('date', thisMonthStart),
+    supabase.from('webstore_orders').select('total').in('status', wsStatuses).gte('date', thisMonthStart),
+    supabase.from('sales').select('final_amount').in('status', salesStatuses).gte('date', lastMonthStart).lte('date', lastMonthEnd),
+    supabase.from('webstore_orders').select('total').in('status', wsStatuses).gte('date', lastMonthStart).lte('date', lastMonthEnd),
+    supabase.from('b2b_orders').select('total_value').in('stage', ['delivered','invoice_paid']).gte('created_at', thisMonthStart),
+    supabase.from('b2b_orders').select('total_value').in('stage', ['delivered','invoice_paid']).gte('created_at', lastMonthStart).lte('created_at', lastMonthEnd),
   ]);
 
   const revThis = round2(
     (salesThis.data || []).reduce((s, x) => s + parseFloat(x.final_amount || 0), 0) +
-    (wsThis.data   || []).reduce((s, x) => s + parseFloat(x.total || 0), 0)
+    (wsThis.data   || []).reduce((s, x) => s + parseFloat(x.total || 0), 0) +
+    (b2bThis.data  || []).reduce((s, x) => s + parseFloat(x.total_value || 0), 0)
   );
   const revLast = round2(
     (salesLast.data || []).reduce((s, x) => s + parseFloat(x.final_amount || 0), 0) +
-    (wsLast.data   || []).reduce((s, x) => s + parseFloat(x.total || 0), 0)
+    (wsLast.data   || []).reduce((s, x) => s + parseFloat(x.total || 0), 0) +
+    (b2bLast.data  || []).reduce((s, x) => s + parseFloat(x.total_value || 0), 0)
   );
   const proratedLast = round2(revLast * (today.getDate() / daysInMonth));
 
@@ -891,12 +953,18 @@ async function checkRevenue() {
   }
 
   const since7d = new Date(Date.now() - 7 * 86400000).toISOString().slice(0, 10);
-  const { data: dailySales } = await supabase
-    .from('sales').select('date,final_amount').gte('date', since7d).in('status',['delivered','dispatched']);
+  const [{ data: dailySales }, { data: dailyWS }] = await Promise.all([
+    supabase.from('sales').select('date,final_amount').gte('date', since7d).in('status', salesStatuses),
+    supabase.from('webstore_orders').select('date,total').gte('date', since7d).in('status', wsStatuses),
+  ]);
 
   const salesByDay = {};
   for (const s of dailySales || []) {
     salesByDay[s.date] = (salesByDay[s.date] || 0) + parseFloat(s.final_amount || 0);
+  }
+  for (const w of dailyWS || []) {
+    const d = (w.date || '').slice(0, 10);
+    salesByDay[d] = (salesByDay[d] || 0) + parseFloat(w.total || 0);
   }
   const zeroDays = [];
   for (let i = 1; i <= 7; i++) {
@@ -1072,7 +1140,7 @@ async function checkDoubleEntry() {
   const { data: paidSales } = await supabase
     .from('sales')
     .select('id,order_no,final_amount,date,customer_name')
-    .eq('status', 'paid')
+    .in('status', ['confirmed','dispatched','delivered','paid'])
     .gte('date', since30)
     .limit(200);
 
@@ -1716,8 +1784,9 @@ const { sendText: gaSendText, isAutomationDisabled } = require('../lib/greenapi'
 
 async function sendWhatsApp(phone, message) {
   try {
-    await gaSendText(phone, message);
-    console.log('WhatsApp alert sent to', phone);
+    const ok = await gaSendText(phone, message, { priority: true });
+    if (ok) console.log('WhatsApp alert sent to', phone);
+    else console.warn('WhatsApp send returned false (rate limited?) for', phone);
   } catch (e) {
     console.error('WhatsApp send failed:', e.message);
   }
@@ -1739,12 +1808,15 @@ async function main() {
   try {
     const today = new Date().toISOString().slice(0, 10);
     const ago30 = new Date(Date.now() - 30 * 864e5).toISOString().slice(0, 10);
-    const [bills, bankAccs, sales30, ws30, b2bPending] = await Promise.all([
+    const [bills, bankAccs, sales30, ws30, b2bPending, b2bDelivered30, batches30, flourBatches30] = await Promise.all([
       supabase.from('vendor_bills').select('amount,gst_amount,paid_amount,due_date,status').is('deleted_at', null),
       supabase.from('bank_accounts').select('current_balance').eq('is_active', true),
-      supabase.from('sales').select('final_amount').in('status',['delivered','dispatched']).gte('date', ago30),
-      supabase.from('webstore_orders').select('total').in('status', ['confirmed', 'shipped', 'delivered']).gte('date', ago30),
-      supabase.from('b2b_orders').select('total_value').not('stage', 'in', '("delivered","cancelled")'),
+      supabase.from('sales').select('final_amount').in('status',['confirmed','pending','dispatched','delivered','paid']).gte('date', ago30),
+      supabase.from('webstore_orders').select('total').in('status', ['new','confirmed','packed','shipped','delivered']).gte('date', ago30),
+      supabase.from('b2b_orders').select('total_value').not('stage', 'in', '("delivered","cancelled","invoice_paid")'),
+      supabase.from('b2b_orders').select('total_value').in('stage', ['delivered','invoice_paid']).gte('created_at', ago30),
+      supabase.from('batches').select('id,oil_type,oil_output,date').gte('date', ago30),
+      supabase.from('flour_batches').select('id,commodity,flour_received_kg,date').gte('date', ago30),
     ]);
     const billList  = bills.data || [];
     const apOverdue = billList.filter(b => b.status !== 'paid' && b.due_date && b.due_date < today)
@@ -1754,7 +1826,12 @@ async function main() {
       ar_total:     (b2bPending.data || []).reduce((s, x) => s + (x.total_value || 0), 0),
       ap_overdue:   apOverdue,
       revenue_30d:  (sales30.data || []).reduce((s, x) => s + (x.final_amount || 0), 0) +
-                    (ws30.data   || []).reduce((s, x) => s + (x.total || 0), 0),
+                    (ws30.data   || []).reduce((s, x) => s + (x.total || 0), 0) +
+                    (b2bDelivered30.data || []).reduce((s, x) => s + (x.total_value || 0), 0),
+      oil_batches_30d: (batches30.data || []).length,
+      oil_output_30d:  (batches30.data || []).reduce((s, x) => s + parseFloat(x.oil_output || 0), 0),
+      flour_batches_30d: (flourBatches30.data || []).length,
+      flour_output_30d:  (flourBatches30.data || []).reduce((s, x) => s + parseFloat(x.flour_received_kg || 0), 0),
     };
   } catch (e) {
     console.error('Dashboard fetch failed:', e.message);
@@ -1773,6 +1850,7 @@ async function main() {
     checkBooksQuality().catch(e=>{ console.error('BooksQuality check failed:', e.message); return []; }),
     checkPayroll().catch(e    => { console.error('Payroll check failed:', e.message); return []; }),
     checkExpenses().catch(e   => { console.error('Expenses check failed:', e.message); return []; }),
+    checkProduction().catch(e => { console.error('Production check failed:', e.message); return []; }),
     checkRevenue().catch(e    => { console.error('Revenue check failed:', e.message); return []; }),
     checkCompliance().catch(e => { console.error('Compliance check failed:', e.message); return []; }),
     checkDoubleEntry().catch(e => { console.error('DoubleEntry check failed:', e.message); return []; }),
