@@ -1085,7 +1085,7 @@ router.post('/zoho/sync-bank-transactions', auth, async (req, res) => {
         const rec = {
           bank_account_id: local_account_id,
           date:            t.date,
-          type:            t.debit_or_credit === 'debit' ? 'credit' : 'debit',
+          type:            t.debit_or_credit === 'credit' ? 'credit' : 'debit',
           amount,
           description:     desc || ref || '',
           reference:       ref || t.transaction_id || '',
@@ -1234,7 +1234,7 @@ router.get('/zoho/bank-statement', auth, async (req, res) => {
     const transactions = (data.banktransactions || []).map(t => ({
       zoho_txn_id:     t.transaction_id,
       date:            t.date,
-      type:            t.debit_or_credit === 'debit' ? 'credit' : 'debit',
+      type:            t.debit_or_credit === 'credit' ? 'credit' : 'debit',
       amount:          round2(Math.abs(parseFloat(t.amount) || 0)),
       payee:           t.payee || '',
       description:     t.description || '',

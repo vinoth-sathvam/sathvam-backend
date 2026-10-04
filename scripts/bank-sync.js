@@ -102,7 +102,7 @@ async function run() {
       const rec = {
         bank_account_id: LOCAL_ACCOUNT_ID,
         date:            t.date,
-        type:            t.debit_or_credit === 'debit' ? 'credit' : 'debit',
+        type:            t.debit_or_credit === 'credit' ? 'credit' : 'debit',
         amount,
         description:     desc || ref || '',
         reference:       ref || t.transaction_id || '',

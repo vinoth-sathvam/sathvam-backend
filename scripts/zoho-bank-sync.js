@@ -49,7 +49,7 @@ async function main() {
 
         const rec = {
           bank_account_id: acct.id, date: t.date,
-          type: t.debit_or_credit === 'debit' ? 'credit' : 'debit',
+          type: t.debit_or_credit === 'credit' ? 'credit' : 'debit',
           amount, description: desc || ref || '', reference: ref || t.transaction_id || '',
           category: t.category_name || t.account_name || '',
           zoho_txn_id: zohoTxnId,
