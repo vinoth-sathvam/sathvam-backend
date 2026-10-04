@@ -661,51 +661,32 @@ procurement.get('/commodity-costs', auth, async (req, res) => {
       .order('date', { ascending: false });
     if (error) return res.status(500).json({ error: error.message });
 
-    // Weighted-average landed cost per commodity across all qualifying procurements
-    const groups = {};
+    // Latest procurement landed cost per commodity (last-purchase-price method)
+    // Data is already sorted by date DESC, so first entry per commodity_id is the latest
+    const costMap = {};
     (data || []).forEach(p => {
       const cid = p.commodity_id;
-      if (!groups[cid]) groups[cid] = { commodityName: p.commodity_name, entries: [] };
+      if (costMap[cid]) return; // already have the latest for this commodity
       const baseAndLogistics   = parseFloat(p.ordered_price_per_kg) || 0;
       const gstPct             = parseFloat(p.gst) || 0;
       const logisticsCostPerKg = parseFloat(p.logistics_cost_per_kg) || 0;
       const qty                = parseFloat(p.ordered_qty) || 0;
-      // Base (ex-logistics) — GST applies to vendor invoice only, NOT to freight
-      const basePerKg  = baseAndLogistics - logisticsCostPerKg;
-      const gstAmount  = basePerKg * gstPct / 100;
-      const landedCost = basePerKg + gstAmount + logisticsCostPerKg;
-      groups[cid].entries.push({ qty, landedCost, basePerKg, gstAmount, logisticsCostPerKg, gstPct, date: p.date, supplier: p.supplier });
-    });
-
-    const costMap = {};
-    Object.entries(groups).forEach(([cid, g]) => {
-      const totalQty    = g.entries.reduce((s, e) => s + e.qty, 0);
-      const wavgLanded  = totalQty > 0
-        ? g.entries.reduce((s, e) => s + e.landedCost * e.qty, 0) / totalQty
-        : (g.entries[0]?.landedCost || 0);
-      const wavgBase    = totalQty > 0
-        ? g.entries.reduce((s, e) => s + e.basePerKg * e.qty, 0) / totalQty : 0;
-      const wavgGst     = totalQty > 0
-        ? g.entries.reduce((s, e) => s + e.gstAmount * e.qty, 0) / totalQty : 0;
-      const wavgLogist  = totalQty > 0
-        ? g.entries.reduce((s, e) => s + e.logisticsCostPerKg * e.qty, 0) / totalQty : 0;
-      // For display: most recent date + unique suppliers
-      const latestDate  = g.entries[0]?.date;
-      const suppliers   = [...new Set(g.entries.map(e => e.supplier).filter(Boolean))].join(', ');
-      const gstPct      = g.entries[0]?.gstPct || 0;
-      const batchCount  = g.entries.length;
+      // GST applies to orderedPricePerKg (matches frontend landed cost display)
+      const gstAmount  = baseAndLogistics * gstPct / 100;
+      const landedCost = baseAndLogistics + gstAmount + logisticsCostPerKg;
+      const basePerKg  = baseAndLogistics;
       costMap[cid] = {
         commodityId:        cid,
-        commodityName:      g.commodityName,
-        costPerKg:          Math.round(wavgLanded  * 100) / 100,
-        basePerKg:          Math.round(wavgBase    * 100) / 100,
-        gstAmount:          Math.round(wavgGst     * 100) / 100,
-        logisticsCostPerKg: Math.round(wavgLogist  * 100) / 100,
+        commodityName:      p.commodity_name,
+        costPerKg:          Math.round(landedCost * 100) / 100,
+        basePerKg:          Math.round(basePerKg  * 100) / 100,
+        gstAmount:          Math.round(gstAmount  * 100) / 100,
+        logisticsCostPerKg: Math.round(logisticsCostPerKg * 100) / 100,
         gstPct,
-        totalQtyKg:         Math.round(totalQty    * 100) / 100,
-        batchCount,
-        date:               latestDate,
-        supplier:           suppliers,
+        totalQtyKg:         Math.round(qty * 100) / 100,
+        batchCount:         1,
+        date:               p.date,
+        supplier:           p.supplier || '',
       };
     });
     res.json(costMap);
@@ -788,6 +769,22 @@ procurement.post('/', auth, requireRole('admin','manager'), async (req, res) => 
           console.log(`[AUTO] Vendor bill created (upfront) for ${invoiceNo||'no-inv'}: ₹${amount}, paid ₹${paidAmt}`);
         }
       } catch(e) { console.error('[AUTO] Procurement upfront bill error:', e.message); }
+    });
+  }
+
+  // Auto-trigger Cost Monitor Agent when new PO is created with status 'stocked'
+  if ((p.status || 'ordered') === 'stocked' && data) {
+    setImmediate(() => {
+      const { execFile } = require('child_process');
+      console.log(`[AUTO] New procurement stocked — triggering Cost Monitor Agent`);
+      execFile('node', [require('path').join(__dirname, '..', 'scripts', 'cost-monitor-agent.js')], {
+        env: { ...process.env },
+        timeout: 120000,
+      }, (err, stdout, stderr) => {
+        if (err) console.error('[cost-monitor] Error:', err.message);
+        if (stdout) console.log('[cost-monitor]', stdout);
+        if (stderr) console.error('[cost-monitor]', stderr);
+      });
     });
   }
 
@@ -881,6 +878,22 @@ procurement.put('/:id', auth, requireRole('admin','manager'), async (req, res) =
           console.log(`[AUTO] Vendor bill created for invoice ${invoiceNo||'no-inv'}: ₹${amount} (${vendorName})`);
         }
       } catch (e) { console.error('[AUTO] Procurement payable error:', e.message); }
+    });
+  }
+
+  // Auto-trigger Cost Monitor Agent when procurement status changes to 'stocked'
+  if (p.status === 'stocked' && existing?.status !== 'stocked') {
+    setImmediate(() => {
+      const { execFile } = require('child_process');
+      console.log(`[AUTO] Procurement stocked — triggering Cost Monitor Agent`);
+      execFile('node', [require('path').join(__dirname, '..', 'scripts', 'cost-monitor-agent.js')], {
+        env: { ...process.env },
+        timeout: 120000,
+      }, (err, stdout, stderr) => {
+        if (err) console.error('[cost-monitor] Error:', err.message);
+        if (stdout) console.log('[cost-monitor]', stdout);
+        if (stderr) console.error('[cost-monitor]', stderr);
+      });
     });
   }
 
@@ -1521,6 +1534,48 @@ sales.post('/', auth, async (req, res) => {
         console.error('Zoho POS invoice error:', ze.message);
       }
     }
+
+    // Auto-deduct packing materials (bottles, labels, cartons) for POS sale
+    try {
+      const posItems = (s.items || []).filter(i => parseFloat(i.qty) > 0);
+      const posProdIds = posItems.map(i => i.productId).filter(Boolean);
+      if (posProdIds.length) {
+        const { data: posProds } = await supabase.from('products').select('id,name,packing_links').in('id', posProdIds);
+        const posProdMap = {};
+        for (const p of (posProds || [])) posProdMap[p.id] = p;
+        const posAudit = [];
+        for (const item of posItems) {
+          const prod = posProdMap[item.productId];
+          const qty = parseInt(item.qty) || 1;
+          const links = prod?.packing_links || {};
+          const matIds = [
+            ...(Array.isArray(links.materialIds) ? links.materialIds : [links.coverId, links.bottleId].filter(Boolean)),
+            links.labelId,
+          ].filter(Boolean);
+          for (const matId of matIds) {
+            const { data: mat } = await supabase.from('packing_materials').select('id,name,current_stock').eq('id', matId).single();
+            if (!mat) continue;
+            const oldStock = parseFloat(mat.current_stock) || 0;
+            const newStock = Math.max(0, oldStock - qty);
+            await supabase.from('packing_materials').update({ current_stock: newStock, updated_at: new Date().toISOString() }).eq('id', matId);
+            posAudit.push({ material_id: matId, audit_date: new Date().toISOString().slice(0,10), quantity: newStock, previous_qty: oldStock, audited_by: 'auto-deduct', notes: `POS sale — ${s.orderNo} — ${item.productName || prod?.name} × ${qty}` });
+          }
+          if (links.cartonId) {
+            const perCarton = parseInt(links.perCarton) || 12;
+            const cartonQty = Math.ceil(qty / perCarton);
+            const { data: mat } = await supabase.from('packing_materials').select('id,name,current_stock').eq('id', links.cartonId).single();
+            if (mat) {
+              const oldStock = parseFloat(mat.current_stock) || 0;
+              const newStock = Math.max(0, oldStock - cartonQty);
+              await supabase.from('packing_materials').update({ current_stock: newStock, updated_at: new Date().toISOString() }).eq('id', links.cartonId);
+              posAudit.push({ material_id: links.cartonId, audit_date: new Date().toISOString().slice(0,10), quantity: newStock, previous_qty: oldStock, audited_by: 'auto-deduct', notes: `POS carton — ${s.orderNo} — ${item.productName || prod?.name} × ${cartonQty}` });
+            }
+          }
+        }
+        if (posAudit.length) await supabase.from('packing_audit_log').insert(posAudit).catch(() => {});
+        console.log(`[AUTO] Packing materials deducted for POS sale ${s.orderNo} (${posAudit.length} materials)`);
+      }
+    } catch (packErr) { console.error('POS packing deduction error:', packErr.message); }
 
     // Auto-deduct from finished goods + stock_ledger (with duplicate guard)
     try {

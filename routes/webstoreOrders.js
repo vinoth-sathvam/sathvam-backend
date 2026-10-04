@@ -996,15 +996,17 @@ async function updateOrder(req, res) {
       // ── PACKED: deduct packing materials (label + cover/bottle) ───────────
       if (status === 'packed') {
         try {
-          const productIds = items.map(i => i.product_id).filter(Boolean);
+          const productIds = items.map(i => i.product_id || i.id).filter(Boolean);
           if (productIds.length) {
             const { data: prods } = await supabase
               .from('products').select('id,name,packing_links').in('id', productIds);
             const prodMap = {};
             for (const p of (prods || [])) prodMap[p.id] = p;
 
+            const auditRows = [];
             for (const item of items) {
-              const prod  = prodMap[item.product_id];
+              const pid   = item.product_id || item.id;
+              const prod  = prodMap[pid];
               const qty   = parseInt(item.qty) || 1;
               const links = prod?.packing_links || {};
               const matIds = [
@@ -1014,30 +1016,38 @@ async function updateOrder(req, res) {
 
               for (const matId of matIds) {
                 const { data: mat } = await supabase
-                  .from('packing_materials').select('id,current_stock').eq('id', matId).single();
+                  .from('packing_materials').select('id,name,current_stock').eq('id', matId).single();
                 if (!mat) continue;
-                const newStock = Math.max(0, (parseFloat(mat.current_stock) || 0) - qty);
+                const oldStock = parseFloat(mat.current_stock) || 0;
+                const newStock = Math.max(0, oldStock - qty);
                 await supabase.from('packing_materials').update({
                   current_stock: newStock, updated_at: new Date().toISOString(),
                 }).eq('id', matId);
+                auditRows.push({ material_id: matId, audit_date: new Date().toISOString().slice(0,10), quantity: newStock, previous_qty: oldStock, audited_by: 'auto-deduct', notes: `Webstore packed — ${orderNo} — ${item.name || prod?.name} × ${qty}` });
               }
             }
             // Deduct carton boxes (qty / perCarton)
             for (const item of items) {
-              const prod = prodMap[item.product_id];
+              const pid  = item.product_id || item.id;
+              const prod = prodMap[pid];
               const qty = parseInt(item.qty) || 1;
               const links = prod?.packing_links || {};
               if (links.cartonId) {
                 const perCarton = parseInt(links.perCarton) || 12;
                 const cartonQty = Math.ceil(qty / perCarton);
-                const { data: mat } = await supabase.from('packing_materials').select('id,current_stock').eq('id', links.cartonId).single();
+                const { data: mat } = await supabase.from('packing_materials').select('id,name,current_stock').eq('id', links.cartonId).single();
                 if (mat) {
-                  const newStock = Math.max(0, (parseFloat(mat.current_stock) || 0) - cartonQty);
+                  const oldStock = parseFloat(mat.current_stock) || 0;
+                  const newStock = Math.max(0, oldStock - cartonQty);
                   await supabase.from('packing_materials').update({ current_stock: newStock, updated_at: new Date().toISOString() }).eq('id', links.cartonId);
+                  auditRows.push({ material_id: links.cartonId, audit_date: new Date().toISOString().slice(0,10), quantity: newStock, previous_qty: oldStock, audited_by: 'auto-deduct', notes: `Webstore carton — ${orderNo} — ${item.name || prod?.name} × ${cartonQty}` });
                 }
               }
             }
-            console.log(`[AUTO] Packing materials + cartons deducted for order ${orderNo}`);
+            if (auditRows.length) {
+              await supabase.from('packing_audit_log').insert(auditRows).catch(() => {});
+            }
+            console.log(`[AUTO] Packing materials + cartons deducted for order ${orderNo} (${auditRows.length} materials)`);
           }
         } catch (e) { console.error('[AUTO] Pack deduct error:', e.message); }
       }
@@ -1067,9 +1077,10 @@ async function updateOrder(req, res) {
               created_at: new Date().toISOString(), updated_at: new Date().toISOString(),
             });
 
-            if (item.product_id) {
+            const pid = item.product_id || item.id;
+            if (pid) {
               ledgerRows.push({
-                product_id: item.product_id,
+                product_id: pid,
                 product_name: pname, date: today, type: 'out',
                 qty: gap, unit: 'pcs',
                 rate: parseFloat(item.price) || 0,
