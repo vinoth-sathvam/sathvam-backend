@@ -654,6 +654,16 @@ router.post('/webhook', express.json(), async (req, res) => {
             }
           }
 
+          // 0.5 DevOps Agent — auto-diagnose if customer reports a technical issue
+          {
+            const { detectTechIssue, runDiagnostics } = require('./waDevopsAgent');
+            const issueType = detectTechIssue(content);
+            if (issueType) {
+              // Fire-and-forget: run diagnostics in background, don't block customer reply
+              runDiagnostics(phone, content, issueType).catch(e => console.error('[devops-agent]', e.message));
+            }
+          }
+
           // 1. Keyword shortcuts — fast, no AI needed
           const kwReply = await keywordReply(content, phone);
           if (kwReply) {
@@ -1896,6 +1906,18 @@ router.get('/analytics/enhanced', auth, async (req, res) => {
     const { getDailySendCount } = require('../lib/greenapi');
     const rateLimitStatus = getDailySendCount();
 
+    // Messages per day (for dashboard widget compatibility)
+    const dayMap = {};
+    for (const m of messages) {
+      const day = m.timestamp?.slice(0, 10);
+      if (!day) continue;
+      if (!dayMap[day]) dayMap[day] = { date: day, inbound: 0, outbound: 0 };
+      dayMap[day][m.direction === 'inbound' ? 'inbound' : 'outbound']++;
+    }
+    const messagesPerDay = Object.values(dayMap).sort((a, b) => a.date.localeCompare(b.date));
+
+    const totalInbound = messages.filter(m => m.direction === 'inbound').length;
+
     res.json({
       topCustomers,
       messageTypes: typeCounts,
@@ -1903,10 +1925,14 @@ router.get('/analytics/enhanced', auth, async (req, res) => {
       failedCount: failedMessages.length,
       failedMessages: failedMessages.slice(0, 20).map(m => ({ phone: m.phone, content: (m.content || '').slice(0, 80), timestamp: m.timestamp, error: m.delivery_error })),
       aiVsHuman: { bot: botReplies, human: humanReplies, total: outbound.length },
+      aiReplies: botReplies,
+      humanReplies,
       avgResponseMinutes: avgResponseMs ? Math.round(avgResponseMs / 60000) : null,
       rateLimitStatus,
-      totalInbound: messages.filter(m => m.direction === 'inbound').length,
+      messagesPerDay,
+      totalInbound,
       totalOutbound: outbound.length,
+      totals: { totalConversations: new Set(messages.map(m => m.phone)).size, totalInbound, totalOutbound: outbound.length },
       uniqueContacts: new Set(messages.map(m => m.phone)).size,
       period: `${days} days`,
     });
