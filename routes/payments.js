@@ -896,13 +896,26 @@ async function handleRazorpayWebhook(req, res) {
             // Send receipt to customer
             const { data: stashed } = await supabase.from('settings').select('value').eq('key', `pos_payment_link_${paymentLinkId}`).maybeSingle();
             const custPhone = stashed?.value?.customerPhone || linkNotes.wa_phone;
+            const custName  = stashed?.value?.customerName || 'Customer';
             if (custPhone) {
+              const receiptMsg = `✅ *Payment Received — Sathvam*\n\n` +
+                `Thank you! Your payment of ₹${paidAmount.toLocaleString('en-IN')} for order ${linkNotes.order_no || ''} has been received.\n\n` +
+                `— Team Sathvam 🌿`;
               try {
-                await gaSendText(custPhone,
-                  `✅ *Payment Received — Sathvam*\n\n` +
-                  `Thank you! Your payment of ₹${paidAmount.toLocaleString('en-IN')} for order ${linkNotes.order_no || ''} has been received.\n\n` +
-                  `— Team Sathvam 🌿`
-                );
+                await gaSendText(custPhone, receiptMsg);
+                // Log to whatsapp_messages
+                const waDigits = (custPhone || '').replace(/\D/g, '');
+                const logPhone = waDigits.length === 10 ? `91${waDigits}` : waDigits;
+                await supabase.from('whatsapp_messages').insert({
+                  phone:        logPhone,
+                  contact_name: custName,
+                  direction:    'outbound',
+                  type:         'text',
+                  content:      receiptMsg,
+                  status:       'sent',
+                  timestamp:    new Date().toISOString(),
+                  sent_by:      `payment_link:${linkNotes.order_no || ''}`,
+                }).catch(e => console.error('[webhook] WA log error:', e.message));
               } catch(e) {}
             }
           } catch (e) {
@@ -1244,9 +1257,35 @@ router.post('/create-payment-link', auth, async (req, res) => {
         await gaSendText(customerPhone, waMsg);
         // Send QR code image via WhatsApp
         const qrImageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&format=png&data=${encodeURIComponent(paymentUrl)}`;
-        await gaSendFile(customerPhone, qrImageUrl, 'payment-qr.png',
-          `📱 Scan this QR to pay ₹${parseFloat(amount).toLocaleString('en-IN')} for order ${orderNo || 'Sathvam'}`
-        );
+        const qrCaption = `📱 Scan this QR to pay ₹${parseFloat(amount).toLocaleString('en-IN')} for order ${orderNo || 'Sathvam'}`;
+        await gaSendFile(customerPhone, qrImageUrl, 'payment-qr.png', qrCaption);
+
+        // Log to whatsapp_messages so it appears in admin WA panel
+        const waPhone = (customerPhone || '').replace(/\D/g, '');
+        const logPhone = waPhone.length === 10 ? `91${waPhone}` : waPhone;
+        try {
+          await supabase.from('whatsapp_messages').insert({
+            phone:        logPhone,
+            contact_name: customerName || 'Customer',
+            direction:    'outbound',
+            type:         'text',
+            content:      waMsg,
+            status:       'sent',
+            timestamp:    new Date().toISOString(),
+            sent_by:      `payment_link:${orderNo || saleId || ''}`,
+          });
+          await supabase.from('whatsapp_messages').insert({
+            phone:        logPhone,
+            contact_name: customerName || 'Customer',
+            direction:    'outbound',
+            type:         'image',
+            content:      qrCaption,
+            status:       'sent',
+            timestamp:    new Date().toISOString(),
+            sent_by:      `payment_link:${orderNo || saleId || ''}`,
+            media_url:    qrImageUrl,
+          });
+        } catch (logErr) { console.error('[payment-link] WA log error:', logErr.message); }
       } catch (e) {
         console.error('[payment-link] WhatsApp send failed:', e.message);
       }
