@@ -1085,7 +1085,7 @@ router.post('/zoho/sync-bank-transactions', auth, async (req, res) => {
         const rec = {
           bank_account_id: local_account_id,
           date:            t.date,
-          type:            t.debit_or_credit === 'credit' ? 'credit' : 'debit',
+          type:            t.debit_or_credit === 'debit' ? 'credit' : 'debit',  // Zoho uses journal perspective (debit=money IN for asset accounts); we use bank statement perspective
           amount,
           description:     desc || ref || '',
           reference:       ref || t.transaction_id || '',
