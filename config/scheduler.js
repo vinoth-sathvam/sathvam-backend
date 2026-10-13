@@ -868,13 +868,14 @@ function startScheduler() {
             // Skip Zoho accounting splits (vendor/employee payments) — only sync real bank feed entries
             const desc = (t.payee || t.description || '').trim();
             const ref = (t.reference_number || '').trim();
-            const isRealBankTxn = ref.length > 0 || /^(UPI|NEFT|RTGS|INF|MMT|ACH|BIL|MIN|MSI|EZY|Mob alrt)/i.test(desc);
-            if (!isRealBankTxn && t.source !== 'bank_feed') continue;
+            const looksLikeBankNarration = /^(UPI|NEFT|RTGS|INF|MMT|ACH|BIL|MIN|MSI|EZY|Mob alrt)/i.test(desc);
+            const isRealBankTxn = (ref.length > 0 && !/^\d{16,}$/.test(ref)) || looksLikeBankNarration;
+            if (!isRealBankTxn || t.date < fromDate) continue;  // skip Zoho bookkeeping splits and out-of-window rows
 
             const rec = {
               bank_account_id: acct.id,
               date:            t.date,
-              type:            t.debit_or_credit === 'credit' ? 'credit' : 'debit',
+              type:            t.debit_or_credit === 'debit' ? 'credit' : 'debit',  // Zoho debit_or_credit is journal perspective (debit = money IN); flip to bank-statement perspective
               amount,
               description:     desc || ref || '',
               reference:       ref || t.transaction_id || '',
@@ -886,13 +887,13 @@ function startScheduler() {
 
             const { data: existing } = await supabase
               .from('bank_transactions')
-              .select('id')
+              .select('id, created_by')
               .eq('zoho_txn_id', t.transaction_id)
               .maybeSingle();
 
             if (existing) {
               await supabase.from('bank_transactions')
-                .update({ ...rec, updated_at: new Date().toISOString() })
+                .update(existing.created_by === 'bank-statement-import' ? { reconciled: rec.reconciled, updated_at: new Date().toISOString() } : { ...rec, updated_at: new Date().toISOString() })
                 .eq('id', existing.id);
               totalUpdated++;
             } else {

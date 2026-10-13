@@ -1078,9 +1078,10 @@ router.post('/zoho/sync-bank-transactions', auth, async (req, res) => {
         // Skip Zoho accounting splits — only sync real bank feed entries
         const desc = (t.payee || t.description || '').trim();
         const ref = (t.reference_number || '').trim();
-        const isRealBankTxn = ref.length > 0 || /^(UPI|NEFT|RTGS|INF|MMT|ACH|BIL|MIN|MSI|EZY|Mob alrt|CAM|SMS|Dbt card|Cash dep|POSDEC)/i.test(desc);
-        const isTrustedSource = t.source === 'bank_feed' || t.source === 'manually_added' || t.source === 'categorized' || t.source === 'matched';
-        if (!isRealBankTxn && !isTrustedSource) { skipped++; continue; }
+        const looksLikeBankNarration = /^(UPI|NEFT|RTGS|INF|MMT|ACH|BIL|MIN|MSI|EZY|Mob alrt|CAM|SMS|Dbt card|Cash dep|POSDEC)/i.test(desc);
+        const isRealBankTxn = (ref.length > 0 && !/^\d{16,}$/.test(ref)) || looksLikeBankNarration;
+        // Zoho bookkeeping splits (e.g. per-employee salary lines) have no bank reference/narration; Zoho also ignores date_start for Status.Uncategorized
+        if (!isRealBankTxn || t.date < fromDate) { skipped++; continue; }
 
         const rec = {
           bank_account_id: local_account_id,
@@ -1098,13 +1099,13 @@ router.post('/zoho/sync-bank-transactions', auth, async (req, res) => {
         // Upsert by zoho_txn_id to avoid duplicates
         const { data: existing } = await supabase
           .from('bank_transactions')
-          .select('id')
+          .select('id, created_by')
           .eq('zoho_txn_id', zohoTxnId)
           .maybeSingle();
 
         if (existing) {
           await supabase.from('bank_transactions')
-            .update({ ...rec, updated_at: new Date().toISOString() })
+            .update(existing.created_by === 'bank-statement-import' ? { reconciled: rec.reconciled, updated_at: new Date().toISOString() } : { ...rec, updated_at: new Date().toISOString() })
             .eq('id', existing.id);
           updated++;
         } else {
@@ -1234,7 +1235,7 @@ router.get('/zoho/bank-statement', auth, async (req, res) => {
     const transactions = (data.banktransactions || []).map(t => ({
       zoho_txn_id:     t.transaction_id,
       date:            t.date,
-      type:            t.debit_or_credit === 'credit' ? 'credit' : 'debit',
+      type:            t.debit_or_credit === 'debit' ? 'credit' : 'debit',  // Zoho debit_or_credit is journal perspective (debit = money IN); flip to bank-statement perspective
       amount:          round2(Math.abs(parseFloat(t.amount) || 0)),
       payee:           t.payee || '',
       description:     t.description || '',
