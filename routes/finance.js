@@ -1777,6 +1777,149 @@ router.post('/journal/backfill', auth, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 // BALANCE SHEET (synthesised from GL + operational data)
 // ═══════════════════════════════════════════════════════════════════════════════
+// ── Balance Sheet — Schedule III (Companies Act 2013) format, built from Zoho Books ──
+// GET /finance/balance-sheet-schedule3?as_of=YYYY-MM-DD
+// Maps every Zoho balance-sheet account to a Schedule III line, adds the previous
+// 31 March as comparative, and flags book-keeping problems a CA would raise.
+const S3_LINES = {
+  share_capital:             { side: 'el', group: "Shareholders' funds",     label: 'Share capital' },
+  reserves:                  { side: 'el', group: "Shareholders' funds",     label: 'Reserves and surplus' },
+  lt_borrowings:             { side: 'el', group: 'Non-current liabilities', label: 'Long-term borrowings' },
+  other_lt_liabilities:      { side: 'el', group: 'Non-current liabilities', label: 'Other long-term liabilities' },
+  st_borrowings:             { side: 'el', group: 'Current liabilities',     label: 'Short-term borrowings' },
+  trade_payables:            { side: 'el', group: 'Current liabilities',     label: 'Trade payables' },
+  other_current_liabilities: { side: 'el', group: 'Current liabilities',     label: 'Other current liabilities' },
+  st_provisions:             { side: 'el', group: 'Current liabilities',     label: 'Short-term provisions' },
+  ppe:                       { side: 'a',  group: 'Non-current assets',      label: 'Property, plant and equipment' },
+  nc_investments:            { side: 'a',  group: 'Non-current assets',      label: 'Non-current investments' },
+  lt_loans_advances:         { side: 'a',  group: 'Non-current assets',      label: 'Long-term loans and advances' },
+  other_nc_assets:           { side: 'a',  group: 'Non-current assets',      label: 'Other non-current assets' },
+  inventories:               { side: 'a',  group: 'Current assets',          label: 'Inventories' },
+  receivables:               { side: 'a',  group: 'Current assets',          label: 'Trade receivables' },
+  cash:                      { side: 'a',  group: 'Current assets',          label: 'Cash and cash equivalents' },
+  st_loans_advances:         { side: 'a',  group: 'Current assets',          label: 'Short-term loans and advances' },
+  other_current_assets:      { side: 'a',  group: 'Current assets',          label: 'Other current assets' },
+};
+
+// Flatten Zoho's nested report into leaf accounts with their group path
+function s3Leaves(report) {
+  const out = [];
+  const walk = (node, path) => {
+    const name = node.name || node.total_label || '';
+    const kids = node.account_transactions || [];
+    if (!kids.length) { if (path.length) out.push({ name, id: node.account_id || name, total: Number(node.total) || 0, path }); return; }
+    kids.forEach(k => walk(k, [...path, name]));
+  };
+  (report || []).forEach(n => walk(n, []));
+  return out;
+}
+
+function s3Classify({ name, path }) {
+  const n = name.toLowerCase();
+  const top = (path[0] || '').toLowerCase();
+  const g = (path[path.length - 1] || '').toLowerCase();
+  const inPath = s => path.some(p => p.toLowerCase() === s);
+  if (top.startsWith('assets')) {
+    if (inPath('cash') || inPath('bank')) return 'cash';
+    if (inPath('accounts receivable')) return 'receivables';
+    if (/inventory|goods in transit|stock/.test(n)) return 'inventories';
+    if (inPath('fixed assets')) return /advance/.test(n) ? 'lt_loans_advances' : 'ppe';
+    if (inPath('other assets') || inPath('non current assets')) return /invest/.test(n) ? 'nc_investments' : 'other_nc_assets';
+    if (/input (c|s|i)gst|input tax|gst receivable|tds receivable|clearing/.test(n)) return 'other_current_assets';
+    if (/advance|prepaid|loan|deposit/.test(n)) return 'st_loans_advances';
+    return 'other_current_assets';
+  }
+  if (inPath('equities') || g.includes('earnings') || n.includes('earnings')) {
+    return (/owner|share capital|^capital/.test(n) && !/invest/.test(n)) ? 'share_capital' : 'reserves';
+  }
+  if (inPath('accounts payable') || n === 'accounts payable') return 'trade_payables';
+  if (inPath('non current liabilities') || inPath('other liabilities')) return /loan|borrow/.test(n) ? 'lt_borrowings' : 'other_lt_liabilities';
+  if (/loan|borrow|overdraft/.test(n)) return 'st_borrowings';
+  if (/provision/.test(n)) return 'st_provisions';
+  return 'other_current_liabilities';
+}
+
+router.get('/balance-sheet-schedule3', auth, async (req, res) => {
+  try {
+    if (!zohoApi || !ZOHO_ORG()) return res.status(503).json({ error: 'Zoho Books is not configured' });
+    const asOf = /^\d{4}-\d{2}-\d{2}$/.test(req.query.as_of || '') ? req.query.as_of : new Date().toISOString().slice(0, 10);
+    const [y, m] = asOf.split('-').map(Number);
+    const prevDate = `${m >= 4 ? y : y - 1}-03-31`;   // previous financial-year end (comparative column)
+
+    // Zoho ignores to_date for the equity section unless a CustomDate filter is passed (report then doesn't balance)
+    const fyStart = d => { const [yy, mm] = d.split('-').map(Number); return `${mm >= 4 ? yy : yy - 1}-04-01`; };
+    const fetchBS = d => zohoApi('get', '/reports/balancesheet', null, { organization_id: ZOHO_ORG(), from_date: fyStart(d), to_date: d, filter_by: 'TransactionDate.CustomDate' });
+    const [curR, prevR] = await Promise.all([fetchBS(asOf), fetchBS(prevDate).catch(() => null)]);
+    const cur = s3Leaves(curR.balance_sheet), prev = s3Leaves(prevR?.balance_sheet);
+
+    // accounts keyed by id, carrying both periods
+    const accts = {};
+    for (const [period, list] of [['cur', cur], ['prev', prev]]) {
+      for (const l of list) {
+        const a = accts[l.id] || (accts[l.id] = { name: l.name, line: s3Classify(l), cur: 0, prev: 0 });
+        a[period] += l.total;
+      }
+    }
+
+    // Build lines + notes in Schedule III order; a note number is given only to lines that have a value
+    let noteNo = 0;
+    const lines = Object.entries(S3_LINES).map(([key, def]) => {
+      const members = Object.values(accts).filter(a => a.line === key && (Math.abs(a.cur) > 0.004 || Math.abs(a.prev) > 0.004));
+      const curT = members.reduce((s, a) => s + a.cur, 0), prevT = members.reduce((s, a) => s + a.prev, 0);
+      return { key, ...def, note: members.length ? ++noteNo : null, cur: round2(curT), prev: round2(prevT),
+        accounts: members.sort((a, b) => Math.abs(b.cur) - Math.abs(a.cur)).map(a => ({ name: a.name, cur: round2(a.cur), prev: round2(a.prev) })) };
+    });
+    const sum = (side, p) => round2(lines.filter(l => l.side === side).reduce((s, l) => s + l[p], 0));
+    const totals = { assets_cur: sum('a', 'cur'), assets_prev: sum('a', 'prev'), el_cur: sum('el', 'cur'), el_prev: sum('el', 'prev') };
+
+    // ── Books health: what a CA would query before signing ──
+    const issues = [];
+    const fmt = v => '₹' + Math.round(v).toLocaleString('en-IN');
+    const totalAssets = Math.max(Math.abs(totals.assets_cur), 1);
+    for (const l of cur) {
+      const key = s3Classify(l), side = S3_LINES[key].side, n = l.name.toLowerCase();
+      if (Math.abs(l.total) < 1) continue;
+      if (side === 'a' && l.total < 0) {
+        const fix = key === 'cash' ? 'Reconcile this bank/cash account in Zoho Banking: match every statement line, remove duplicate or wrong-direction entries.'
+          : key === 'inventories' ? 'Stock cannot be negative. Post purchases/production to inventory (or record opening stock) in Zoho Items, then re-run.'
+          : 'An asset cannot be negative — usually a payment or receipt posted to the wrong account. Re-categorise the transactions.';
+        issues.push({ severity: 'high', account: l.name, amount: l.total, title: `Negative asset: ${l.name}`, detail: `${l.name} shows ${fmt(l.total)}.`, fix });
+      }
+      if (side === 'el' && key !== 'reserves' && l.total < 0) {
+        issues.push({ severity: 'medium', account: l.name, amount: l.total, title: `Negative liability: ${l.name}`, detail: `${l.name} shows ${fmt(l.total)} (a debit balance).`, fix: 'Usually a payment recorded without the matching bill/expense. Record the bill or reclassify the payment.' });
+      }
+      if (/opening balance adj/.test(n)) issues.push({ severity: 'high', account: l.name, amount: l.total, title: 'Opening balances do not tie', detail: `${fmt(l.total)} is parked in Opening Balance Adjustments.`, fix: 'Enter the correct opening balance of every account (from the last audited balance sheet) so this becomes zero.' });
+      if (/undeposited/.test(n) && l.total > 0) issues.push({ severity: 'medium', account: l.name, amount: l.total, title: 'Receipts not matched to bank', detail: `${fmt(l.total)} of customer receipts sit in Undeposited Funds.`, fix: 'Match these receipts to the bank deposits (Razorpay settlements, UPI) in Zoho Banking.' });
+      if (key === 'ppe' && (l.total < 5000 || /milk|pooja|cloth|expense/.test(n))) issues.push({ severity: 'medium', account: l.name, amount: l.total, title: `Expense booked as fixed asset: ${l.name}`, detail: `${l.name} (${fmt(l.total)}) is under Fixed Assets.`, fix: 'Move day-to-day purchases to the right expense account; keep only machinery, equipment, furniture, vehicles etc. as fixed assets.' });
+      if (/prepaid/.test(n) && l.total > totalAssets * 0.1) issues.push({ severity: 'medium', account: l.name, amount: l.total, title: 'Unusually large prepaid expenses', detail: `Prepaid Expenses is ${fmt(l.total)} — ${Math.round(l.total / totalAssets * 100)}% of total assets.`, fix: 'Check whether expenses or vendor advances were parked here; expense what has been used.' });
+      if (/suspense/.test(n)) issues.push({ severity: 'high', account: l.name, amount: l.total, title: 'Suspense balance', detail: `${fmt(l.total)} in ${l.name}.`, fix: 'Clear the suspense account by posting each entry to its proper head.' });
+    }
+    // Zoho book balance vs actual bank statement balance (synced feed balance)
+    try {
+      const { data: banks } = await supabase.from('bank_accounts').select('name, zoho_account_id, current_balance').not('zoho_account_id', 'is', null);
+      for (const b of banks || []) {
+        const leaf = cur.find(l => l.id === b.zoho_account_id);
+        const stmt = Number(b.current_balance);
+        if (leaf && !isNaN(stmt) && Math.abs(leaf.total - stmt) > 1) {
+          issues.push({ severity: 'high', account: leaf.name, amount: round2(leaf.total - stmt), title: `Bank not reconciled: ${b.name}`, detail: `Books show ${fmt(leaf.total)} but the bank statement balance is ${fmt(stmt)} (difference ${fmt(leaf.total - stmt)}).`, fix: 'Reconcile in Zoho Banking until the book balance equals the statement balance.' });
+        }
+      }
+    } catch (_) {}
+    // a bank flagged as unreconciled doesn't also need a separate "negative asset" item
+    const unreconciled = new Set(issues.filter(i => i.title.startsWith('Bank not reconciled')).map(i => i.account));
+    for (let i = issues.length - 1; i >= 0; i--) if (issues[i].title.startsWith('Negative asset') && unreconciled.has(issues[i].account)) issues.splice(i, 1);
+    const diff = round2(totals.assets_cur - totals.el_cur);
+    if (Math.abs(diff) > 1) issues.unshift({ severity: 'high', title: 'Balance sheet does not balance', detail: `Assets minus (Equity + Liabilities) = ${fmt(diff)}.`, fix: 'Check for one-sided journal entries in Zoho.' });
+    const rank = { high: 0, medium: 1, low: 2 };
+    issues.sort((a, b) => rank[a.severity] - rank[b.severity] || Math.abs(b.amount || 0) - Math.abs(a.amount || 0));
+
+    res.json({ as_of: asOf, prev_date: prevR ? prevDate : null, source: 'Zoho Books', lines, totals, balanced: Math.abs(diff) <= 1, issues });
+  } catch (e) {
+    console.error('[balance-sheet-schedule3]', e.response?.data || e.message);
+    res.status(500).json({ error: e.response?.data?.message || e.message });
+  }
+});
+
 router.get('/balance-sheet', auth, async (req, res) => {
   try {
     const { as_of } = req.query;
